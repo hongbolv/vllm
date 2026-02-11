@@ -114,34 +114,38 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 
-            if self.pass_config.enable_sp:
-                self.passes += [SequenceParallelismPass(config)]
-                if self.pass_config.fuse_gemm_comms:
-                    self.passes += [AsyncTPPass(config)]
+            if current_platform.is_cuda_alike():
+                if self.pass_config.enable_sp:
+                    self.passes += [SequenceParallelismPass(config)]
+                    if self.pass_config.fuse_gemm_comms and current_platform.is_cuda():
+                        self.passes += [AsyncTPPass(config)]
 
-            if self.pass_config.fuse_allreduce_rms:
-                self.passes += [AllReduceFusionPass(config)]
+            if current_platform.is_cuda():
+                if self.pass_config.fuse_allreduce_rms:
+                    self.passes += [AllReduceFusionPass(config)]
 
-            if self.pass_config.fuse_norm_quant:
-                self.passes += [RMSNormQuantFusionPass(config)]
-                if rocm_aiter_ops.is_enabled():
-                    self.passes += [
-                        RocmAiterRMSNormQuantFusionPass(config),
-                    ]
-            if self.pass_config.fuse_act_quant:
-                self.passes += [ActivationQuantFusionPass(config)]
-                if rocm_aiter_ops.is_enabled():
-                    self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
+            if current_platform.is_cuda_alike():
+                if self.pass_config.fuse_norm_quant:
+                    self.passes += [RMSNormQuantFusionPass(config)]
+                    if rocm_aiter_ops.is_enabled():
+                        self.passes += [
+                            RocmAiterRMSNormQuantFusionPass(config),
+                        ]
+                if self.pass_config.fuse_act_quant:
+                    self.passes += [ActivationQuantFusionPass(config)]
+                    if rocm_aiter_ops.is_enabled():
+                        self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
 
             if self.pass_config.fuse_act_padding and rocm_aiter_ops.is_enabled():
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
-            if self.pass_config.fuse_attn_quant:
-                self.passes += [AttnFusionPass(config)]
+            if current_platform.is_cuda_alike():
+                if self.pass_config.fuse_attn_quant:
+                    self.passes += [AttnFusionPass(config)]
 
-            if self.pass_config.enable_qk_norm_rope_fusion:
-                self.passes += [SplitCoalescingPass(config)]
-                self.passes += [QKNormRoPEFusionPass(config)]
+                if self.pass_config.enable_qk_norm_rope_fusion:
+                    self.passes += [SplitCoalescingPass(config)]
+                    self.passes += [QKNormRoPEFusionPass(config)]
 
             # needs a functional graph
             self.post_cleanup = PostCleanupPass(config)
