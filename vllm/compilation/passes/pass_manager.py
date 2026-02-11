@@ -117,10 +117,11 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if current_platform.is_cuda_alike():
                 if self.pass_config.enable_sp:
                     self.passes += [SequenceParallelismPass(config)]
-                    if self.pass_config.fuse_gemm_comms and current_platform.is_cuda():
-                        self.passes += [AsyncTPPass(config)]
 
+            # AsyncTPPass and AllReduceFusionPass are CUDA-only
             if current_platform.is_cuda():
+                if self.pass_config.enable_sp and self.pass_config.fuse_gemm_comms:
+                    self.passes += [AsyncTPPass(config)]
                 if self.pass_config.fuse_allreduce_rms:
                     self.passes += [AllReduceFusionPass(config)]
 
