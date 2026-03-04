@@ -222,11 +222,104 @@ vllm/
 │
 ├── v1/kv_cache_interface.py                 # KV Cache 规格定义
 │
-└── csrc/attention/                          # CUDA 内核
-    ├── attention_kernels.cuh                # 核心 CUDA 内核
-    ├── paged_attention_v1.cu                # Paged Attention V1
-    ├── paged_attention_v2.cu                # Paged Attention V2
-    └── merge_attn_states.cu                 # 状态合并 CUDA 内核
+└── csrc/attention/                          # CUDA/C++ 内核
+    ├── attention_kernels.cuh                # 核心 Paged Attention CUDA 内核模板
+    ├── attention_generic.cuh                # 通用注意力工具函数
+    ├── attention_utils.cuh                  # 注意力计算工具（warp reduce 等）
+    ├── attention_dtypes.h                   # 数据类型分发
+    ├── dtype_float16.cuh                    # FP16 向量化操作
+    ├── dtype_bfloat16.cuh                   # BF16 向量化操作
+    ├── dtype_float32.cuh                    # FP32 向量化操作
+    ├── dtype_fp8.cuh                        # FP8 向量化操作
+    ├── paged_attention_v1.cu                # Paged Attention V1（短序列，单 pass）
+    ├── paged_attention_v2.cu                # Paged Attention V2（长序列，分区 reduce）
+    ├── merge_attn_states.cu                 # 多 Backend 注意力状态合并（LogSumExp）
+    ├── vertical_slash_index.cu              # 稀疏注意力索引计算
+    └── mla/                                 # CUTLASS MLA 内核（SM100/Blackwell）
+        ├── sm100_cutlass_mla_kernel.cu      # MLA 主入口
+        └── cutlass_sm100_mla/               # CUTLASS MLA 模板库
+            ├── device/sm100_mla.hpp         # Device 级 MLA 配置
+            └── kernel/                      # Kernel 级实现
+                ├── sm100_fmha_mla_tma_warpspecialized.hpp  # TMA warp 特化核
+                ├── sm100_fmha_mla_reduction.hpp            # Reduction 核
+                └── sm100_mla_tile_scheduler.hpp            # Tile 调度器
+```
+
+### Kernel 实现文件结构（全平台）
+
+```
+vllm/
+├── csrc/attention/                          # CUDA 注意力内核（见上方详细列表）
+│
+├── csrc/rocm/                               # ROCm (AMD) 专用内核
+│   └── attention.cu                         # ROCm Paged Attention 实现
+│
+├── csrc/cpu/                                # CPU 注意力内核
+│   ├── cpu_attn.cpp                         # CPU 注意力主入口
+│   ├── cpu_attn_impl.hpp                    # 实现模板
+│   ├── cpu_attn_vec.hpp                     # SSE/AVX 向量化实现
+│   ├── cpu_attn_vec16.hpp                   # AVX-512 向量化实现
+│   ├── cpu_attn_amx.hpp                     # AMX（Intel Advanced Matrix Extensions）实现
+│   ├── cpu_attn_neon.hpp                    # ARM NEON 实现
+│   ├── cpu_attn_neon_bfmmla.hpp             # ARM NEON BF16 矩阵乘实现
+│   ├── cpu_attn_vxe.hpp                     # s390x VXE 实现
+│   ├── mla_decode.cpp                       # CPU MLA 解码实现
+│   └── generate_cpu_attn_dispatch.py        # 自动生成分发代码
+│
+├── v1/attention/ops/                        # Python 层注意力算子
+│   ├── paged_attn.py                        # Paged Attention Python 接口
+│   ├── merge_attn_states.py                 # 注意力状态合并
+│   ├── triton_merge_attn_states.py          # Triton 实现的状态合并
+│   ├── prefix_prefill.py                    # 前缀 Prefill 核（ROCm 使用）
+│   ├── triton_prefill_attention.py          # Triton Prefill 注意力核
+│   ├── triton_decode_attention.py           # Triton Decode 注意力核
+│   ├── triton_unified_attention.py          # Triton 统一注意力核（prefill+decode）
+│   ├── triton_reshape_and_cache_flash.py    # Triton KV Cache 写入核
+│   ├── chunked_prefill_paged_decode.py      # 分块 Prefill + Paged Decode 融合核
+│   ├── flashmla.py                          # FlashMLA 算子封装
+│   ├── rocm_aiter_mla_sparse.py             # ROCm AITER 稀疏 MLA 算子
+│   ├── vit_attn_wrappers.py                 # ViT 注意力包装器
+│   └── common.py                            # 公共工具函数
+│
+├── v1/attention/backends/                   # Python 后端实现
+│   ├── flash_attn.py                        # FlashAttention v2/v3 [CUDA/ROCm/XPU]
+│   ├── flash_attn_diffkv.py                 # FlashAttention 差分 KV [CUDA]
+│   ├── flashinfer.py                        # FlashInfer [CUDA]
+│   ├── triton_attn.py                       # Triton 注意力 [ROCm/XPU]
+│   ├── flex_attention.py                    # PyTorch Flex Attention [CUDA]
+│   ├── cpu_attn.py                          # CPU 注意力 [CPU]
+│   ├── rocm_attn.py                         # ROCm 注意力 [ROCm]
+│   ├── rocm_aiter_fa.py                     # ROCm AITER FlashAttention [ROCm gfx9]
+│   ├── rocm_aiter_unified_attn.py           # ROCm AITER 统一注意力 [ROCm gfx9]
+│   ├── tree_attn.py                         # 树形注意力（推测解码）
+│   ├── gdn_attn.py                          # GDN 注意力
+│   ├── linear_attn.py                       # 线性注意力
+│   ├── short_conv_attn.py                   # 短卷积注意力
+│   ├── mamba_attn.py                        # Mamba SSM
+│   ├── mamba1_attn.py                       # Mamba-1
+│   ├── mamba2_attn.py                       # Mamba-2
+│   └── mla/                                 # MLA 专用后端
+│       ├── flashmla.py                      # FlashMLA [CUDA]
+│       ├── flashmla_sparse.py               # FlashMLA Sparse [CUDA]
+│       ├── flashattn_mla.py                 # FlashAttn MLA [CUDA/ROCm]
+│       ├── flashinfer_mla.py                # FlashInfer MLA [CUDA]
+│       ├── flashinfer_mla_sparse.py         # FlashInfer MLA Sparse [CUDA]
+│       ├── cutlass_mla.py                   # CUTLASS MLA [CUDA SM100]
+│       ├── triton_mla.py                    # Triton MLA [ROCm/XPU/CPU]
+│       ├── aiter_triton_mla.py              # AITER Triton MLA [ROCm]
+│       ├── rocm_aiter_mla.py                # ROCm AITER MLA [ROCm gfx9]
+│       └── rocm_aiter_mla_sparse.py         # ROCm AITER MLA Sparse [ROCm gfx9]
+│
+└── model_executor/layers/                   # 注意力层实现
+    └── attention/
+        ├── attention.py                     # 标准 Decoder Attention
+        ├── mla_attention.py                 # MLA Attention
+        ├── cross_attention.py               # 交叉注意力
+        ├── encoder_only_attention.py        # 编码器注意力 (BERT)
+        ├── chunked_local_attention.py       # 分块局部注意力
+        ├── static_sink_attention.py         # Sink Token 注意力
+        ├── mm_encoder_attention.py          # 多模态编码器注意力
+        └── lightning_attn.py                # Lightning Attention
 ```
 
 ### 类层次关系
@@ -312,7 +405,55 @@ class Attention(nn.Module, AttentionLayerBase):
 3. **选择 Attention Backend** — 调用 `get_attn_backend()` 根据硬件和配置选择最优后端
 4. **创建 Backend 实现** — 通过 `backend.get_impl_cls()` 获取实现类并实例化
 5. **初始化 KV Cache** — 为每个 Pipeline 并行阶段创建占位 KV Cache 张量
-6. **设置量化参数** — 初始化 FP8 Q/K/V 缩放因子
+6. **设置量化参数** — 初始化 FP8 Q/K/V 缩放因子（详见下方说明）
+
+#### FP8 Q/K/V 缩放因子详解
+
+FP8 (8-bit 浮点) 格式仅有 8 bit，动态范围有限（E4M3 格式最大 ±240）。缩放因子的作用是将高精度张量映射到 FP8 可表示的范围内，保留相对精度。
+
+**数学定义**：
+
+```
+scale = max(|tensor|) / range_constant
+```
+
+其中 `range_constant` 为预设常数（默认 Q=200, K=200, V=100），用于在 FP8 范围内留出余量。
+
+**三个缩放因子**：
+
+| 缩放因子 | 用途 | 计算方式 |
+|---------|------|---------|
+| `_q_scale` | Query 量化缩放 | `max(\|query\|) / 200` |
+| `_k_scale` | Key 写入 KV Cache 时量化 | `max(\|key\|) / 200` |
+| `_v_scale` | Value 写入 KV Cache 时量化 | `max(\|value\|) / 100` |
+
+**计算时机与流程**：
+
+```python
+# 1. 初始化时注册为缓冲区（默认值 1.0）
+self.register_buffer("_q_scale", torch.tensor(1.0))
+self.register_buffer("_k_scale", torch.tensor(1.0))
+self.register_buffer("_v_scale", torch.tensor(1.0))
+
+# 2. 首次 forward 时动态计算（仅一次）
+def calc_kv_scales(self, query, key, value):
+    self._q_scale.copy_(torch.abs(query).max() / self.q_range)  # 200
+    self._k_scale.copy_(torch.abs(key).max() / self.k_range)    # 200
+    self._v_scale.copy_(torch.abs(value).max() / self.v_range)   # 100
+    self.calculate_kv_scales = False  # 后续 forward 不再计算
+
+# 3. 量化（写入 Cache）
+key_fp8 = (key / k_scale).clamp(FP8_MIN, FP8_MAX).to(fp8_e4m3)
+
+# 4. 反量化（读取时在核内融合）
+key_restored = key_fp8 * k_scale
+```
+
+**两种模式**：
+- **动态缩放**（`calculate_kv_scales=True`）：首次 forward 时根据实际数据计算，之后冻结复用
+- **静态缩放**（`calculate_kv_scales=False`）：使用模型 checkpoint 中保存的缩放因子或默认值 1.0
+
+**为什么需要缩放因子**：直接将 FP16/BF16 值截断为 FP8 会导致大量溢出或精度丢失。缩放因子确保数据分布适配 FP8 的有限范围，使量化误差最小化。当前 vLLM 采用 **per-tensor** 缩放（整个张量共享一个 scale），而非 per-channel。
 
 #### Forward 方法
 
@@ -326,27 +467,90 @@ def forward(
 ) -> torch.Tensor:
 ```
 
-**执行流程**：
+**执行流程**（详细）：
 
 ```
-forward()
+forward(query, key, value, output_shape)
   │
   ├─ 1. 计算 KV 缩放因子（FP8 量化，仅首次调用）
-  │     torch.ops.vllm.maybe_calc_kv_scales(query, key, value)
+  │     torch.ops.vllm.maybe_calc_kv_scales(query, key, value, layer_name)
+  │     │
+  │     └─ 首次调用时:
+  │        _q_scale = max(|query|) / q_range   # per-tensor scale
+  │        _k_scale = max(|key|) / k_range
+  │        _v_scale = max(|value|) / v_range
+  │        calculate_kv_scales = False          # 之后不再计算
   │
-  ├─ 2. 量化 Query（如果启用 FP8）
-  │     query, _ = self.query_quant(query, self._q_scale)
+  ├─ 2. 量化 Query（如果 Backend 支持 FP8 query 输入）
+  │     if self.impl.supports_quant_query_input:
+  │         query, _ = self.query_quant(query, self._q_scale)
+  │         # query: FP16 → FP8 (query / q_scale → clamp → fp8_e4m3)
   │
-  ├─ 3. 重塑张量维度
-  │     query: [num_tokens, num_heads*head_size] → [num_tokens, num_heads, head_size]
-  │     key:   [num_tokens, num_kv_heads*head_size] → [num_tokens, num_kv_heads, head_size]
-  │     value: [num_tokens, num_kv_heads*head_size] → [num_tokens, num_kv_heads, head_size]
+  ├─ 3. 重塑张量维度（2D → 3D）
+  │     query:  [num_tokens, num_heads * head_size]
+  │          →  [num_tokens, num_heads, head_size]
+  │     key:    [num_tokens, num_kv_heads * head_size]
+  │          →  [num_tokens, num_kv_heads, head_size]
+  │     value:  [num_tokens, num_kv_heads * head_size]
+  │          →  [num_tokens, num_kv_heads, head_size]
   │
-  ├─ 4. 更新 KV Cache（如果 Backend 不包含 KV Cache 更新）
-  │     unified_kv_cache_update(key, value, layer_name)
+  ├─ 4. 更新 KV Cache（如果 Backend 不在 forward 中自行更新）
+  │     if not self.impl.forward_includes_kv_cache_update:
+  │         torch.ops.vllm.unified_kv_cache_update(key, value, layer_name)
+  │         │
+  │         └─ 内部流程:
+  │            ├─ get_attention_context(layer_name)
+  │            │   → 从 ForwardContext 获取 kv_cache, slot_mapping
+  │            ├─ impl.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+  │            │   ├─ key_cache, value_cache = kv_cache.unbind(0)
+  │            │   ├─ reshape_and_cache_flash(key, value, key_cache, value_cache,
+  │            │   │                          slot_mapping, kv_cache_dtype,
+  │            │   │                          k_scale, v_scale)
+  │            │   │   └─ CUDA 核: 按 slot_mapping 将 K/V 写入对应物理块位置
+  │            │   │       如果是 FP8 模式: 写入前将 K/V 量化为 FP8
+  │            │   └─ 返回
   │
-  └─ 5. 执行注意力计算
-        unified_attention_with_output(query, key, value, output, layer_name)
+  ├─ 5. 执行注意力计算
+  │     torch.ops.vllm.unified_attention_with_output(
+  │         query, key, value, output, layer_name)
+  │     │
+  │     └─ 内部流程:
+  │        ├─ get_attention_context(layer_name)
+  │        │   → 从 ForwardContext 获取 attn_metadata, kv_cache
+  │        ├─ impl.forward(layer, query, key, value, kv_cache, attn_metadata,
+  │        │               output=output, ...)
+  │        │   ├─ 以 FlashAttention 为例:
+  │        │   │   ├─ key_cache, value_cache = kv_cache.unbind(0)
+  │        │   │   ├─ 检查是否使用 Cascade Attention（共享前缀优化）
+  │        │   │   ├─ flash_attn_varlen_func(
+  │        │   │   │     q=query[:num_actual_tokens],
+  │        │   │   │     k=key_cache,           # 从 Paged KV Cache 读取
+  │        │   │   │     v=value_cache,
+  │        │   │   │     cu_seqlens_q=query_start_loc,
+  │        │   │   │     seqused_k=seq_lens,
+  │        │   │   │     block_table=block_table,  # 虚拟→物理块映射
+  │        │   │   │     softmax_scale=1/√d,
+  │        │   │   │     causal=True,
+  │        │   │   │     window_size=sliding_window,
+  │        │   │   │     k_descale=_k_scale,     # FP8 反量化因子
+  │        │   │   │     v_descale=_v_scale,
+  │        │   │   │   )
+  │        │   │   └─ 返回 output: [num_tokens, num_heads, head_size]
+  │        │   │
+  │        │   ├─ 以 FlashInfer 为例:
+  │        │   │   ├─ wrapper.run(q, kv_cache)  # 使用预规划的 wrapper
+  │        │   │   └─ 返回 output
+  │        │   │
+  │        │   └─ 以 Triton 为例:
+  │        │       ├─ unified_attention(q, k_cache, v_cache, ...)  # 自适应 2D/3D 核
+  │        │       └─ 返回 output
+  │        │
+  │        └─ output 已写入预分配的输出缓冲区（原地操作）
+  │
+  └─ 6. 返回结果
+        return output.reshape(output_shape)
+        # output: [num_tokens, num_heads * head_size]
+        # → 后续经过 O Projection → 残差连接 → 下一层
 ```
 
 #### Custom Ops 机制
