@@ -6,6 +6,7 @@
    - 1.1 [各 Attention 组件之间的关系](#各-attention-组件之间的关系)
 2. [架构总览](#2-架构总览)
 3. [核心 Attention 层](#3-核心-attention-层)
+   - 3.1 [Eager Mode 与 Compile Mode 控制逻辑](#eager-mode-与-compile-mode-控制逻辑)
 4. [V1 Backend 抽象层](#4-v1-backend-抽象层)
 5. [Backend 选择机制](#5-backend-选择机制)
 6. [主要 Backend 实现](#6-主要-backend-实现)
@@ -406,6 +407,7 @@ class Attention(nn.Module, AttentionLayerBase):
 4. **创建 Backend 实现** — 通过 `backend.get_impl_cls()` 获取实现类并实例化
 5. **初始化 KV Cache** — 为每个 Pipeline 并行阶段创建占位 KV Cache 张量
 6. **设置量化参数** — 初始化 FP8 Q/K/V 缩放因子（详见下方说明）
+7. **确定调用模式** — 根据平台设置 `use_direct_call`（详见"Eager Mode 与 Compile Mode"小节）
 
 #### FP8 Q/K/V 缩放因子详解
 
@@ -554,24 +556,153 @@ forward(query, key, value, output_shape)
         # → 后续经过 O Projection → 残差连接 → 下一层
 ```
 
-#### Custom Ops 机制
+#### Eager Mode 与 Compile Mode 控制逻辑
 
-vLLM 将注意力计算注册为 PyTorch Custom Ops，使其与 `torch.compile` 兼容：
+vLLM 的注意力系统支持两种执行模式：**Eager Mode**（直接函数调用）和 **Compile Mode**（通过不透明 Custom Op 调用）。模式选择影响 `torch.compile` 对注意力计算的可见性。
+
+##### 编译模式配置
+
+**文件**：`vllm/config/compilation.py`
 
 ```python
-# 注册为 Custom Op
-@torch.library.custom_op("vllm::unified_attention_with_output", mutates_args=["output"])
-def unified_attention_with_output(query, key, value, output, layer_name, ...):
-    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
-    self.impl.forward(self, query, key, value, kv_cache, attn_metadata, output=output)
-
-@torch.library.custom_op("vllm::unified_kv_cache_update", mutates_args=[])
-def unified_kv_cache_update(key, value, layer_name):
-    _, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
-    attn_layer.impl.do_kv_cache_update(attn_layer, key, value, kv_cache, slot_mapping)
+class CompilationMode(enum.IntEnum):
+    NONE = 0               # 完全 Eager 模式，不使用 torch.compile
+    STOCK_TORCH_COMPILE = 1  # 标准 torch.compile 编译流水线
+    DYNAMO_TRACE_ONCE = 2    # 单次 Dynamo trace，避免重编译
+    VLLM_COMPILE = 3         # vLLM 自定义 Inductor 后端（分段编译 + 缓存 + Custom Pass）
 ```
 
-这里的关键是 `get_attention_context(layer_name)` 函数，它从 `ForwardContext` 中提取当前批次的注意力元数据、KV Cache 和 slot 映射。
+`CompilationMode` 由启动配置决定。当 `enforce_eager=True` 或 `mode=0` 时，模型以纯 Eager 方式运行，不触发任何 `torch.compile` 编译。
+
+##### 平台级模式控制：`use_direct_call`
+
+**文件**：`vllm/model_executor/layers/attention/attention.py`
+
+```python
+# Attention.__init__() 中
+self.use_direct_call = not current_platform.opaque_attention_op()
+```
+
+| 平台 | `opaque_attention_op()` | `use_direct_call` | 说明 |
+|------|------------------------|-------------------|------|
+| CUDA | `True` | `False` | 注意力作为不透明 Custom Op，torch.compile 不会 trace 进入 |
+| ROCm | `True` | `False` | 同 CUDA |
+| XPU | `True` | `False` | 同 CUDA |
+| CPU | `False`（默认） | `True` | 直接函数调用，torch.compile 可以 trace 整个注意力逻辑 |
+
+##### Forward 中的双路径分发
+
+`Attention.forward()` 根据 `use_direct_call` 选择不同的调用路径：
+
+```python
+# 路径 A: 直接调用（Eager 模式 / CPU 平台）
+if self.use_direct_call:
+    # 直接调用 Python 函数，torch.compile 可以 trace 进入内部逻辑
+    kv_cache_dummy_dep = unified_kv_cache_update(key, value, self.layer_name)
+    unified_attention_with_output(query, key, value, output, self.layer_name,
+                                  kv_cache_dummy_dep=kv_cache_dummy_dep)
+
+# 路径 B: 不透明 Custom Op（Compile 模式 / CUDA/ROCm/XPU 平台）
+else:
+    # 通过 torch.ops.vllm.* 调用，torch.compile 将其视为黑盒
+    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+        key, value, self.layer_name)
+    torch.ops.vllm.unified_attention_with_output(
+        query, key, value, output, self.layer_name,
+        kv_cache_dummy_dep=kv_cache_dummy_dep)
+```
+
+**为什么需要两条路径**：
+
+- **不透明 Custom Op（路径 B）**：`torch.compile` 将注意力视为单个黑盒算子，不尝试融合或优化其内部逻辑。这避免了编译器对复杂注意力核（FlashAttention CUDA 核等）进行不当优化，同时允许编译器优化注意力之外的线性层、激活函数等
+- **直接调用（路径 A）**：在 CPU 等不需要 Custom Op 的平台，torch.compile 可以完整 trace 注意力逻辑，进行端到端优化
+
+##### Custom Op 注册机制
+
+**文件**：`vllm/utils/torch_utils.py` — `direct_register_custom_op()`
+
+```python
+def direct_register_custom_op(
+    op_name: str,          # 算子名，如 "unified_attention_with_output"
+    op_func: Callable,     # 实际执行函数
+    mutates_args: list,    # 声明哪些参数会被原地修改
+    fake_impl: Callable,   # torch.compile 用的 fake 实现（只返回正确形状的空张量）
+    dispatch_key: str,     # 分发到哪个后端（"CUDA"/"CPU" 等）
+    tags: tuple,           # 可标记 cudagraph_unsafe
+):
+    schema_str = infer_schema(op_func, mutates_args=mutates_args)
+    vllm_lib.define(op_name + schema_str, tags=tags)     # 1. 定义算子 schema
+    vllm_lib.impl(op_name, op_func, dispatch_key=...)    # 2. 注册真实实现
+    vllm_lib._register_fake(op_name, fake_impl)          # 3. 注册 fake 实现
+```
+
+注册后，`torch.ops.vllm.unified_attention_with_output(...)` 在真实执行时调用 `op_func`，在 `torch.compile` trace 时调用 `fake_impl`（返回正确形状的空张量，仅用于形状推导）。
+
+##### 注意力算子与分段编译
+
+**文件**：`vllm/config/compilation.py`
+
+vLLM 的 `VLLM_COMPILE` 模式（mode=3）使用**分段编译（Piecewise Compilation）**：将模型 FX 图在注意力算子处切分为多段，每段独立编译和 CUDA Graph 捕获。
+
+```python
+# 被视为 "分段切割点" 的注意力算子
+_attention_ops: ClassVar[list[str]] = [
+    "vllm::unified_attention",
+    "vllm::unified_attention_with_output",
+    "vllm::unified_mla_attention",
+    "vllm::unified_mla_attention_with_output",
+    "vllm::mamba_mixer2",
+    "vllm::mamba_mixer",
+    # ... 以及其他 SSM/线性注意力算子
+]
+```
+
+分段编译流程：
+
+```
+模型 FX 图
+┌──────────────────────────────────────────────────────────┐
+│  Linear → RoPE → [切割] → Attention → [切割] → Linear   │
+│  │                         ↑ 不透明 Custom Op              │
+│  ▼                         │                               │
+│  段1: 可编译 + CUDAGraph   段2: Eager 执行   段3: 可编译    │
+└──────────────────────────────────────────────────────────┘
+```
+
+- **段1/段3**（线性层、激活等）：由 Inductor 编译优化 + CUDAGraph 捕获
+- **段2**（注意力算子）：标记为 `cudagraph_unsafe`，以 Eager 方式执行（因为 batch 大小动态变化，CUDAGraph 需要固定形状）
+
+`splitting_ops` 配置控制切分行为：
+- `None`（默认）：使用 `_attention_ops` 作为切分点
+- `[]`（空列表）：不切分，适用于全量 CUDAGraph 模式（如 FlashAttention v3 的 `ALWAYS` CG 支持级别）
+
+##### ForwardContext：连接编译图与运行时状态
+
+**文件**：`vllm/forward_context.py`
+
+Custom Op 内部通过 `ForwardContext` 访问当前批次的运行时状态，这是编译模式能正常工作的关键：
+
+```python
+@dataclass
+class ForwardContext:
+    no_compile_layers: dict[str, Any]  # layer_name → Attention 层实例
+    attn_metadata: dict[str, AttentionMetadata]  # 注意力元数据
+    slot_mapping: dict[str, torch.Tensor]  # KV Cache 写入映射
+    # ...
+
+# Custom Op 内部获取上下文
+def unified_attention_with_output(query, key, value, output, layer_name, ...):
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]  # 获取层实例
+    attn_metadata = forward_context.attn_metadata                # 获取元数据
+    kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
+    attn_layer.impl.forward(attn_layer, query, key, value, kv_cache, attn_metadata, output=output)
+```
+
+`no_compile_layers` 的设计意义：层实例引用不嵌入编译图中，而是在运行时通过 `layer_name` 字符串查找。这使得：
+- 编译图可以在不同 batch 间复用
+- 层的权重更新不需要重编译
+- 支持 MoE 等动态路由模型的快速冷启动
 
 ---
 
