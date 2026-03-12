@@ -13,6 +13,8 @@
    - 6.1 [FlashAttention](#61-flashattention-backend)
    - 6.2 [FlashInfer](#62-flashinfer-backend)
    - 6.3 [Triton](#63-triton-backend)
+   - 6.4 [同一 Kernel 的多种实现方式](#同一-kernel-的多种实现方式)
+   - 6.5 [不同 Kernel 的适用场景](#不同-kernel-的适用场景)
 7. [MLA (Multi-Head Latent Attention)](#7-mla-multi-head-latent-attention)
 8. [Paged Attention 与 KV Cache](#8-paged-attention-与-kv-cache)
 9. [特殊 Attention 变体](#9-特殊-attention-变体)
@@ -1119,6 +1121,129 @@ class TritonAttentionMetadata:
 | **ROCm (gfx1x: RDNA3/4)** | Triton Attention | FlashAttention (Triton 后端) | Triton MLA |
 | **XPU (Intel)** | FlashAttention (IPEX 实现) | Triton Attention (fp32 回退) | Triton MLA (唯一) |
 | **CPU** | CPU Attention (PyTorch ops) | 无 | 不支持 |
+
+### 同一 Kernel 的多种实现方式
+
+同一个逻辑操作在 vLLM 中通常有多种实现，覆盖不同硬件平台和优化策略。以下按逻辑操作分组，列出所有实现变体：
+
+#### Paged Attention（分页注意力计算）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| CUDA V1 | `csrc/attention/paged_attention_v1.cu` | CUDA C++ | 短序列单 pass，模板特化多种 block_size/head_size |
+| CUDA V2 | `csrc/attention/paged_attention_v2.cu` | CUDA C++ | 长序列分区 reduce（QKV 核 + reduce 核两步执行） |
+| Triton Decode 2D | `v1/attention/ops/triton_decode_attention.py` | Triton Python | 纯 Triton 编写，短序列统一块布局 |
+| Triton Unified 3D | `v1/attention/ops/triton_unified_attention.py` | Triton Python | 自适应 2D/3D 核，支持 prefill+decode+cascade |
+| ROCm MFMA | `csrc/rocm/attention.cu` | ROCm/HIP | 多种 MFMA 核变体（mfma16/mfma4），适配 gfx9/gfx11/gfx12 |
+| CPU SIMD | `csrc/cpu/cpu_attn.cpp` + ISA 头文件 | CPU | 7 种 ISA 变体（AVX-512/AMX/NEON/VXE 等），动态分发 |
+
+#### Flash Attention（密集注意力）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| FlashAttention v2/v3 | `v1/attention/backends/flash_attn.py` → 外部库 | CUDA C++ | 官方 Dao-AILab 库，varlen 接口，支持 FP8 descale |
+| FlashAttention DiffKV | `v1/attention/backends/flash_attn_diffkv.py` → 外部库 | CUDA C++ | 支持不同 K/V 头维度的变体 |
+| FlashInfer Native | `v1/attention/backends/flashinfer.py` → 外部库 | CUDA C++ | FlashInfer 库，plan/run 两步模式 |
+| FlashInfer TRTLLM | `v1/attention/backends/flashinfer.py` → TRT-LLM 核 | CUDA C++ | NVIDIA TRT-LLM 路径，Blackwell HND 布局优化 |
+| Triton Prefill | `v1/attention/ops/triton_prefill_attention.py` | Triton Python | 纯 Triton 实现，支持 ALiBi/因果掩码/可变 head_size |
+| ROCm AITER FA | `v1/attention/backends/rocm_aiter_fa.py` → aiter_ops | ROCm/HIP | AMD AITER 库封装，gfx9 专用优化核 |
+| ROCm AITER Unified | `v1/attention/backends/rocm_aiter_unified_attn.py` | ROCm/HIP | Prefill+Decode 统一核，AITER + Triton 前缀预填充混合 |
+| FlexAttention | `v1/attention/backends/flex_attention.py` → PyTorch | PyTorch Compile | PyTorch 2.4+ 原生 flex_attention，动态块掩码 |
+
+#### MLA Attention（多头潜在注意力）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| CUTLASS MLA | `csrc/attention/mla/sm100_cutlass_mla_kernel.cu` | CUDA C++ (SM100) | Blackwell 专用 CUTLASS FMHA，TMA warp 特化 |
+| FlashMLA | `v1/attention/backends/mla/flashmla.py` → ops | CUDA C++ | SGLang FlashMLA 核，decode 优化，支持 FP8 |
+| FlashInfer MLA | `v1/attention/backends/mla/flashinfer_mla.py` | CUDA (FlashInfer 库) | FlashInfer MLA 路径，含 TRTLLM decode |
+| FlashAttn MLA | `v1/attention/backends/mla/flashattn_mla.py` | CUDA/ROCm (外部库) | 基于 FlashAttention 库的 MLA 封装 |
+| Triton MLA | `v1/attention/backends/mla/triton_mla.py` | Triton Python | 纯 Triton 实现，跨平台可移植（ROCm/XPU/CPU） |
+| ROCm AITER MLA | `v1/attention/backends/mla/rocm_aiter_mla.py` | ROCm (gfx9) | AMD AITER ops MLA 专用核 |
+| AITER Triton MLA | `v1/attention/backends/mla/aiter_triton_mla.py` | ROCm | AITER + Triton 混合 MLA |
+| CPU MLA Decode | `csrc/cpu/mla_decode.cpp` | CPU | CPU 端 MLA decode 实现 |
+
+#### Attention State Merge（注意力状态合并）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| CUDA 核 | `csrc/attention/merge_attn_states.cu` | CUDA C++ | 128-bit packed load/store，支持 FP16/BF16/FP32 |
+| Triton 核 | `v1/attention/ops/triton_merge_attn_states.py` | Triton Python | 额外支持 FP8，CUDA 核不支持的 dtype/head_size 回退 |
+
+#### KV Cache 写入（reshape_and_cache）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| CUDA 核 | CUDA 库中 `reshape_and_cache_flash` | CUDA C++ | 按 slot_mapping 写入，支持 FP8 量化写入 |
+| Triton 核 | `v1/attention/ops/triton_reshape_and_cache_flash.py` | Triton Python | 支持 NHD/HND 双布局，DiffKV 变体 |
+
+#### 稀疏注意力（Sparse Attention）
+
+| 实现 | 文件 | 平台 | 特点 |
+|------|------|------|------|
+| CUDA 稀疏索引 | `csrc/attention/vertical_slash_index.cu` | CUDA C++ | 稀疏注意力模式的索引计算核 |
+| FlashMLA Sparse | `v1/attention/backends/mla/flashmla_sparse.py` | CUDA | FlashMLA + block-sparse 模式（block_size=1） |
+| FlashInfer MLA Sparse | `v1/attention/backends/mla/flashinfer_mla_sparse.py` | CUDA | FlashInfer MLA + 可配置稀疏度 |
+| ROCm AITER MLA Sparse | `v1/attention/backends/mla/rocm_aiter_mla_sparse.py` | ROCm (gfx9) | AMD 平台稀疏 MLA |
+
+> **设计哲学**：每个逻辑操作都遵循 "CUDA C++ 高性能核 → 外部库封装 → Triton 通用回退" 的分层实现策略。CUDA C++ 核提供最高性能但可移植性最差；Triton 核可跨 GPU 平台运行但性能可能次优；外部库（FlashAttention/FlashInfer/AITER）在特定平台上提供经过高度优化的实现。
+
+### 不同 Kernel 的适用场景
+
+不同的注意力 kernel 针对不同的使用场景进行了优化。以下按场景分类，列出最适合的 kernel 及其选择原因：
+
+#### 按计算阶段分类
+
+| 阶段 | 适用 Kernel | 选择原因 |
+|------|------------|---------|
+| **Prefill（首次推理）** | Triton Prefill、FlashAttention varlen、FlashInfer BatchPrefill | 长序列、高并行度，需要最大化 TLB 命中率和计算吞吐量 |
+| **Decode（逐 token 生成）** | Paged Attention V1/V2、Triton Decode、FlashInfer BatchDecode、FlashMLA | 单/少量 token，受内存带宽限制，优化延迟和批处理效率 |
+| **Unified（混合批次）** | Triton Unified、Chunked Prefill+Paged Decode、ROCm AITER Unified | 同一批次中 prefill 和 decode 请求共存，消除分支开销 |
+
+#### 按序列长度分类
+
+| 序列长度 | 适用 Kernel | 选择原因 |
+|---------|------------|---------|
+| **短序列（< 512 tokens）** | Paged Attention V1、Triton Decode 2D、FlashMLA Dense | 核启动开销 > 计算，V1 单 pass 避免 reduce 开销 |
+| **中等序列（512 ~ 4K）** | FlashAttention v3、Triton Prefill、FlashInfer | 良好的 SM 占用率和内存带宽利用 |
+| **长序列（4K ~ 100K+）** | Paged Attention V2（分区 reduce）、Triton Unified 3D、Cascade Attention | V2 将序列分区并行计算后 reduce，3D 核支持跨块级联 |
+| **超长序列（100K+）** | Cascade Attention + Merge、DCP（分布式上下文并行）、Sparse Attention | 单 GPU 显存不足，需分布式或稀疏化处理 |
+
+#### 按注意力模式分类
+
+| 模式 | 适用 Kernel | 场景举例 |
+|------|------------|---------|
+| **因果注意力（Causal）** | FlashAttention、FlashInfer、Triton（设 `causal=True`） | GPT、LLaMA 等自回归模型的标准推理 |
+| **双向注意力（Bidirectional）** | Triton Prefill（`causal=False`）、FlashAttention Encoder | BERT、RoBERTa 等编码器模型 |
+| **交叉注意力（Cross）** | FlashAttention（encoder_decoder 模式）、Triton | T5、BART 等编码器-解码器模型 |
+| **滑动窗口（Sliding Window）** | FlashAttention（`window_size` 参数）、Triton | Mistral 等使用局部注意力的模型 |
+| **分块局部（Chunked Local）** | ChunkedLocalAttention（虚拟 batch 重组） | 长序列场景下限制注意力范围 |
+| **Sink Token** | StaticSinkAttention（Triton 核填充 sink KV） | StreamingLLM 风格，保留初始 token |
+| **稀疏注意力（Sparse）** | FlashMLA Sparse、FlashInfer MLA Sparse、vertical_slash_index | 大规模 MLA 模型的效率优化 |
+| **树形注意力（Tree）** | Tree Attention（Triton Unified 核 + 树掩码） | 推测解码中的多分支并行验证 |
+
+#### 按模型架构分类
+
+| 模型架构 | 适用 Kernel | 说明 |
+|---------|------------|------|
+| **标准 Transformer（LLaMA/GPT/Mistral）** | FlashAttention / FlashInfer / Triton | 标准 MHA/GQA 注意力，按 GPU 代际自动选择最优后端 |
+| **MLA 模型（DeepSeek-V2/V3）** | FlashMLA / CUTLASS MLA / FlashInfer MLA / Triton MLA | MLA 专用后端，KV Cache 576 维压缩，双路径 MHA+MQA |
+| **编码器模型（BERT/RoBERTa）** | Triton（首选，完整编码器支持）、FlashAttention | 双向注意力，无 KV Cache |
+| **编码器-解码器（T5/BART）** | FlashAttention / Triton | 交叉注意力 + 编码器 KV Cache |
+| **SSM/Mamba 模型** | Mamba / Mamba2 Backend | 线性递推，固定状态大小，非 Q/K/V 注意力 |
+| **线性注意力模型** | Linear Attention Backend | O(n) 复杂度，状态索引替代 slot mapping |
+| **多模态模型（ViT+LLM）** | FlashAttention + MMEncoderAttention | ViT 使用编码器注意力，LLM 部分使用标准注意力 |
+
+#### 按优化目标分类
+
+| 优化目标 | 适用 Kernel / 技术 | 机制 |
+|---------|-------------------|------|
+| **最大吞吐量** | FlashAttention v3 + AOT Scheduling | 预计算 tile 调度，减少核启动开销 |
+| **最低延迟** | FlashInfer BatchDecode + CUDA Graph | 预规划 + 图捕获消除每次调用开销 |
+| **最小显存** | MLA Kernel + FP8 量化 | 576 维 KV Cache + 8-bit 量化 = ~28× 压缩 |
+| **共享前缀** | Cascade Attention + Merge State | 前缀计算一次 + LogSumExp 合并 = 避免重复计算 |
+| **多 GPU 长上下文** | DCP / PCP + All-gather/Reduce-scatter | KV Cache 分布式存储，注意力分布式计算 |
+| **跨平台可移植** | Triton Kernel（Prefill/Decode/Unified/MLA） | 纯 Python DSL 编写，支持 CUDA/ROCm/XPU |
 
 ---
 
