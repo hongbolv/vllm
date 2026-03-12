@@ -1174,7 +1174,7 @@ class TritonAttentionMetadata:
 
 | 实现 | 文件 | 平台 | 特点 |
 |------|------|------|------|
-| CUDA 核 | CUDA 库中 `reshape_and_cache_flash` | CUDA C++ | 按 slot_mapping 写入，支持 FP8 量化写入 |
+| CUDA 核 | `csrc/cache_kernels.cu` (`reshape_and_cache_flash`) | CUDA C++ | 按 slot_mapping 写入，支持 FP8 量化写入 |
 | Triton 核 | `v1/attention/ops/triton_reshape_and_cache_flash.py` | Triton Python | 支持 NHD/HND 双布局，DiffKV 变体 |
 
 #### 稀疏注意力（Sparse Attention）
