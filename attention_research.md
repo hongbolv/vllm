@@ -36,6 +36,7 @@
    - 6.5 [各平台 Kernel 实现概览](#各平台-kernel-实现概览)
    - 6.6 [同一 Kernel 的多种实现方式](#同一-kernel-的多种实现方式)
    - 6.7 [不同 Kernel 的适用场景](#不同-kernel-的适用场景)
+   - 6.8 [Kernel 调用方式分类（直接调用 vs PyTorch API）](#kernel-调用方式分类直接调用-vs-pytorch-api)
 7. [MLA (Multi-Head Latent Attention)](#7-mla-multi-head-latent-attention)
    - 7.1 [原理与 KV 压缩](#71-原理)
    - 7.2 [双路径计算（MHA Prefill / MQA Decode）](#73-双路径计算)
@@ -1488,6 +1489,84 @@ class TritonAttentionMetadata:
 | **共享前缀** | Cascade Attention + Merge State | 前缀计算一次 + LogSumExp 合并 = 避免重复计算 |
 | **多 GPU 长上下文** | DCP / PCP + All-gather/Reduce-scatter | KV Cache 分布式存储，注意力分布式计算 |
 | **跨平台可移植** | Triton Kernel（Prefill/Decode/Unified/MLA） | 纯 Python DSL 编写，支持 CUDA/ROCm/XPU |
+
+### Kernel 调用方式分类（直接调用 vs PyTorch API）
+
+vLLM 的 attention kernel **绝大多数绕过 PyTorch 的 attention API，直接调用底层 kernel 实现**。只有少数场景（CPU prefill、FlexAttention、ViT 兼容）会走 PyTorch 内置的 `scaled_dot_product_attention`。
+
+#### 四类调用路径
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    vLLM Attention 调用路径                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  路径 A: 外部 C++ 库直接调用（主力路径）                           │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ FlashAttention:  flash_attn_varlen_func()               │   │
+│  │   └─ 来源: vllm.vllm_flash_attn (CUDA) /               │   │
+│  │           flash_attn (ROCm) / xpu_ops (XPU)             │   │
+│  │ FlashInfer:      trtllm_batch_*_with_kv_cache()         │   │
+│  │   └─ 来源: flashinfer.prefill / flashinfer.decode       │   │
+│  │ ROCm AITER:      rocm_aiter_ops.flash_attn_varlen_func()│   │
+│  │   └─ 来源: vllm._aiter_ops                              │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  路径 B: vLLM 自研 Triton Kernel（可移植路径）                    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ unified_attention()       ← @triton.jit 装饰器编译       │   │
+│  │ context_attention_fwd()   ← @triton.jit 装饰器编译       │   │
+│  │ triton_reshape_and_cache_flash() ← @triton.jit          │   │
+│  │   └─ 来源: vllm/v1/attention/ops/triton_*.py            │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  路径 C: vLLM C++ 自定义算子（KV Cache + CPU）                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ ops.reshape_and_cache_flash()    ← torch.ops._C_cache_ops│   │
+│  │ ops.cpu_attention_with_kv_cache()← vllm._custom_ops     │   │
+│  │ ops.cpu_attn_reshape_and_cache() ← vllm._custom_ops     │   │
+│  │ rocm_aiter_ops.pa_fwd_asm()     ← ROCm 汇编内核         │   │
+│  │   └─ 通过 vllm/_custom_ops 或 torch.ops.vllm.* 注册    │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  路径 D: PyTorch 内置 API（少数场景）                             │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ F.scaled_dot_product_attention()                         │   │
+│  │   └─ CPU prefill 路径 (cpu_attn.py)                     │   │
+│  │   └─ ViT 兼容层 (vit_attn_wrappers.py)                  │   │
+│  │ flex_attention() + torch.compile                         │   │
+│  │   └─ FlexAttention 后端 (flex_attention.py)              │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 完整调用方式对照表
+
+| Backend | 核心函数调用 | 调用类型 | 来源 |
+|---------|-------------|---------|------|
+| **FlashAttention** | `flash_attn_varlen_func()` | 外部 C++ 库 | `vllm.vllm_flash_attn` / `flash_attn` / `xpu_ops` |
+| **FlashInfer (Prefill)** | `trtllm_batch_context_with_kv_cache()` | 外部 C++ 库 | `flashinfer.prefill` |
+| **FlashInfer (Decode)** | `trtllm_batch_decode_with_kv_cache()` | 外部 C++ 库 | `flashinfer.decode` |
+| **Triton (Unified)** | `unified_attention()` | Triton JIT | `vllm.v1.attention.ops.triton_unified_attention` |
+| **Triton (Prefill)** | `context_attention_fwd()` | Triton JIT | `vllm.v1.attention.ops.triton_prefill_attention` |
+| **ROCm AITER (FA)** | `rocm_aiter_ops.flash_attn_varlen_func()` | ROCm C++ 扩展 | `vllm._aiter_ops` |
+| **ROCm AITER (PA)** | `rocm_aiter_ops.pa_fwd_asm()` | ROCm 汇编内核 | `vllm._aiter_ops` |
+| **CPU (Decode)** | `ops.cpu_attention_with_kv_cache()` | C++ 自定义算子 | `vllm._custom_ops` |
+| **CPU (Prefill)** | `F.scaled_dot_product_attention()` | **PyTorch 内置** | `torch.nn.functional` |
+| **FlexAttention** | `flex_attention()` | **PyTorch 内置** + `torch.compile` | `torch.nn.attention.flex_attention` |
+| **ViT SDPA** | `F.scaled_dot_product_attention()` | **PyTorch 内置** | `torch.nn.functional` |
+| **KV Cache 写入** | `reshape_and_cache_flash()` | C++ 自定义算子 | `torch.ops._C_cache_ops` |
+
+#### 设计理由
+
+vLLM 选择绕过 PyTorch 内置 attention 的主要原因：
+
+1. **Paged KV Cache 不兼容**：PyTorch 的 `F.scaled_dot_product_attention()` 要求连续的 K/V 张量，而 vLLM 使用分页内存布局（block table + slot mapping），需要底层 kernel 直接理解分页结构
+2. **性能优化**：FlashAttention/FlashInfer 等外部库提供了针对特定 GPU 架构深度调优的 kernel（如 FlashInfer 的 TRT-LLM 路径、Blackwell HND 内存布局），远超 PyTorch 通用实现的性能
+3. **FP8 量化集成**：vLLM 的 FP8 Q/K/V 缩放因子（见 §3.3）需要在 kernel 内部完成量化/反量化，PyTorch SDPA 不支持这种自定义量化流程
+4. **Custom Op + torch.compile**：通过 `torch.ops.vllm.*` 注册不透明自定义算子（见 §3.4），vLLM 在保持 `torch.compile` 兼容性的同时使用自定义 kernel
+
+**例外情况**：CPU prefill 路径和 FlexAttention 后端是仅有的使用 PyTorch 内置 API 的场景——前者因为 CPU 上没有 Paged Attention 需求（直接将 K/V 拼接为连续张量），后者利用 PyTorch 的 `flex_attention` 实现灵活的注意力模式（如树形注意力）并通过 `torch.compile` 生成优化代码。
 
 ---
 
