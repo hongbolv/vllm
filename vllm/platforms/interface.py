@@ -179,6 +179,11 @@ class Platform:
     def get_max_output_tokens(self, prompt_len: int) -> int:
         return sys.maxsize
 
+    @classmethod
+    def device_count(cls) -> int:
+        """Return the number of devices available on this platform."""
+        return 0
+
     def is_cuda_alike(self) -> bool:
         """Stateless version of [torch.cuda.is_available][]."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)

@@ -19,7 +19,6 @@ from vllm.model_executor.layers.batch_invariant import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_ports_list
-from vllm.utils.torch_utils import cuda_device_count_stateless
 
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
@@ -710,13 +709,14 @@ class ParallelConfig:
             ray_found = ray_utils.ray_is_available()
             if current_platform.is_tpu() and envs.VLLM_XLA_USE_SPMD:
                 backend = "uni"
-            elif current_platform.is_cuda() and self.nnodes > 1:
+            elif (
+                current_platform.is_cuda() or current_platform.is_xpu()
+            ) and self.nnodes > 1:
                 backend = "mp"
             elif (
-                current_platform.is_cuda()
-                and cuda_device_count_stateless() < self.world_size
-            ):
-                gpu_count = cuda_device_count_stateless()
+                current_platform.is_cuda() or current_platform.is_xpu()
+            ) and current_platform.device_count() < self.world_size:
+                gpu_count = current_platform.device_count()
                 raise ValueError(
                     f"World size ({self.world_size}) is larger than the number of "
                     f"available GPUs ({gpu_count}) in this node. If this is "
