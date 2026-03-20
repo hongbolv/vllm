@@ -60,9 +60,10 @@ class XPUWorker(Worker):
             and current_platform.is_xpu()
         ):
             # Set ZE_AFFINITY_MASK to isolate this worker to its assigned
-            # physical device BEFORE any torch.xpu access. This prevents
-            # Level Zero from initializing all devices on the system, which
-            # can crash on some hardware (e.g. multiple Intel Arc GPUs).
+            # physical device BEFORE any torch.xpu access. This avoids the
+            # UR Level Zero adapter's multi-device initialization path,
+            # which can crash on systems with multiple Intel Arc GPUs due
+            # to a bug in the adapter's extension property chain handling.
             physical_device_id = current_platform.device_id_to_physical_device_id(
                 self.local_rank
             )
