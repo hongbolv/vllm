@@ -59,19 +59,22 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            # Determine the device index based on visible devices.
-            # When ZE_AFFINITY_MASK isolates a single device per worker
-            # (device_count == 1), the device is remapped to index 0
-            # regardless of local_rank.
-            device_count = torch.xpu.device_count()
-            device_index = 0 if device_count == 1 else self.local_rank
-            self.device = torch.device(f"xpu:{device_index}")
+            # Set ZE_AFFINITY_MASK to isolate this worker to its assigned
+            # physical device BEFORE any torch.xpu access. This prevents
+            # Level Zero from initializing all devices on the system, which
+            # can crash on some hardware (e.g. multiple Intel Arc GPUs).
+            physical_device_id = current_platform.device_id_to_physical_device_id(
+                self.local_rank
+            )
+            os.environ["ZE_AFFINITY_MASK"] = str(physical_device_id)
+
+            # After setting the mask, only one device is visible,
+            # so always use device index 0.
+            self.device = torch.device("xpu:0")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
-            self.init_gpu_memory = torch.xpu.get_device_properties(
-                device_index
-            ).total_memory
+            self.init_gpu_memory = torch.xpu.get_device_properties(0).total_memory
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
