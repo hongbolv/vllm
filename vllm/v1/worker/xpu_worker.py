@@ -59,12 +59,18 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            self.device = torch.device(f"xpu:{self.local_rank}")
+            # Determine the device index based on visible devices.
+            # When ZE_AFFINITY_MASK isolates a single device per worker,
+            # the visible device count may be less than local_rank + 1,
+            # so we use device 0 in that case.
+            device_count = torch.xpu.device_count()
+            device_index = self.local_rank if self.local_rank < device_count else 0
+            self.device = torch.device(f"xpu:{device_index}")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
             self.init_gpu_memory = torch.xpu.get_device_properties(
-                self.local_rank
+                device_index
             ).total_memory
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")

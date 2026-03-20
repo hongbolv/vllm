@@ -71,6 +71,7 @@ class RayDistributedExecutor(Executor):
         "CUDA_VISIBLE_DEVICES",
         "HIP_VISIBLE_DEVICES",
         "ROCR_VISIBLE_DEVICES",
+        "ZE_AFFINITY_MASK",
     }
 
     uses_ray: bool = True

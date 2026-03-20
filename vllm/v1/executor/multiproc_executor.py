@@ -673,7 +673,26 @@ class WorkerProc:
             daemon=True,
         )
 
-        proc.start()
+        # For XPU: temporarily set per-worker ZE_AFFINITY_MASK before
+        # spawning to prevent concurrent Level Zero device initialization
+        # crashes when using multiple Intel GPUs. Each worker is isolated
+        # to its own device; the worker then uses device index 0.
+        original_ze_mask = os.environ.get("ZE_AFFINITY_MASK")
+        if current_platform.is_xpu():
+            physical_device_id = current_platform.device_id_to_physical_device_id(
+                local_rank
+            )
+            os.environ["ZE_AFFINITY_MASK"] = str(physical_device_id)
+
+        try:
+            proc.start()
+        finally:
+            # Restore the original ZE_AFFINITY_MASK in the parent process.
+            if current_platform.is_xpu():
+                if original_ze_mask is not None:
+                    os.environ["ZE_AFFINITY_MASK"] = original_ze_mask
+                else:
+                    os.environ.pop("ZE_AFFINITY_MASK", None)
         # Close child ends of pipes here in the parent
         ready_writer.close()
         death_reader.close()
