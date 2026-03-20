@@ -673,10 +673,9 @@ class WorkerProc:
             daemon=True,
         )
 
-        # For XPU: temporarily set per-worker ZE_AFFINITY_MASK before
-        # spawning to avoid the UR Level Zero adapter's multi-device
-        # initialization bug on systems with multiple Intel GPUs. Each
-        # worker is isolated to its own device; the worker uses device 0.
+        # For XPU: set per-worker ZE_AFFINITY_MASK before spawning so
+        # the child process inherits device isolation from the start.
+        # This is the XPU equivalent of CUDA_VISIBLE_DEVICES.
         if current_platform.is_xpu():
             original_ze_mask = os.environ.get("ZE_AFFINITY_MASK")
             physical_device_id = current_platform.device_id_to_physical_device_id(
