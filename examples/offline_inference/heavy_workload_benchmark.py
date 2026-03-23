@@ -11,7 +11,7 @@ Reference: Qwen3-30B-A3B MoE demo for multi-GPU inference.
 
 Usage examples:
 
-    # Basic heavy workload with default settings (GPU, compiled mode)
+    # Basic heavy workload with default settings (GPU, eager mode)
     python examples/offline_inference/heavy_workload_benchmark.py
 
     # Custom model with tensor parallelism
@@ -21,15 +21,9 @@ Usage examples:
         --num-prompts 200 \
         --max-tokens 512
 
-    # Compare eager vs compiled mode
-    python examples/offline_inference/heavy_workload_benchmark.py \
-        --model meta-llama/Llama-3.1-8B-Instruct \
-        --compare-eager
-
-    # XPU / CPU fallback (auto-disables torch.compile)
+    # XPU with explicit dtype (auto-detects XPU and configures eagerly)
     python examples/offline_inference/heavy_workload_benchmark.py \
         --model Qwen/Qwen3-30B-A3B \
-        --enforce-eager \
         --dtype float16
 """
 
@@ -300,7 +294,7 @@ def main():
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Force eager execution (no torch.compile)",
+        help="Force eager execution (no torch.compile). Automatically enabled on XPU.",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -315,11 +309,6 @@ def main():
         help="Override KV cache block count (for memory-limited GPUs)",
     )
     parser.add_argument(
-        "--compare-eager",
-        action="store_true",
-        help="Run both compiled and eager modes, then compare throughput",
-    )
-    parser.add_argument(
         "--show-samples",
         type=int,
         default=3,
@@ -332,16 +321,17 @@ def main():
     )
     args = parser.parse_args()
 
-    # Detect XPU and auto-configure
+    # Detect XPU and auto-configure — XPU only supports eager mode
     try:
         import torch
 
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
             os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+            args.enforce_eager = True
             print(
-                "[INFO] XPU detected — torch.compile disabled, "
-                "timeout extended to 1800s"
+                "[INFO] XPU detected — forcing eager mode, "
+                "torch.compile disabled, timeout extended to 1800s"
             )
     except ImportError:
         pass
@@ -376,50 +366,15 @@ def main():
     print(f"  dtype           : {args.dtype}")
     print("=" * 60)
 
-    if args.compare_eager:
-        # --- Compiled mode ---
-        print("\n>>> Phase 1: Compiled mode (default)")
-        compiled_stats, compiled_outputs = run_benchmark(
-            **common_kwargs,
-            enforce_eager=False,
-        )
-        print_stats(compiled_stats, label="Compiled")
-        if args.show_samples > 0:
-            print_sample_outputs(compiled_outputs, args.show_samples)
-
-        # --- Eager mode ---
-        print("\n>>> Phase 2: Eager mode (enforce_eager=True)")
-        eager_stats, eager_outputs = run_benchmark(
-            **common_kwargs,
-            enforce_eager=True,
-        )
-        print_stats(eager_stats, label="Eager")
-        if args.show_samples > 0:
-            print_sample_outputs(eager_outputs, args.show_samples)
-
-        # --- Comparison ---
-        print("\n" + "=" * 60)
-        print("  Eager vs Compiled Comparison")
-        print("=" * 60)
-        c_tp = compiled_stats["output_throughput_tok_s"]
-        e_tp = eager_stats["output_throughput_tok_s"]
-        speedup = c_tp / e_tp if e_tp > 0 else float("inf")
-        print(f"  Compiled throughput : {c_tp:.2f} tok/s")
-        print(f"  Eager throughput    : {e_tp:.2f} tok/s")
-        print(f"  Speedup (compiled)  : {speedup:.2f}x")
-        print(f"  Compiled init time  : {compiled_stats['init_time_s']:.2f}s")
-        print(f"  Eager init time     : {eager_stats['init_time_s']:.2f}s")
-        print("=" * 60)
-    else:
-        # Single mode run
-        stats, outputs = run_benchmark(
-            **common_kwargs,
-            enforce_eager=args.enforce_eager,
-        )
-        mode_label = "Eager" if args.enforce_eager else "Compiled"
-        print_stats(stats, label=mode_label)
-        if args.show_samples > 0:
-            print_sample_outputs(outputs, args.show_samples)
+    # Single mode run
+    stats, outputs = run_benchmark(
+        **common_kwargs,
+        enforce_eager=args.enforce_eager,
+    )
+    mode_label = "Eager" if args.enforce_eager else "Compiled"
+    print_stats(stats, label=mode_label)
+    if args.show_samples > 0:
+        print_sample_outputs(outputs, args.show_samples)
 
     print("\nDone!")
 
