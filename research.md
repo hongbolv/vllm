@@ -104,7 +104,7 @@ Dynamo 的输出是一个 `torch.fx.GraphModule`，这是一个中间表示（IR
 | **SHAPE_ENV** | 张量形状关系 | `x.shape[0] == y.shape[0]` |
 | **TYPE_MATCH** | 输入参数类型 | `isinstance(x, torch.Tensor)` |
 | **VALUE** | 具体数值 | `training == False` |
-| **ID_MATCH** | 对象身份 | `id(weight) == 0x7f...` |
+| **ID_MATCH** | 对象身份 | `id(weight) == 0x7f1a2b3c4d00` |
 | **GLOBAL_STATE** | 全局状态 | `torch.is_grad_enabled() == False` |
 
 #### Guard 与重编译（Recompilation）
@@ -231,7 +231,7 @@ def fused_rms_norm_silu_mul_quant_kernel(
 def set_inductor_config(config, compile_range):
     if compile_range.is_single_size():
         # 单一 batch size：启用完整调优
-        config["max_autotune"] = True          # 穷举搜索最优 Triton 内核参数
+        config["max_autotune"] = True          # 启用内核参数自动搜索最优配置
         config["coordinate_descent_tuning"] = True  # 坐标下降法迭代优化
     # 动态 range：跳过调优（编译成本太高）
 ```
@@ -455,14 +455,15 @@ class StandaloneCompiledArtifacts:
     # 第一级: "{子图名}_{形状}" → 内容 hash
     submodule_bytes = {
         "submod_0_Range(1,1)": "sha256_abc123...",
-        "submod_0_Range(2,2)": "sha256_abc123...",  # 同一子图不同 range 可能相同
-        "submod_2_Range(1,1)": "sha256_abc123...",  # 同构层的子图也可能相同
+        "submod_0_Range(2,2)": "sha256_def456...",  # 同一子图不同 range 通常不同
+        "submod_2_Range(1,1)": "sha256_abc123...",  # 同构层的子图内容相同 → hash 相同 → 去重
     }
 
     # 第二级: 内容 hash → 实际编译字节码
     submodule_bytes_store = {
-        "sha256_abc123...": b"<compiled triton code bytes>",
-        # 只存一份！多个子图共享
+        "sha256_abc123...": b"<compiled triton code for range(1,1)>",
+        "sha256_def456...": b"<compiled triton code for range(2,2)>",
+        # submod_0 和 submod_2 的 Range(1,1) 内容相同，只存一份！
     }
 ```
 
