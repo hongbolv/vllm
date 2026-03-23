@@ -137,7 +137,7 @@ def run_benchmark(
     tensor_parallel_size: int = 1,
     dtype: str = "auto",
     max_model_len: int = 4096,
-    enforce_eager: bool = False,
+    enforce_eager: bool = True,
     gpu_memory_utilization: float = 0.90,
     num_gpu_blocks_override: int | None = None,
     trust_remote_code: bool = True,
@@ -293,8 +293,10 @@ def main():
     )
     parser.add_argument(
         "--enforce-eager",
-        action="store_true",
-        help="Force eager execution (no torch.compile). Automatically enabled on XPU.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force eager execution (default: True). "
+        "Use --no-enforce-eager to enable torch.compile.",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -313,11 +315,6 @@ def main():
         type=int,
         default=3,
         help="Number of sample outputs to print (default: 3; 0 to disable)",
-    )
-    parser.add_argument(
-        "--no-trust-remote-code",
-        action="store_true",
-        help="Disable trusting remote code in model (default: trust enabled)",
     )
     args = parser.parse_args()
 
@@ -353,7 +350,7 @@ def main():
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        trust_remote_code=not args.no_trust_remote_code,
+        trust_remote_code=True,
     )
 
     print("=" * 60)
