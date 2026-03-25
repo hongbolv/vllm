@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: 2024 Intel Corporation
 # Demo: Qwen1.5-MoE-A2.7B on 2x Intel Arc Pro B60 with TP=2
 
