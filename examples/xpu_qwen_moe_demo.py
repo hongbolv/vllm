@@ -25,8 +25,8 @@ def main():
     # enforce_eager=True since we are not using Triton
     # Qwen3-30B-A3B default max_position_embeddings is 32768; use 4096 here
     # for a practical demo on 4x Intel Arc Pro B60.
-    # num_gpu_blocks_override is set to cover 4096 tokens (block_size=16 ->
-    # 256 blocks minimum).
+    # Let vLLM compute num_gpu_blocks automatically from available VRAM
+    # (~6 GiB/card with 4x B60) to avoid KV-cache exhaustion across requests.
     llm = LLM(
         model=model_path,
         tensor_parallel_size=4,
@@ -35,7 +35,6 @@ def main():
         max_model_len=4096,
         enforce_eager=True,
         gpu_memory_utilization=0.95,
-        num_gpu_blocks_override=256,
     )
 
     sampling_params = SamplingParams(
