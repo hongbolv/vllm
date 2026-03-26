@@ -23,16 +23,16 @@ def main():
 
     # Initialize the model with TP=4
     # enforce_eager=True since we are not using Triton
-    # Qwen3-30B-A3B default max_position_embeddings is 32768; use 4096 here
-    # for a practical demo on 4x Intel Arc Pro B60.
-    # Let vLLM compute num_gpu_blocks automatically from available VRAM
-    # (~6 GiB/card with 4x B60) to avoid KV-cache exhaustion across requests.
+    # max_model_len=1024: constrained by available VRAM after loading 30B weights
+    # across 4x Intel Arc Pro B60 (~6 GiB/card free for KV cache).
+    # Increasing max_model_len or max_tokens beyond these values causes
+    # KV-cache exhaustion across the 4 concurrent requests.
     llm = LLM(
         model=model_path,
         tensor_parallel_size=4,
         trust_remote_code=True,
         dtype="float16",
-        max_model_len=4096,
+        max_model_len=1024,
         enforce_eager=True,
         gpu_memory_utilization=0.95,
     )
@@ -40,7 +40,7 @@ def main():
     sampling_params = SamplingParams(
         temperature=0.7,
         top_p=0.9,
-        max_tokens=512,
+        max_tokens=128,
     )
 
     prompts = [
