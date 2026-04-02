@@ -1,31 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Demo: Qwen3-30B-A3B on Intel Arc Pro B60 with TP=2, DP=2, EP=True
 #
-# ============================================================================
-# REQUIREMENTS / ENVIRONMENT SETUP
-# ============================================================================
-#
-# This demo requires the Intel XPU fork of vLLM (hongbolv/vllm), NOT the
-# upstream vllm-project/vllm.  The fork includes Intel Arc GPU-specific
-# changes (XPU kernels, XCCL backend, Level Zero fixes) that are not yet
-# merged upstream.  Running this script against the standard vllm-project/vllm
-# will fail with import errors (missing vllm_xpu_kernels) or incorrect results.
-#
-# Recommended install (inside a venv or conda env):
-#
-#   # 1. Install Intel Extension for PyTorch (XPU flavour)
-#   pip install torch torchvision torchaudio --index-url \
-#       https://pytorch-extension.intel.com/release-whl/xpu/us/
-#
-#   # 2. Install this fork
-#   git clone https://github.com/hongbolv/vllm.git
-#   cd vllm
-#   VLLM_USE_PRECOMPILED=1 pip install -e .
-#
-#   # 3. Verify Intel XPU devices are visible to PyTorch
-#   python -c "import torch; print(torch.xpu.device_count(), 'XPU device(s) found')"
-#
-# ============================================================================
 # With DP=2 and EP=True, each XPU device acts as a separate data-parallel
 # rank while experts are distributed across ranks via alltoall (AgRs backend).
 #
@@ -108,56 +83,6 @@ os.environ.setdefault("SYCL_UR_USE_LEVEL_ZERO_V2", "0")
 os.environ.setdefault("NEOReadDebugKeys", "1")
 os.environ.setdefault("EnableImplicitScaling", "0")
 os.environ.setdefault("RenderCompressedBuffersEnabled", "0")
-
-# ---------------------------------------------------------------------------
-# Runtime environment sanity check
-# ---------------------------------------------------------------------------
-# Verify that:
-#  1. PyTorch can see at least one Intel XPU device
-#  2. The required XPU kernels from hongbolv/vllm are importable
-# These checks run early so users get a clear error instead of a cryptic
-# traceback deep inside the engine if the wrong vllm is installed.
-def _check_environment() -> None:
-    import importlib
-    import sys
-
-    # Check for torch.xpu support
-    try:
-        import torch
-        n_xpu = torch.xpu.device_count() if hasattr(torch, "xpu") else 0
-    except Exception:
-        n_xpu = 0
-    if n_xpu == 0:
-        print(
-            "[ERROR] No Intel XPU devices found by PyTorch.  Make sure "
-            "Intel Extension for PyTorch (IPEX) is installed and at least "
-            "one Intel Arc GPU is visible (check 'xpu-smi' or 'clinfo').",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Check for XPU kernels (only present in hongbolv/vllm, not upstream)
-    missing = []
-    for mod in ("vllm_xpu_kernels._C", "vllm_xpu_kernels._moe_C",
-                "vllm_xpu_kernels._xpu_C"):
-        if importlib.util.find_spec(mod.split(".")[0]) is None:
-            missing.append(mod)
-            break
-    if missing:
-        print(
-            "[ERROR] The 'vllm_xpu_kernels' package is not installed.  "
-            "This demo requires the Intel XPU fork of vLLM "
-            "(https://github.com/hongbolv/vllm), not the standard "
-            "vllm-project/vllm.  Please follow the setup instructions at "
-            "the top of this file.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    print(f"[INFO] Environment OK: {n_xpu} XPU device(s) found.")
-
-
-_check_environment()
 
 MODEL_PATH = "/home/media/Hongbo/models/Qwen3-30B-A3B"
 
