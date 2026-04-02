@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Demo: Qwen1.5-MoE-A2.7B on 2x Intel Arc Pro B60 with DP=2 + EP
+# Demo: Qwen3-30B-A3B on Intel Arc Pro B60 with TP=2, DP=2, EP=True
 #
 # With DP=2 and EP=True, each XPU device acts as a separate data-parallel
 # rank while experts are distributed across ranks via alltoall (AgRs backend).
@@ -27,7 +27,7 @@
 #   Process 1 gets: RANK=1, LOCAL_RANK=1, WORLD_SIZE=2
 #
 # ============================================================================
-# Option B - torchrun (multi-node, e.g. 1 XPU per node, 2 nodes)
+# Option C - torchrun (multi-node, e.g. 1 XPU per node, 2 nodes)
 # ============================================================================
 #
 # Suppose you have:
@@ -75,6 +75,8 @@ from time import sleep
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 # XPU model loading can be slow; increase the engine startup timeout
 os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+# Workaround: fall back to UR Level Zero v1 adapter for stability (avoid v2 crash)
+os.environ.setdefault("SYCL_UR_USE_LEVEL_ZERO_V2", "0")
 # Workaround for Intel GPU driver (NEO Compute Runtime) buffer compression bug:
 # dist.all_gather on xccl returns corrupted data for non-16-byte-aligned buffers
 # when render compression is enabled. Disabling compression fixes this.
@@ -82,7 +84,7 @@ os.environ.setdefault("NEOReadDebugKeys", "1")
 os.environ.setdefault("EnableImplicitScaling", "0")
 os.environ.setdefault("RenderCompressedBuffersEnabled", "0")
 
-MODEL_PATH = "/home/qzhan15/ai_rack/models/Qwen1.5-MoE-A2.7B"
+MODEL_PATH = "/path/to/Qwen3-30B-A3B"
 
 PROMPTS = [
     "Hello, my name is",
@@ -112,13 +114,13 @@ def run_dp_rank(
         os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
 
     print("=" * 60)
-    print(f"[DP rank {global_dp_rank}] Qwen1.5-MoE-A2.7B  DP=2 + EP")
+    print(f"[DP rank {global_dp_rank}] Qwen3-30B-A3B  TP=2, DP=2, EP=True")
     print(f"[DP rank {global_dp_rank}] Device: Intel Arc Pro B60 (XPU)")
     print("=" * 60)
 
     engine_kwargs = dict(
         model=MODEL_PATH,
-        tensor_parallel_size=1,
+        tensor_parallel_size=2,
         enable_expert_parallel=True,
         trust_remote_code=True,
         dtype="float16",
@@ -137,7 +139,9 @@ def run_dp_rank(
     llm = LLM(**engine_kwargs)
 
     # Each DP rank processes a different subset of prompts
-    my_prompts = [p for i, p in enumerate(PROMPTS) if i % dp_size == global_dp_rank]
+    my_prompts = [
+        p for i, p in enumerate(PROMPTS) if i % dp_size == global_dp_rank
+    ]
     if not my_prompts:
         my_prompts = ["Placeholder"]
 
@@ -147,7 +151,9 @@ def run_dp_rank(
         max_tokens=128,
     )
 
-    print(f"\n[DP rank {global_dp_rank}] Generating {len(my_prompts)} responses...\n")
+    print(
+        f"\n[DP rank {global_dp_rank}] Generating {len(my_prompts)} responses...\n"
+    )
     outputs = llm.generate(my_prompts, sampling_params)
 
     print("=" * 60)
