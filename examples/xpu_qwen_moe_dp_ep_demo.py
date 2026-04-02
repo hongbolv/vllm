@@ -84,7 +84,7 @@ os.environ.setdefault("NEOReadDebugKeys", "1")
 os.environ.setdefault("EnableImplicitScaling", "0")
 os.environ.setdefault("RenderCompressedBuffersEnabled", "0")
 
-MODEL_PATH = "/path/to/Qwen3-30B-A3B"
+MODEL_PATH = "/home/media/Hongbo/models/Qwen3-30B-A3B"
 
 PROMPTS = [
     "Hello, my name is",
