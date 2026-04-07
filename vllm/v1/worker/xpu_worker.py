@@ -67,9 +67,8 @@ class XPUWorker(Worker):
                 and parallel_config.nnodes_within_dp == 1
             ):
                 # Adjust local_rank to account for data parallelism so that
-                # each DP group's workers are mapped to distinct XPU devices.
-                # Without this, DP0 and DP1 both use xpu:0/xpu:1 which causes
-                # xccl init to hang due to LOCAL_RANK conflicts.
+                # each DP group's workers are mapped to distinct physical XPU
+                # devices.  This mirrors the logic in gpu_worker.py for CUDA.
                 dp_local_rank = parallel_config.data_parallel_rank_local
                 if dp_local_rank is None:
                     dp_local_rank = parallel_config.data_parallel_index
@@ -83,7 +82,9 @@ class XPUWorker(Worker):
                 self.local_rank += dp_local_rank * tp_pp_world_size
                 assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds "
-                    f"(device count: {torch.accelerator.device_count()})."
+                    f"(device count: {torch.accelerator.device_count()}, "
+                    f"dp_local_rank: {dp_local_rank}, "
+                    f"tp_pp_world_size: {tp_pp_world_size})."
                 )
 
             self.device = torch.device(f"xpu:{self.local_rank}")
@@ -116,6 +117,29 @@ class XPUWorker(Worker):
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
+        logger.info(
+            "XPU worker init: rank=%d, local_rank=%d, device=%s, "
+            "dp_size=%d, dp_rank=%d, LOCAL_WORLD_SIZE=%s, "
+            "CCL_ATL_TRANSPORT=%s, ZE_AFFINITY_MASK=%s",
+            self.rank,
+            self.local_rank,
+            self.device,
+            self.parallel_config.data_parallel_size,
+            self.parallel_config.data_parallel_rank,
+            ENV_LOCAL_WORLD_SIZE,
+            ENV_CCL_ATL_TRANSPORT,
+            os.environ.get("ZE_AFFINITY_MASK", "not set"),
+        )
+
+        logger.info(
+            "XPU worker calling init_worker_distributed_environment "
+            "(rank=%d, local_rank=%d, init_method=%s, backend=%s)",
+            self.rank,
+            self.local_rank,
+            self.distributed_init_method,
+            current_platform.dist_backend,
+        )
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
@@ -124,8 +148,19 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
+        logger.info(
+            "XPU worker init_process_group completed (rank=%d), "
+            "starting warmup all_reduce...",
+            self.rank,
+        )
+
         # global all_reduce needed for overall oneccl warm up
         torch.distributed.all_reduce(torch.zeros(1).xpu())
+
+        logger.info(
+            "XPU worker warmup all_reduce completed (rank=%d)",
+            self.rank,
+        )
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
