@@ -5,59 +5,68 @@
 # rank while experts are distributed across ranks via alltoall (AgRs backend).
 #
 # ============================================================================
-# Option A - multiprocessing (recommended for single-node, 2 XPUs on 1 machine)
+# Option A - multiprocessing (single-node, 4 XPUs: TP=2, DP=2, EP=True)
 # ============================================================================
 #
 # Just run:
 #   python examples/xpu_qwen_moe_dp_ep_demo.py
 #
-# The script spawns 2 child processes internally. Nothing else needed.
+# The script spawns 2 child processes (dp_rank 0 and 1). Each child process
+# runs vllm with tensor_parallel_size=2, which internally spawns 2 TP workers.
+# Total GPU usage: 4 XPUs (2 DP groups × 2 TP workers each).
 #
 # ============================================================================
-# Option B - torchrun (single-node, 2 XPUs on 1 machine)
+# Option B - torchrun (single-node, 4 XPUs: TP=2, DP=2, EP=True)
 # ============================================================================
 #
-# torchrun spawns 2 processes and sets RANK/LOCAL_RANK/WORLD_SIZE for you:
+# torchrun spawns 4 processes (WORLD_SIZE=4 = TP×DP = 2×2):
 #
-#   torchrun --nproc-per-node=2 \
+#   torchrun --nproc-per-node=4 \
 #       examples/xpu_qwen_moe_dp_ep_demo.py --torchrun
 #
-# This is equivalent:
-#   Process 0 gets: RANK=0, LOCAL_RANK=0, WORLD_SIZE=2
-#   Process 1 gets: RANK=1, LOCAL_RANK=1, WORLD_SIZE=2
+# Process layout:
+#   RANK 0: vllm dp_rank=0, tp_rank=0   (DP group 0, TP leader)
+#   RANK 1: vllm dp_rank=0, tp_rank=1   (DP group 0, TP follower)
+#   RANK 2: vllm dp_rank=1, tp_rank=0   (DP group 1, TP leader)
+#   RANK 3: vllm dp_rank=1, tp_rank=1   (DP group 1, TP follower)
+#
+# Key rule: TP partners (same dp_rank) MUST process the SAME prompt subset.
+# vllm dp_rank = RANK // tensor_parallel_size  (i.e. RANK // 2)
 #
 # ============================================================================
-# Option C - torchrun (multi-node, e.g. 1 XPU per node, 2 nodes)
+# Option C - torchrun (multi-node, 2 nodes × 2 XPUs: TP=2, DP=2, EP=True)
 # ============================================================================
 #
 # Suppose you have:
-#   Node 0 (master): IP = 192.168.1.100, has 1 XPU
-#   Node 1:          IP = 192.168.1.101, has 1 XPU
+#   Node 0 (master): IP = 192.168.1.100, has 2 XPUs  (RANK 0, 1)
+#   Node 1:          IP = 192.168.1.101, has 2 XPUs  (RANK 2, 3)
 #
 # Step 1 - On Node 0 (master), run:
 #   torchrun \
 #       --nnodes=2 \
 #       --node-rank=0 \
-#       --nproc-per-node=1 \
+#       --nproc-per-node=2 \
 #       --master-addr=192.168.1.100 \
 #       --master-port=29500 \
 #       examples/xpu_qwen_moe_dp_ep_demo.py --torchrun
-#
-#   This process gets: RANK=0, LOCAL_RANK=0, WORLD_SIZE=2
 #
 # Step 2 - On Node 1, run:
 #   torchrun \
 #       --nnodes=2 \
 #       --node-rank=1 \
-#       --nproc-per-node=1 \
+#       --nproc-per-node=2 \
 #       --master-addr=192.168.1.100 \
 #       --master-port=29500 \
 #       examples/xpu_qwen_moe_dp_ep_demo.py --torchrun
 #
-#   This process gets: RANK=1, LOCAL_RANK=0, WORLD_SIZE=2
-#
 # Both nodes must use the SAME --master-addr and --master-port.
 # torchrun on each node waits until all nodes connect before starting.
+#
+# Process layout across nodes (same as Option B):
+#   Node 0 RANK 0: vllm dp_rank=0, tp_rank=0
+#   Node 0 RANK 1: vllm dp_rank=0, tp_rank=1
+#   Node 1 RANK 2: vllm dp_rank=1, tp_rank=0
+#   Node 1 RANK 3: vllm dp_rank=1, tp_rank=1
 #
 # Key torchrun flags:
 #   --nnodes          Total number of nodes (machines)
@@ -96,6 +105,7 @@ PROMPTS = [
 
 def run_dp_rank(
     dp_size: int,
+    tp_size: int,
     local_dp_rank: int,
     global_dp_rank: int,
     dp_master_ip: str,
@@ -114,13 +124,16 @@ def run_dp_rank(
         os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
 
     print("=" * 60)
-    print(f"[DP rank {global_dp_rank}] Qwen3-30B-A3B  TP=2, DP=2, EP=True")
+    print(
+        f"[DP rank {global_dp_rank}] Qwen3-30B-A3B  "
+        f"TP={tp_size}, DP={dp_size}, EP=True"
+    )
     print(f"[DP rank {global_dp_rank}] Device: Intel Arc Pro B60 (XPU)")
     print("=" * 60)
 
     engine_kwargs = dict(
         model=MODEL_PATH,
-        tensor_parallel_size=2,
+        tensor_parallel_size=tp_size,
         enable_expert_parallel=True,
         trust_remote_code=True,
         dtype="float16",
@@ -138,7 +151,9 @@ def run_dp_rank(
 
     llm = LLM(**engine_kwargs)
 
-    # Each DP rank processes a different subset of prompts
+    # Each DP rank processes a different subset of prompts.
+    # In torchrun mode with TP>1, TP partners share the same dp_rank and
+    # MUST process the same prompt subset to keep TP allreduce in sync.
     my_prompts = [
         p for i, p in enumerate(PROMPTS) if i % dp_size == global_dp_rank
     ]
@@ -170,23 +185,67 @@ def run_dp_rank(
 
 def main():
     use_torchrun = "--torchrun" in sys.argv
-    dp_size = 2
+    tp_size = 2   # tensor_parallel_size used throughout this demo
+    dp_size = 2   # data_parallel_size
 
     if use_torchrun:
-        # torchrun manages ranks via RANK / LOCAL_RANK env vars
-        global_dp_rank = int(os.environ.get("RANK", 0))
-        local_dp_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # torchrun mode: WORLD_SIZE = TP × DP = 4
+        # torchrun assigns RANK/LOCAL_RANK/WORLD_SIZE env vars.
+        #
+        # Process layout (vllm's internal assignment):
+        #   vllm dp_rank = RANK // tp_size
+        #   vllm tp_rank = RANK %  tp_size
+        #
+        #   RANK 0 → dp_rank=0, tp_rank=0  (TP leader  of DP group 0)
+        #   RANK 1 → dp_rank=0, tp_rank=1  (TP follower of DP group 0)
+        #   RANK 2 → dp_rank=1, tp_rank=0  (TP leader  of DP group 1)
+        #   RANK 3 → dp_rank=1, tp_rank=1  (TP follower of DP group 1)
+        #
+        # TP partners share the same dp_rank and MUST receive the SAME
+        # prompt subset so that TP allreduce tensors stay in sync.
+        # Only the TP leader (tp_rank==0) prints results.
+        rank = int(os.environ.get("RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", tp_size * dp_size))
+
+        expected_world_size = tp_size * dp_size
+        if world_size != expected_world_size:
+            print(
+                f"[ERROR] WORLD_SIZE={world_size} but TP={tp_size} × DP={dp_size}"
+                f" requires WORLD_SIZE={expected_world_size}.\n"
+                f"  Re-run with: torchrun --nproc-per-node={expected_world_size} ...",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # vllm computes dp_rank = RANK // (WORLD_SIZE // dp_size) = RANK // tp_size
+        vllm_dp_rank = rank // tp_size
+        vllm_tp_rank = rank % tp_size
+
+        # TP followers share the TP leader's dp_rank and produce the same outputs;
+        # suppress their prints to avoid duplicate output.
+        if vllm_tp_rank != 0:
+            # Redirect stdout for TP followers so only TP leaders print results.
+            import io
+            sys.stdout = io.StringIO()
+
         run_dp_rank(
             dp_size=dp_size,
-            local_dp_rank=local_dp_rank,
-            global_dp_rank=global_dp_rank,
+            tp_size=tp_size,
+            local_dp_rank=local_rank,
+            global_dp_rank=vllm_dp_rank,
             dp_master_ip="",
             dp_master_port=0,
             use_torchrun=True,
         )
+
+        # Restore stdout for TP followers after generate() completes.
+        if vllm_tp_rank != 0:
+            sys.stdout = sys.__stdout__
     else:
-        # Multiprocessing mode: spawn one process per DP rank
-        # Must use 'spawn' on XPU to avoid re-initialization errors
+        # Multiprocessing mode: spawn one process per DP rank.
+        # vllm will spawn TP workers internally within each DP process.
+        # Must use 'spawn' on XPU to avoid re-initialization errors.
         import multiprocessing
         from multiprocessing import Process
 
@@ -201,7 +260,8 @@ def main():
         for rank in range(dp_size):
             proc = Process(
                 target=run_dp_rank,
-                args=(dp_size, rank, rank, dp_master_ip, dp_master_port, False),
+                args=(dp_size, tp_size, rank, rank,
+                      dp_master_ip, dp_master_port, False),
             )
             proc.start()
             procs.append(proc)
