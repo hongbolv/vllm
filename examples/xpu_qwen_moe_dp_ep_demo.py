@@ -170,8 +170,7 @@ def run_dp_rank(
 
     if should_print_results:
         print(
-            f"\n[DP rank {global_dp_rank}] Generating"
-            f" {len(my_prompts)} responses...\n"
+            f"\n[DP rank {global_dp_rank}] Generating {len(my_prompts)} responses...\n"
         )
     outputs = llm.generate(my_prompts, sampling_params)
 
@@ -230,7 +229,7 @@ def main():
         # Only the TP leader (tp_rank==0) per DP group prints results.
         # TP followers participate in collective ops but produce duplicate output;
         # pass should_print_results=False so they silently run generate() without
-        # printing. Do NOT redirect sys.stdout — vllm calls sys.stdout.fileno()
+        # printing. Do NOT redirect sys.stdout -- vllm calls sys.stdout.fileno()
         # internally (e.g. in suppress_stdout()) which raises UnsupportedOperation
         # on io.StringIO objects.
         run_dp_rank(
