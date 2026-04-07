@@ -111,6 +111,7 @@ def run_dp_rank(
     dp_master_ip: str,
     dp_master_port: int,
     use_torchrun: bool = False,
+    should_print_results: bool = True,
 ):
     """Worker function executed by each DP rank."""
     from vllm import LLM, SamplingParams
@@ -123,13 +124,14 @@ def run_dp_rank(
         os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
         os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
 
-    print("=" * 60)
-    print(
-        f"[DP rank {global_dp_rank}] Qwen3-30B-A3B  "
-        f"TP={tp_size}, DP={dp_size}, EP=True"
-    )
-    print(f"[DP rank {global_dp_rank}] Device: Intel Arc Pro B60 (XPU)")
-    print("=" * 60)
+    if should_print_results:
+        print("=" * 60)
+        print(
+            f"[DP rank {global_dp_rank}] Qwen3-30B-A3B  "
+            f"TP={tp_size}, DP={dp_size}, EP=True"
+        )
+        print(f"[DP rank {global_dp_rank}] Device: Intel Arc Pro B60 (XPU)")
+        print("=" * 60)
 
     engine_kwargs = dict(
         model=MODEL_PATH,
@@ -166,20 +168,23 @@ def run_dp_rank(
         max_tokens=128,
     )
 
-    print(
-        f"\n[DP rank {global_dp_rank}] Generating {len(my_prompts)} responses...\n"
-    )
+    if should_print_results:
+        print(
+            f"\n[DP rank {global_dp_rank}] Generating"
+            f" {len(my_prompts)} responses...\n"
+        )
     outputs = llm.generate(my_prompts, sampling_params)
 
-    print("=" * 60)
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[DP rank {global_dp_rank}] Prompt:    {prompt!r}")
-        print(f"[DP rank {global_dp_rank}] Response:  {generated_text!r}")
-        print("-" * 60)
+    if should_print_results:
+        print("=" * 60)
+        for output in outputs:
+            prompt = output.prompt
+            generated_text = output.outputs[0].text
+            print(f"[DP rank {global_dp_rank}] Prompt:    {prompt!r}")
+            print(f"[DP rank {global_dp_rank}] Response:  {generated_text!r}")
+            print("-" * 60)
 
-    print(f"\n[DP rank {global_dp_rank}] Done!")
+        print(f"\n[DP rank {global_dp_rank}] Done!")
     sleep(1)
 
 
@@ -222,13 +227,12 @@ def main():
         vllm_dp_rank = rank // tp_size
         vllm_tp_rank = rank % tp_size
 
-        # TP followers share the TP leader's dp_rank and produce the same outputs;
-        # suppress their prints to avoid duplicate output.
-        if vllm_tp_rank != 0:
-            # Redirect stdout for TP followers so only TP leaders print results.
-            import io
-            sys.stdout = io.StringIO()
-
+        # Only the TP leader (tp_rank==0) per DP group prints results.
+        # TP followers participate in collective ops but produce duplicate output;
+        # pass should_print_results=False so they silently run generate() without
+        # printing. Do NOT redirect sys.stdout — vllm calls sys.stdout.fileno()
+        # internally (e.g. in suppress_stdout()) which raises UnsupportedOperation
+        # on io.StringIO objects.
         run_dp_rank(
             dp_size=dp_size,
             tp_size=tp_size,
@@ -237,11 +241,8 @@ def main():
             dp_master_ip="",
             dp_master_port=0,
             use_torchrun=True,
+            should_print_results=(vllm_tp_rank == 0),
         )
-
-        # Restore stdout for TP followers after generate() completes.
-        if vllm_tp_rank != 0:
-            sys.stdout = sys.__stdout__
     else:
         # Multiprocessing mode: spawn one process per DP rank.
         # vllm will spawn TP workers internally within each DP process.
