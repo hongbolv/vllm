@@ -59,6 +59,32 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
+            parallel_config = self.parallel_config
+            if (
+                parallel_config.distributed_executor_backend
+                not in ("ray", "external_launcher")
+                and parallel_config.data_parallel_backend != "ray"
+                and parallel_config.nnodes_within_dp == 1
+            ):
+                # Adjust local_rank to account for data parallelism so that
+                # each DP group's workers are mapped to distinct XPU devices.
+                # Without this, DP0 and DP1 both use xpu:0/xpu:1 which causes
+                # xccl init to hang due to LOCAL_RANK conflicts.
+                dp_local_rank = parallel_config.data_parallel_rank_local
+                if dp_local_rank is None:
+                    dp_local_rank = parallel_config.data_parallel_index
+
+                tp_pp_world_size = (
+                    parallel_config.pipeline_parallel_size
+                    * parallel_config.tensor_parallel_size
+                )
+
+                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                self.local_rank += dp_local_rank * tp_pp_world_size
+                assert self.local_rank < torch.accelerator.device_count(), (
+                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                )
+
             self.device = torch.device(f"xpu:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -71,7 +97,10 @@ class XPUWorker(Worker):
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(
-            "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
+            "LOCAL_WORLD_SIZE",
+            str(
+                self.parallel_config.local_world_size or self.parallel_config.world_size
+            ),
         )
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
