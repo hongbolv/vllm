@@ -36,10 +36,6 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.fused_moe.zero_expert_fused_moe import (
     ZeroExpertFusedMoE,
 )
-from vllm.model_executor.layers.fused_moe.xpu_fused_moe import (
-    XPUExperts,
-    XPUExpertsFp8,
-)
 from vllm.triton_utils import HAS_TRITON
 
 _config: dict[str, Any] | None = None
@@ -77,8 +73,6 @@ __all__ = [
     "apply_moe_activation",
     "override_config",
     "get_config",
-    "XPUExperts",
-    "XPUExpertsFp8",
 ]
 
 if HAS_TRITON:
@@ -114,6 +108,10 @@ if HAS_TRITON:
     from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
         TritonOrDeepGemmExperts,
     )
+    from vllm.model_executor.layers.fused_moe.xpu_fused_moe import (
+        XPUExperts,
+        XPUExpertsFp8,
+    )
 
     __all__ += [
         "AiterExperts",
@@ -131,6 +129,8 @@ if HAS_TRITON:
         "DeepGemmExperts",
         "BatchedDeepGemmExperts",
         "TritonOrDeepGemmExperts",
+        "XPUExperts",
+        "XPUExpertsFp8",
     ]
 else:
     # Some model classes directly use the custom ops. Add placeholders
