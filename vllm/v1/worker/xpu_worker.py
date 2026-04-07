@@ -97,12 +97,21 @@ class XPUWorker(Worker):
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
-        ENV_LOCAL_WORLD_SIZE = os.getenv(
-            "LOCAL_WORLD_SIZE",
-            str(
-                self.parallel_config.local_world_size or self.parallel_config.world_size
-            ),
-        )
+        # When DP adjustment is applied, the global process group spans all
+        # DP workers (world_size_across_dp). LOCAL_WORLD_SIZE must reflect
+        # how many of those workers are on this node so that oneCCL/xccl
+        # can choose the right intra-node transport.
+        if (
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+        ):
+            effective_local_ws = self.parallel_config.world_size_across_dp // max(
+                self.parallel_config.nnodes, 1
+            )
+        else:
+            effective_local_ws = self.parallel_config.world_size
+        ENV_LOCAL_WORLD_SIZE = os.getenv("LOCAL_WORLD_SIZE", str(effective_local_ws))
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
