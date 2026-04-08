@@ -64,13 +64,14 @@ class LLMEngine:
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
-        import sys
+        import os as _os
+        import sys as _sys
         print(f"[DP diag] LLMEngine.__init__ ENTERED "
               f"(multiprocess_mode={multiprocess_mode}, "
               f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
               f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
-              f"pid={os.getpid()})", flush=True)
-        sys.stdout.flush()
+              f"pid={_os.getpid()})", flush=True)
+        _sys.stdout.flush()
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -175,6 +176,18 @@ class LLMEngine:
 
         # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
+
+        import os as _os
+        import sys as _sys
+        print(f"[DP diag] from_engine_args: create_engine_config done, "
+              f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
+              f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
+              f"executor_backend="
+              f"{vllm_config.parallel_config.distributed_executor_backend}, "
+              f"pid={_os.getpid()}", flush=True)
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+
         executor_class = Executor.get_class(vllm_config)
 
         if envs.VLLM_ENABLE_V1_MULTIPROCESSING:

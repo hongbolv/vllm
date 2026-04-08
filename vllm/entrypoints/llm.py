@@ -379,9 +379,20 @@ class LLM:
 
         log_non_default_args(engine_args)
 
+        import os as _os
+        import sys as _sys
+        print(f"[DP diag] LLM.__init__: calling LLMEngine.from_engine_args "
+              f"(pid={_os.getpid()})", flush=True)
+        _sys.stdout.flush()
+
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
         )
+
+        print(f"[DP diag] LLM.__init__: LLMEngine.from_engine_args returned "
+              f"(pid={_os.getpid()})", flush=True)
+        _sys.stdout.flush()
+
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
