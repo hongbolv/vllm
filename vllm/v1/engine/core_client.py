@@ -530,22 +530,11 @@ class MPClient(EngineCoreClient):
                     self.ctx, addresses.outputs[0], zmq.PULL
                 )
 
-                import os as _os
-                _os.write(2, f"[DP diag] MPClient: calling launch_core_engines "
-                          f"(dp_size={parallel_config.data_parallel_size}, "
-                          f"dp_rank={parallel_config.data_parallel_rank}, "
-                          f"dp_rank_local={parallel_config.data_parallel_rank_local}, "
-                          f"pid={_os.getpid()})\n".encode())
-
                 with launch_core_engines(
                     vllm_config, executor_class, log_stats, addresses
                 ) as (engine_manager, coordinator, addresses):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
-
-                _os.write(2, f"[DP diag] MPClient: launch_core_engines completed "
-                          f"(dp_rank={parallel_config.data_parallel_rank}, "
-                          f"pid={_os.getpid()})\n".encode())
 
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
