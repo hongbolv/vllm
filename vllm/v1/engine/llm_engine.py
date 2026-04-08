@@ -65,14 +65,12 @@ class LLMEngine:
         self.observability_config = vllm_config.observability_config
 
         import os as _os
-        import sys as _sys
-        print(f"[DP diag] LLMEngine.__init__ ENTERED "
-              f"(multiprocess_mode={multiprocess_mode}, "
-              f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
-              f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
-              f"pid={_os.getpid()}, "
-              f"file={__file__})",
-              file=_sys.stderr, flush=True)
+        _os.write(2, f"[DP diag] LLMEngine.__init__ ENTERED "
+                  f"(multiprocess_mode={multiprocess_mode}, "
+                  f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
+                  f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
+                  f"pid={_os.getpid()}, "
+                  f"file={__file__})\n".encode())
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -179,14 +177,12 @@ class LLMEngine:
         vllm_config = engine_args.create_engine_config(usage_context)
 
         import os as _os
-        import sys as _sys
-        print(f"[DP diag] from_engine_args: create_engine_config done, "
-              f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
-              f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
-              f"executor_backend="
-              f"{vllm_config.parallel_config.distributed_executor_backend}, "
-              f"pid={_os.getpid()}",
-              file=_sys.stderr, flush=True)
+        _os.write(2, f"[DP diag] from_engine_args: create_engine_config done, "
+                  f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
+                  f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
+                  f"executor_backend="
+                  f"{vllm_config.parallel_config.distributed_executor_backend}, "
+                  f"pid={_os.getpid()}\n".encode())
 
         executor_class = Executor.get_class(vllm_config)
 

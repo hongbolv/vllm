@@ -802,10 +802,9 @@ class EngineCoreProc(EngineCore):
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
 
-        import sys as _sys
-        print(f"[DP diag] EngineCoreProc: starting handshake "
-              f"(engine_index={engine_index})",
-              file=_sys.stderr, flush=True)
+        import os as _os
+        _os.write(2, f"[DP diag] EngineCoreProc: starting handshake "
+                  f"(engine_index={engine_index})\n".encode())
 
         with self._perform_handshakes(
             handshake_address,
@@ -814,9 +813,8 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
-            print(f"[DP diag] EngineCoreProc: handshake complete "
-                  f"(engine_index={engine_index})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] EngineCoreProc: handshake complete "
+                      f"(engine_index={engine_index})\n".encode())
             # Set up data parallel environment.
             self.has_coordinator = addresses.coordinator_output is not None
             self.frontend_stats_publish_address = (
@@ -842,14 +840,12 @@ class EngineCoreProc(EngineCore):
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
                     vllm_config=vllm_config,
                 )
-            print(f"[DP diag] EngineCoreProc: calling _init_data_parallel "
-                  f"(engine_index={engine_index})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] EngineCoreProc: calling _init_data_parallel "
+                      f"(engine_index={engine_index})\n".encode())
             self._init_data_parallel(vllm_config)
-            print(f"[DP diag] EngineCoreProc: _init_data_parallel done, "
-                  f"calling EngineCore.__init__ (creates executor + workers) "
-                  f"(engine_index={engine_index})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] EngineCoreProc: _init_data_parallel done, "
+                      f"calling EngineCore.__init__ (creates executor + workers) "
+                      f"(engine_index={engine_index})\n".encode())
 
             super().__init__(
                 vllm_config,
@@ -858,9 +854,8 @@ class EngineCoreProc(EngineCore):
                 executor_fail_callback,
                 internal_dp_balancing,
             )
-            print(f"[DP diag] EngineCoreProc: EngineCore.__init__ done "
-                  f"(engine_index={engine_index})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] EngineCoreProc: EngineCore.__init__ done "
+                      f"(engine_index={engine_index})\n".encode())
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
@@ -1047,11 +1042,9 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
-        import sys
-        print(f"[DP diag] run_engine_core ENTERED "
-              f"(dp_rank={dp_rank}, local_dp_rank={local_dp_rank}, "
-              f"pid={os.getpid()}, file={__file__})",
-              file=sys.stderr, flush=True)
+        os.write(2, f"[DP diag] run_engine_core ENTERED "
+                 f"(dp_rank={dp_rank}, local_dp_rank={local_dp_rank}, "
+                 f"pid={os.getpid()}, file={__file__})\n".encode())
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
@@ -1086,14 +1079,16 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                print(f"[DP diag] run_engine_core: creating DPEngineCoreProc "
-                      f"(dp_rank={dp_rank}, dp_size={parallel_config.data_parallel_size}, "
-                      f"local_dp_rank={local_dp_rank})",
-                      file=sys.stderr, flush=True)
+                os.write(2, (
+                    f"[DP diag] run_engine_core: creating "
+                    f"DPEngineCoreProc (dp_rank={dp_rank}, "
+                    f"dp_size="
+                    f"{parallel_config.data_parallel_size}, "
+                    f"local_dp_rank={local_dp_rank})\n"
+                ).encode())
                 engine_core = DPEngineCoreProc(*args, **kwargs)
-                print(f"[DP diag] run_engine_core: DPEngineCoreProc created "
-                      f"(dp_rank={dp_rank})",
-                      file=sys.stderr, flush=True)
+                os.write(2, f"[DP diag] run_engine_core: DPEngineCoreProc created "
+                         f"(dp_rank={dp_rank})\n".encode())
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
@@ -1650,16 +1645,14 @@ class DPEngineCoreProc(EngineCoreProc):
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
         self.dp_rank = dp_rank
-        import sys as _sys
-        print(f"[DP diag] _init_data_parallel: calling "
-              f"stateless_init_dp_group (dp_rank={dp_rank}, dp_size={dp_size}, "
-              f"dp_master_ip={parallel_config.data_parallel_master_ip})",
-              file=_sys.stderr, flush=True)
+        import os as _os
+        _os.write(2, f"[DP diag] _init_data_parallel: calling "
+                  f"stateless_init_dp_group (dp_rank={dp_rank}, dp_size={dp_size}, "
+                  f"dp_master_ip={parallel_config.data_parallel_master_ip})\n".encode())
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
-        print(f"[DP diag] _init_data_parallel: stateless_init_dp_group "
-              f"completed (dp_rank={dp_rank})",
-              file=_sys.stderr, flush=True)
+        _os.write(2, f"[DP diag] _init_data_parallel: stateless_init_dp_group "
+                  f"completed (dp_rank={dp_rank})\n".encode())
 
     def shutdown(self):
         super().shutdown()

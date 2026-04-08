@@ -380,19 +380,17 @@ class LLM:
         log_non_default_args(engine_args)
 
         import os as _os
-        import sys as _sys
-        print(f"[DP diag] LLM.__init__: calling LLMEngine.from_engine_args "
-              f"(pid={_os.getpid()}, "
-              f"file={__file__})",
-              file=_sys.stderr, flush=True)
+        _os.write(2, f"[DP diag] LLM.__init__: calling "
+                  f"LLMEngine.from_engine_args (pid={_os.getpid()}, "
+                  f"file={__file__})\n".encode())
 
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
         )
 
-        print(f"[DP diag] LLM.__init__: LLMEngine.from_engine_args returned "
-              f"(pid={_os.getpid()})",
-              file=_sys.stderr, flush=True)
+        _os.write(2, f"[DP diag] LLM.__init__: "
+                  f"LLMEngine.from_engine_args returned "
+                  f"(pid={_os.getpid()})\n".encode())
 
         self.engine_class = type(self.llm_engine)
 

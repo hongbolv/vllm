@@ -117,22 +117,24 @@ class XPUWorker(Worker):
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
-        import sys as _sys
-        print(f"[DP diag] XPU worker init: rank={self.rank}, "
-              f"local_rank={self.local_rank}, device={self.device}, "
-              f"dp_size={self.parallel_config.data_parallel_size}, "
-              f"dp_rank={self.parallel_config.data_parallel_rank}, "
-              f"LOCAL_WORLD_SIZE={ENV_LOCAL_WORLD_SIZE}, "
-              f"CCL_ATL_TRANSPORT={ENV_CCL_ATL_TRANSPORT}, "
-              f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK', 'not set')}",
-              file=_sys.stderr, flush=True)
+        os.write(2, (
+            f"[DP diag] XPU worker init: rank={self.rank}, "
+            f"local_rank={self.local_rank}, device={self.device}, "
+            f"dp_size="
+            f"{self.parallel_config.data_parallel_size}, "
+            f"dp_rank="
+            f"{self.parallel_config.data_parallel_rank}, "
+            f"LOCAL_WORLD_SIZE={ENV_LOCAL_WORLD_SIZE}, "
+            f"CCL_ATL_TRANSPORT={ENV_CCL_ATL_TRANSPORT}, "
+            f"ZE_AFFINITY_MASK="
+            f"{os.environ.get('ZE_AFFINITY_MASK', 'not set')}\n"
+        ).encode())
 
-        print(f"[DP diag] XPU worker calling "
-              f"init_worker_distributed_environment "
-              f"(rank={self.rank}, local_rank={self.local_rank}, "
-              f"init_method={self.distributed_init_method}, "
-              f"backend={current_platform.dist_backend})",
-              file=_sys.stderr, flush=True)
+        os.write(2, f"[DP diag] XPU worker calling "
+                 f"init_worker_distributed_environment "
+                 f"(rank={self.rank}, local_rank={self.local_rank}, "
+                 f"init_method={self.distributed_init_method}, "
+                 f"backend={current_platform.dist_backend})\n".encode())
 
         init_worker_distributed_environment(
             self.vllm_config,
@@ -142,16 +144,14 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
-        print(f"[DP diag] XPU worker init_process_group completed "
-              f"(rank={self.rank}), starting warmup all_reduce...",
-              file=_sys.stderr, flush=True)
+        os.write(2, f"[DP diag] XPU worker init_process_group completed "
+                 f"(rank={self.rank}), starting warmup all_reduce...\n".encode())
 
         # global all_reduce needed for overall oneccl warm up
         torch.distributed.all_reduce(torch.zeros(1).xpu())
 
-        print(f"[DP diag] XPU worker warmup all_reduce completed "
-              f"(rank={self.rank})",
-              file=_sys.stderr, flush=True)
+        os.write(2, f"[DP diag] XPU worker warmup all_reduce completed "
+                 f"(rank={self.rank})\n".encode())
 
         # Set random seed.
         set_random_seed(self.model_config.seed)

@@ -165,13 +165,16 @@ class MultiprocExecutor(Executor):
                 [] if context.get_start_method() == "fork" else None
             )
 
-            import sys as _sys
-            print(f"[DP diag] MultiprocExecutor: spawning {self.local_world_size} "
-                  f"worker processes "
-                  f"(dp_rank={self.parallel_config.data_parallel_rank}, "
-                  f"dp_size={self.parallel_config.data_parallel_size}, "
-                  f"world_size={self.world_size})",
-                  file=_sys.stderr, flush=True)
+            import os as _os
+            _os.write(2, (
+                f"[DP diag] MultiprocExecutor: spawning "
+                f"{self.local_world_size} worker processes "
+                f"(dp_rank="
+                f"{self.parallel_config.data_parallel_rank}, "
+                f"dp_size="
+                f"{self.parallel_config.data_parallel_size}, "
+                f"world_size={self.world_size})\n"
+            ).encode())
 
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
@@ -191,10 +194,9 @@ class MultiprocExecutor(Executor):
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
 
-            print(f"[DP diag] MultiprocExecutor: all {self.local_world_size} "
-                  f"workers spawned, calling wait_for_ready "
-                  f"(dp_rank={self.parallel_config.data_parallel_rank})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] MultiprocExecutor: all {self.local_world_size} "
+                      f"workers spawned, calling wait_for_ready "
+                      f"(dp_rank={self.parallel_config.data_parallel_rank})\n".encode())
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -617,14 +619,12 @@ class WorkerProc:
         # Load model
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
         if not is_eep_new_worker:
-            import sys as _sys
-            print(f"[DP diag] WorkerProc: calling init_device "
-                  f"(rank={rank}, local_rank={local_rank})",
-                  file=_sys.stderr, flush=True)
+            import os as _os
+            _os.write(2, f"[DP diag] WorkerProc: calling init_device "
+                      f"(rank={rank}, local_rank={local_rank})\n".encode())
             self.worker.init_device()
-            print(f"[DP diag] WorkerProc: init_device completed "
-                  f"(rank={rank}, local_rank={local_rank})",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] WorkerProc: init_device completed "
+                      f"(rank={rank}, local_rank={local_rank})\n".encode())
             # Update process title now that parallel groups are initialized
             self.setup_proc_title_and_log_prefix(
                 enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -842,17 +842,18 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
-            import sys as _sys
-            print(f"[DP diag] worker_main: creating WorkerProc "
-                  f"(rank={rank}, local_rank={kwargs.get('local_rank', -1)})",
-                  file=_sys.stderr, flush=True)
+            import os as _os
+            _os.write(2, (
+                f"[DP diag] worker_main: creating WorkerProc "
+                f"(rank={rank}, "
+                f"local_rank={kwargs.get('local_rank', -1)})\n"
+            ).encode())
 
             worker = WorkerProc(*args, **kwargs)
             assert worker.worker_response_mq is not None
 
-            print(f"[DP diag] worker_main: WorkerProc created "
-                  f"(rank={rank}), sending READY",
-                  file=_sys.stderr, flush=True)
+            _os.write(2, f"[DP diag] worker_main: WorkerProc created "
+                      f"(rank={rank}), sending READY\n".encode())
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
