@@ -382,16 +382,17 @@ class LLM:
         import os as _os
         import sys as _sys
         print(f"[DP diag] LLM.__init__: calling LLMEngine.from_engine_args "
-              f"(pid={_os.getpid()})", flush=True)
-        _sys.stdout.flush()
+              f"(pid={_os.getpid()}, "
+              f"file={__file__})",
+              file=_sys.stderr, flush=True)
 
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
         )
 
         print(f"[DP diag] LLM.__init__: LLMEngine.from_engine_args returned "
-              f"(pid={_os.getpid()})", flush=True)
-        _sys.stdout.flush()
+              f"(pid={_os.getpid()})",
+              file=_sys.stderr, flush=True)
 
         self.engine_class = type(self.llm_engine)
 

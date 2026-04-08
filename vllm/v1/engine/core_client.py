@@ -536,8 +536,8 @@ class MPClient(EngineCoreClient):
                       f"(dp_size={parallel_config.data_parallel_size}, "
                       f"dp_rank={parallel_config.data_parallel_rank}, "
                       f"dp_rank_local={parallel_config.data_parallel_rank_local}, "
-                      f"pid={_os.getpid()})", flush=True)
-                _sys.stdout.flush()
+                      f"pid={_os.getpid()})",
+                      file=_sys.stderr, flush=True)
 
                 with launch_core_engines(
                     vllm_config, executor_class, log_stats, addresses
@@ -547,8 +547,8 @@ class MPClient(EngineCoreClient):
 
                 print(f"[DP diag] MPClient: launch_core_engines completed "
                       f"(dp_rank={parallel_config.data_parallel_rank}, "
-                      f"pid={_os.getpid()})", flush=True)
-                _sys.stdout.flush()
+                      f"pid={_os.getpid()})",
+                      file=_sys.stderr, flush=True)
 
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
