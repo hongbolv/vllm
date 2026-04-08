@@ -258,6 +258,9 @@ class LLM:
     ) -> None:
         """LLM constructor."""
 
+        logger.info("LLM.__init__: model=%s (PR trace - confirms "
+                     "logger.info works from this process)", model)
+
         if "swap_space" in kwargs:
             kwargs.pop("swap_space")
             import warnings
