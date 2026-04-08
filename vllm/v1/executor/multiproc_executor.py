@@ -165,6 +165,15 @@ class MultiprocExecutor(Executor):
                 [] if context.get_start_method() == "fork" else None
             )
 
+            logger.info(
+                "[DP diag] MultiprocExecutor: spawning %d worker processes "
+                "(dp_rank=%d, dp_size=%d, world_size=%d)",
+                self.local_world_size,
+                self.parallel_config.data_parallel_rank,
+                self.parallel_config.data_parallel_size,
+                self.world_size,
+            )
+
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
@@ -182,6 +191,13 @@ class MultiprocExecutor(Executor):
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+
+            logger.info(
+                "[DP diag] MultiprocExecutor: all %d workers spawned, "
+                "calling wait_for_ready (dp_rank=%d)",
+                self.local_world_size,
+                self.parallel_config.data_parallel_rank,
+            )
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -604,7 +620,19 @@ class WorkerProc:
         # Load model
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
         if not is_eep_new_worker:
+            logger.info(
+                "[DP diag] WorkerProc: calling init_device "
+                "(rank=%d, local_rank=%d)",
+                rank,
+                local_rank,
+            )
             self.worker.init_device()
+            logger.info(
+                "[DP diag] WorkerProc: init_device completed "
+                "(rank=%d, local_rank=%d)",
+                rank,
+                local_rank,
+            )
             # Update process title now that parallel groups are initialized
             self.setup_proc_title_and_log_prefix(
                 enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -822,8 +850,21 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
+            logger.info(
+                "[DP diag] worker_main: creating WorkerProc "
+                "(rank=%d, local_rank=%d)",
+                rank,
+                kwargs.get("local_rank", -1),
+            )
+
             worker = WorkerProc(*args, **kwargs)
             assert worker.worker_response_mq is not None
+
+            logger.info(
+                "[DP diag] worker_main: WorkerProc created "
+                "(rank=%d), sending READY",
+                rank,
+            )
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 

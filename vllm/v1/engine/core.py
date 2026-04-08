@@ -802,6 +802,12 @@ class EngineCoreProc(EngineCore):
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
 
+        logger.info(
+            "[DP diag] EngineCoreProc: starting handshake "
+            "(engine_index=%d)",
+            engine_index,
+        )
+
         with self._perform_handshakes(
             handshake_address,
             identity,
@@ -809,6 +815,11 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
+            logger.info(
+                "[DP diag] EngineCoreProc: handshake complete "
+                "(engine_index=%d)",
+                engine_index,
+            )
             # Set up data parallel environment.
             self.has_coordinator = addresses.coordinator_output is not None
             self.frontend_stats_publish_address = (
@@ -834,7 +845,18 @@ class EngineCoreProc(EngineCore):
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
                     vllm_config=vllm_config,
                 )
+            logger.info(
+                "[DP diag] EngineCoreProc: calling _init_data_parallel "
+                "(engine_index=%d)",
+                engine_index,
+            )
             self._init_data_parallel(vllm_config)
+            logger.info(
+                "[DP diag] EngineCoreProc: _init_data_parallel done, "
+                "calling EngineCore.__init__ (creates executor + workers) "
+                "(engine_index=%d)",
+                engine_index,
+            )
 
             super().__init__(
                 vllm_config,
@@ -842,6 +864,11 @@ class EngineCoreProc(EngineCore):
                 log_stats,
                 executor_fail_callback,
                 internal_dp_balancing,
+            )
+            logger.info(
+                "[DP diag] EngineCoreProc: EngineCore.__init__ done "
+                "(engine_index=%d)",
+                engine_index,
             )
 
             # Background Threads and Queues for IO. These enable us to
@@ -1062,7 +1089,19 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
+                logger.info(
+                    "[DP diag] run_engine_core: creating DPEngineCoreProc "
+                    "(dp_rank=%d, dp_size=%d, local_dp_rank=%d)",
+                    dp_rank,
+                    parallel_config.data_parallel_size,
+                    local_dp_rank,
+                )
                 engine_core = DPEngineCoreProc(*args, **kwargs)
+                logger.info(
+                    "[DP diag] run_engine_core: DPEngineCoreProc created "
+                    "(dp_rank=%d)",
+                    dp_rank,
+                )
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
@@ -1619,8 +1658,20 @@ class DPEngineCoreProc(EngineCoreProc):
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
         self.dp_rank = dp_rank
+        logger.info(
+            "[DP diag] _init_data_parallel: calling "
+            "stateless_init_dp_group (dp_rank=%d, dp_size=%d, "
+            "dp_master_ip=%s)",
+            dp_rank, dp_size,
+            parallel_config.data_parallel_master_ip,
+        )
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
+        logger.info(
+            "[DP diag] _init_data_parallel: stateless_init_dp_group "
+            "completed (dp_rank=%d)",
+            dp_rank,
+        )
 
     def shutdown(self):
         super().shutdown()
