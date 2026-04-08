@@ -39,6 +39,8 @@ class XPUWorker(Worker):
         device_config = self.device_config
         assert device_config.device_type == "xpu"
         assert current_platform.is_xpu()
+        logger.info("XPUWorker created: rank=%d, local_rank=%d",
+                    rank, local_rank)
 
         # Torch profiler. Enabled and configured through profiler_config.
         self.profiler: Any | None = None
