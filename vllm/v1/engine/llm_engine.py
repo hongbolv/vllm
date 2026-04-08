@@ -64,6 +64,14 @@ class LLMEngine:
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
+        import sys
+        print(f"[DP diag] LLMEngine.__init__ ENTERED "
+              f"(multiprocess_mode={multiprocess_mode}, "
+              f"dp_size={vllm_config.parallel_config.data_parallel_size}, "
+              f"dp_rank={vllm_config.parallel_config.data_parallel_rank}, "
+              f"pid={os.getpid()})", flush=True)
+        sys.stdout.flush()
+
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
             init_tracer("vllm.llm_engine", tracing_endpoint)

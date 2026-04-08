@@ -1056,6 +1056,13 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        import sys
+        print(f"[DP diag] run_engine_core ENTERED "
+              f"(dp_rank={dp_rank}, local_dp_rank={local_dp_rank}, "
+              f"pid={os.getpid()})", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 

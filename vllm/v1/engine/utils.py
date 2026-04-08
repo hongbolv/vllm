@@ -139,6 +139,12 @@ class CoreEngineProcManager:
                 # CUDA and XPU platforms use set_device_index() + local_rank
                 # adjustment in the worker instead, so we skip env-var-based
                 # device isolation for them.
+                import sys
+                print(f"[DP diag] CoreEngineProcManager: starting engine "
+                      f"core proc (name={proc.name}, "
+                      f"local_dp_rank={local_dp_rank}, "
+                      f"is_dp={is_dp}, pid={os.getpid()})", flush=True)
+                sys.stdout.flush()
                 if is_dp and (
                     not (current_platform.is_cuda_alike()
                          or current_platform.is_xpu())
@@ -148,6 +154,10 @@ class CoreEngineProcManager:
                         proc.start()
                 else:
                     proc.start()
+                print(f"[DP diag] CoreEngineProcManager: proc.start() "
+                      f"returned (name={proc.name}, pid={proc.pid})",
+                      flush=True)
+                sys.stdout.flush()
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
