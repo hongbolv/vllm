@@ -1950,7 +1950,19 @@ class EngineCoreActorMixin:
         from vllm.platforms import current_platform
 
         if current_platform.is_xpu():
-            pass
+            import sys as _sys
+
+            print(
+                f"[=====VLLM_DEBUG=====] "
+                f"EngineCoreProc._set_visible_devices: "
+                f"XPU detected, skipping device env-var adjustment, "
+                f"local_dp_rank={local_dp_rank}, "
+                f"ZE_AFFINITY_MASK="
+                f"{os.environ.get('ZE_AFFINITY_MASK', '<not set>')}, "
+                f"pid={os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
         else:
             device_control_env_var = current_platform.device_control_env_var
             self._set_cuda_visible_devices(
