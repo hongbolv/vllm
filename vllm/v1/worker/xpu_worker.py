@@ -94,7 +94,6 @@ class XPUWorker(Worker):
 
         # Now take memory snapshot after NCCL is initialized
         gc.collect()
-        torch.xpu.synchronize()
         torch.xpu.empty_cache()
 
         # take current memory snapshot
