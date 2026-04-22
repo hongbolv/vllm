@@ -53,6 +53,13 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        logger.debug(
+            "XPUWorker.init_device: rank=%d, local_rank=%d, ZE_AFFINITY_MASK=%s",
+            self.rank,
+            self.local_rank,
+            os.environ.get("ZE_AFFINITY_MASK", "not set"),
+        )
+
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
@@ -66,6 +73,11 @@ class XPUWorker(Worker):
             self.init_gpu_memory = torch.xpu.get_device_properties(
                 self.local_rank
             ).total_memory
+            logger.debug(
+                "XPUWorker device initialized: device=%s, total_memory=%s",
+                self.device,
+                format_gib(self.init_gpu_memory),
+            )
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
@@ -76,7 +88,15 @@ class XPUWorker(Worker):
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
+        logger.debug(
+            "XPUWorker CCL env: CCL_ATL_TRANSPORT=%s, "
+            "LOCAL_WORLD_SIZE=%s, LOCAL_RANK=%s",
+            ENV_CCL_ATL_TRANSPORT,
+            ENV_LOCAL_WORLD_SIZE,
+            self.local_rank,
+        )
 
+        logger.debug("XPUWorker initializing distributed environment")
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
@@ -84,10 +104,13 @@ class XPUWorker(Worker):
             self.local_rank,
             current_platform.dist_backend,
         )
+        logger.debug("XPUWorker distributed environment initialized")
 
         # global all_reduce needed for overall oneccl warm up
         if torch.distributed.is_xccl_available():
+            logger.debug("XPUWorker performing XCCL warm-up all_reduce")
             torch.distributed.all_reduce(torch.zeros(1).xpu())
+            logger.debug("XPUWorker XCCL warm-up complete")
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -107,12 +130,21 @@ class XPUWorker(Worker):
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
+        logger.debug(
+            "XPUWorker workspace manager initialized with %d ubatches",
+            num_ubatches,
+        )
 
         # Construct the model runner
         model_runner = XPUModelRunnerV2 if self.use_v2_model_runner else XPUModelRunner
+        logger.debug(
+            "XPUWorker constructing model runner: %s",
+            model_runner.__name__,
+        )
         self.model_runner = model_runner(  # type: ignore
             self.vllm_config, self.device
         )
+        logger.debug("XPUWorker model runner constructed")
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
