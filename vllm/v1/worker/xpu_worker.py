@@ -107,10 +107,9 @@ class XPUWorker(Worker):
 
         # XCCL warm-up: run a dummy all_reduce on the TP group so that
         # the oneCCL backend is fully initialised before real work begins.
-        # We intentionally use the TP group rather than the default (world)
-        # group because in DP + TP configurations each DP shard sees only
-        # its own subset of devices (via ZE_AFFINITY_MASK) and a world-wide
-        # all_reduce across DP groups can hang.
+        # We use the TP group rather than the default (world) group to
+        # avoid requiring a world-wide collective during init, which can
+        # hang in certain multi-device configurations.
         if torch.distributed.is_xccl_available():
             from vllm.distributed.parallel_state import get_tp_group
 
