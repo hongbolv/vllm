@@ -156,14 +156,26 @@ class XPUWorker(Worker):
               file=_sys.stderr, flush=True)
 
         # Set random seed.
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"set_random_seed, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         set_random_seed(self.model_config.seed)
 
         # Now take memory snapshot after NCCL is initialized
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"gc.collect + empty_cache, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         gc.collect()
         torch.accelerator.empty_cache()
 
         # take current memory snapshot
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"MemorySnapshot, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"request_memory, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         self.requested_memory = request_memory(init_snapshot, self.cache_config)
         logger.debug("worker init memory snapshot: %r", self.init_snapshot)
         logger.debug(
@@ -171,17 +183,30 @@ class XPUWorker(Worker):
         )
 
         # Initialize workspace manager
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"init_workspace_manager, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"constructing model_runner "
+              f"(use_v2={self.use_v2_model_runner}), pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         model_runner = XPUModelRunnerV2 if self.use_v2_model_runner else XPUModelRunner
         self.model_runner = model_runner(  # type: ignore
             self.vllm_config, self.device
         )
+        print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+              f"model_runner constructed, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
+            print(f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+                  f"report_usage_stats (rank 0 only), pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             report_usage_stats(self.vllm_config)
 
         print(f"[VLLM_DEBUG] XPUWorker.init_device: all done, "
