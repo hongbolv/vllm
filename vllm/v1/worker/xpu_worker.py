@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import sys as _sys
 from typing import Any
 
 import torch
@@ -93,8 +94,26 @@ class XPUWorker(Worker):
         set_random_seed(self.model_config.seed)
 
         # Now take memory snapshot after NCCL is initialized
+        print(
+            f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"before gc.collect(), pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
         gc.collect()
+        print(
+            f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"gc.collect() done, before empty_cache(), pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
         torch.accelerator.empty_cache()
+        print(
+            f"[======VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"empty_cache() done, pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
 
         # take current memory snapshot
         self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
