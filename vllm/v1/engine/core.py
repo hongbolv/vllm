@@ -1060,6 +1060,14 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        # Immediate stderr log to confirm subprocess is alive.
+        # This prints before any framework initialization, so it is
+        # as reliable as CCL WARN messages (both go to stderr).
+        import sys as _sys
+        print(f"[VLLM_DEBUG] EngineCore subprocess started, "
+              f"pid={os.getpid()}, dp_rank={dp_rank}",
+              file=_sys.stderr, flush=True)
+
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
