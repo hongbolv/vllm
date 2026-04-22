@@ -33,9 +33,17 @@ class XPUWorker(Worker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] XPUWorker.__init__: ENTERED, "
+              f"rank={rank}, local_rank={local_rank}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         super().__init__(
             vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
         )
+        print(f"[=====VLLM_DEBUG=====] XPUWorker.__init__: super().__init__ done, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         device_config = self.device_config
         assert device_config.device_type == "xpu"
         assert current_platform.is_xpu()

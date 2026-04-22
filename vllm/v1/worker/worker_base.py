@@ -224,6 +224,12 @@ class WorkerWrapperBase:
         Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] WorkerWrapperBase.init_worker: ENTERED, "
+              f"rpc_rank={self.rpc_rank}, global_rank={self.global_rank}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
+
         kwargs = all_kwargs[self.rpc_rank]
 
         vllm_config: VllmConfig | None = kwargs.get("vllm_config")
@@ -240,9 +246,17 @@ class WorkerWrapperBase:
 
         parallel_config = vllm_config.parallel_config
         if isinstance(parallel_config.worker_cls, str):
+            print(f"[=====VLLM_DEBUG=====] WorkerWrapperBase.init_worker: "
+                  f"resolving worker_cls={parallel_config.worker_cls}, "
+                  f"pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             worker_class: type[WorkerBase] = resolve_obj_by_qualname(
                 parallel_config.worker_cls
             )
+            print(f"[=====VLLM_DEBUG=====] WorkerWrapperBase.init_worker: "
+                  f"resolved worker_class={worker_class}, "
+                  f"pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
         else:
             raise ValueError(
                 "passing worker_cls is no longer supported. "
@@ -300,9 +314,16 @@ class WorkerWrapperBase:
                 )
             )
 
+        print(f"[=====VLLM_DEBUG=====] WorkerWrapperBase.init_worker: "
+              f"creating worker instance {worker_class.__name__}(**kwargs), "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
+        print(f"[=====VLLM_DEBUG=====] WorkerWrapperBase.init_worker: "
+              f"worker instance created, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]

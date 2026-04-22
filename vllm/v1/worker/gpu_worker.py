@@ -111,6 +111,12 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] Worker.__init__: ENTERED, "
+              f"rank={rank}, local_rank={local_rank}, "
+              f"device_type={vllm_config.device_config.device_type}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,

@@ -155,6 +155,13 @@ class MultiprocExecutor(Executor):
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] MultiprocExecutor: creating workers, "
+              f"local_world_size={self.local_world_size}, "
+              f"world_size={self.world_size}, "
+              f"distributed_init_method={distributed_init_method}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         context = get_mp_context()
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
@@ -196,6 +203,9 @@ class MultiprocExecutor(Executor):
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
 
+            print(f"[=====VLLM_DEBUG=====] MultiprocExecutor: all workers spawned, "
+                  f"waiting for ready, pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             # Wait for all local workers to be ready.
             self.workers = WorkerProc.wait_for_ready(unready_workers)
 
@@ -586,6 +596,13 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
     ):
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] WorkerProc.__init__: ENTERED, "
+              f"rank={rank}, local_rank={local_rank}, "
+              f"worker_cls={vllm_config.parallel_config.worker_cls}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
+
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
@@ -600,7 +617,13 @@ class WorkerProc:
             "is_driver_worker": is_driver_worker,
             "shared_worker_lock": shared_worker_lock,
         }
+        print(f"[=====VLLM_DEBUG=====] WorkerProc.__init__: calling init_worker, "
+              f"rank={rank}, local_rank={local_rank}, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         wrapper.init_worker(all_kwargs)
+        print(f"[=====VLLM_DEBUG=====] WorkerProc.__init__: init_worker done, "
+              f"rank={rank}, local_rank={local_rank}, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         self.worker = wrapper
 
         self.setup_proc_title_and_log_prefix(
@@ -806,6 +829,15 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+
+        # Immediate stderr log to confirm worker subprocess is alive
+        import sys as _sys
+        _rank = kwargs.get("rank", "?")
+        _local_rank = kwargs.get("local_rank", "?")
+        print(f"[=====VLLM_DEBUG=====] WorkerProc.worker_main: ENTERED, "
+              f"rank={_rank}, local_rank={_local_rank}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

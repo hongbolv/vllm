@@ -113,7 +113,14 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
+        import sys as _sys
+        print(f"[=====VLLM_DEBUG=====] EngineCore.__init__: creating executor "
+              f"{executor_class.__name__}, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         self.model_executor = executor_class(vllm_config)
+        print(f"[=====VLLM_DEBUG=====] EngineCore.__init__: executor created, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
