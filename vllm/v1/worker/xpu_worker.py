@@ -53,6 +53,26 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.nnodes_within_dp == 1
+        ):
+            # Use local DP rank if available, otherwise use global DP rank.
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            tp_pp_world_size = (
+                parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size
+            )
+
+            # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+            self.local_rank += dp_local_rank * tp_pp_world_size
+
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
