@@ -54,6 +54,23 @@ class XPUWorker(Worker):
 
     def init_device(self):
         parallel_config = self.parallel_config
+
+        # --- ZE_AFFINITY_MASK debug logging ---
+        ze_mask = os.environ.get("ZE_AFFINITY_MASK", "<not set>")
+        logger.info(
+            "[XPU_DEBUG] init_device entry: rank=%d, local_rank=%d, "
+            "dp_rank=%s, dp_rank_local=%s, tp=%d, dp=%d, "
+            "ZE_AFFINITY_MASK=%s, xpu_device_count=%d",
+            self.rank,
+            self.local_rank,
+            parallel_config.data_parallel_index,
+            parallel_config.data_parallel_rank_local,
+            parallel_config.tensor_parallel_size,
+            parallel_config.data_parallel_size,
+            ze_mask,
+            torch.xpu.device_count(),
+        )
+
         if (
             parallel_config.distributed_executor_backend
             not in ("ray", "external_launcher")
@@ -72,6 +89,13 @@ class XPUWorker(Worker):
 
             # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
             self.local_rank += dp_local_rank * tp_pp_world_size
+            logger.info(
+                "[XPU_DEBUG] local_rank adjusted: dp_local_rank=%d, "
+                "tp_pp_world_size=%d, new local_rank=%d",
+                dp_local_rank,
+                tp_pp_world_size,
+                self.local_rank,
+            )
 
         device = self.device_config.device
         if (
@@ -80,6 +104,11 @@ class XPUWorker(Worker):
             and current_platform.is_xpu()
         ):
             self.device = torch.device(f"xpu:{self.local_rank}")
+            logger.info(
+                "[XPU_DEBUG] Setting device to %s (local_rank=%d)",
+                self.device,
+                self.local_rank,
+            )
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
@@ -97,12 +126,33 @@ class XPUWorker(Worker):
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
+        logger.info(
+            "[XPU_DEBUG] Before init_worker_distributed_environment: "
+            "rank=%d, local_rank=%d, ZE_AFFINITY_MASK=%s, "
+            "LOCAL_WORLD_SIZE=%s, LOCAL_RANK=%s",
+            self.rank,
+            self.local_rank,
+            os.environ.get("ZE_AFFINITY_MASK", "<not set>"),
+            ENV_LOCAL_WORLD_SIZE,
+            str(self.local_rank),
+        )
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
             self.distributed_init_method,
             self.local_rank,
             current_platform.dist_backend,
+        )
+
+        logger.info(
+            "[XPU_DEBUG] After init_worker_distributed_environment: "
+            "dist.is_initialized=%s, world_size=%d, rank=%d",
+            torch.distributed.is_initialized(),
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else -1,
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
         )
 
         # XCCL warm-up: run a dummy all_reduce on the TP group so that
@@ -114,10 +164,19 @@ class XPUWorker(Worker):
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_group = get_tp_group()
+            logger.info(
+                "[XPU_DEBUG] XCCL warm-up: tp_group ranks=%s, "
+                "rank_in_group=%d, device=%s, ZE_AFFINITY_MASK=%s",
+                tp_group.ranks,
+                tp_group.rank_in_group,
+                self.device,
+                os.environ.get("ZE_AFFINITY_MASK", "<not set>"),
+            )
             torch.distributed.all_reduce(
                 torch.zeros(1, device=self.device),
                 group=tp_group.device_group,
             )
+            logger.info("[XPU_DEBUG] XCCL warm-up all_reduce completed")
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
