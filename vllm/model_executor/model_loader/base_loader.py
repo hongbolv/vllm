@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os as _os
+import sys as _sys
 from abc import ABC, abstractmethod
 
 import torch
@@ -52,16 +54,48 @@ class BaseModelLoader(ABC):
         target_device = torch.device(load_device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                print(
+                    f"[=====VLLM_DEBUG=====] "
+                    f"BaseModelLoader.load_model: "
+                    f"initializing model, "
+                    f"target_device={target_device}, "
+                    f"pid={_os.getpid()}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
                 model = initialize_model(
                     vllm_config=vllm_config,
                     model_config=model_config,
                     prefix=prefix,
                 )
+                print(
+                    f"[=====VLLM_DEBUG=====] "
+                    f"BaseModelLoader.load_model: "
+                    f"model initialized, pid={_os.getpid()}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
 
             log_model_inspection(model)
 
             logger.debug("Loading weights on %s ...", load_device)
+            print(
+                f"[=====VLLM_DEBUG=====] "
+                f"BaseModelLoader.load_model: "
+                f"before load_weights, "
+                f"load_device={load_device}, "
+                f"pid={_os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
             self.load_weights(model, model_config)
+            print(
+                f"[=====VLLM_DEBUG=====] "
+                f"BaseModelLoader.load_model: "
+                f"after load_weights, pid={_os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.

@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import sys as _sys
 import threading
 import weakref
 from collections.abc import Callable, Iterator
@@ -152,6 +153,23 @@ class CoreEngineProcManager:
                     device_control_context = set_device_control_env_var(
                         vllm_config, local_dp_rank
                     )
+
+                print(
+                    f"[=====VLLM_DEBUG=====] "
+                    f"CoreEngineProcManager: "
+                    f"is_dp={is_dp}, "
+                    f"is_cuda_alike="
+                    f"{current_platform.is_cuda_alike()}, "
+                    f"is_xpu={current_platform.is_xpu()}, "
+                    f"local_dp_rank={local_dp_rank}, "
+                    f"device_control_context="
+                    f"{type(device_control_context).__name__}, "
+                    f"ZE_AFFINITY_MASK="
+                    f"{os.environ.get('ZE_AFFINITY_MASK', '<not set>')}"
+                    f", pid={os.getpid()}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
 
                 with (
                     device_control_context,

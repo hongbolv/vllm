@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import sys as _sys
 from typing import Any
 
 import torch
@@ -53,6 +54,16 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        print(
+            f"[=====VLLM_DEBUG=====] XPUWorker.init_device entry: "
+            f"rank={self.rank}, local_rank={self.local_rank}, "
+            f"ZE_AFFINITY_MASK="
+            f"{os.environ.get('ZE_AFFINITY_MASK', '<not set>')}, "
+            f"xpu_device_count={torch.xpu.device_count()}, "
+            f"pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
@@ -60,6 +71,14 @@ class XPUWorker(Worker):
             and current_platform.is_xpu()
         ):
             self.device = torch.device(f"xpu:{self.local_rank}")
+            print(
+                f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+                f"Setting device to {self.device} "
+                f"(local_rank={self.local_rank}), "
+                f"pid={os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
@@ -77,6 +96,18 @@ class XPUWorker(Worker):
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
+        print(
+            f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"before init_worker_distributed_environment, "
+            f"rank={self.rank}, local_rank={self.local_rank}, "
+            f"ZE_AFFINITY_MASK="
+            f"{os.environ.get('ZE_AFFINITY_MASK', '<not set>')}, "
+            f"LOCAL_WORLD_SIZE={ENV_LOCAL_WORLD_SIZE}, "
+            f"pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
@@ -85,16 +116,61 @@ class XPUWorker(Worker):
             current_platform.dist_backend,
         )
 
+        _dist_init = torch.distributed.is_initialized()
+        print(
+            f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"after init_worker_distributed_environment, "
+            f"dist.is_initialized={_dist_init}, "
+            f"world_size="
+            f"{torch.distributed.get_world_size() if _dist_init else -1}"
+            f", rank="
+            f"{torch.distributed.get_rank() if _dist_init else -1}"
+            f", pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
+
         # global all_reduce needed for overall oneccl warm up
         if torch.distributed.is_xccl_available():
+            print(
+                f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+                f"before XCCL warm-up all_reduce, "
+                f"device={self.device}, "
+                f"ZE_AFFINITY_MASK="
+                f"{os.environ.get('ZE_AFFINITY_MASK', '<not set>')}"
+                f", pid={os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
             torch.distributed.all_reduce(torch.zeros(1).xpu())
+            print(
+                f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+                f"after XCCL warm-up all_reduce completed, "
+                f"pid={os.getpid()}",
+                file=_sys.stderr,
+                flush=True,
+            )
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
         # Now take memory snapshot after NCCL is initialized
         gc.collect()
+        print(
+            f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"before torch.accelerator.empty_cache(), "
+            f"pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
         torch.accelerator.empty_cache()
+        print(
+            f"[=====VLLM_DEBUG=====] XPUWorker.init_device: "
+            f"after torch.accelerator.empty_cache(), "
+            f"pid={os.getpid()}",
+            file=_sys.stderr,
+            flush=True,
+        )
 
         # take current memory snapshot
         self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
