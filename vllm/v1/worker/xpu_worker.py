@@ -53,12 +53,52 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        import sys as _sys
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: starting, "
+              f"rank={self.rank}, local_rank={self.local_rank}, "
+              f"device_type={self.device_config.device_type}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
+
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
+            parallel_config = self.parallel_config
+            if (
+                parallel_config.distributed_executor_backend
+                not in ("ray", "external_launcher")
+                and parallel_config.data_parallel_backend != "ray"
+                and parallel_config.nnodes_within_dp == 1
+            ):
+                # Use local DP rank if available, otherwise use global DP rank.
+                dp_local_rank = self.parallel_config.data_parallel_rank_local
+                if dp_local_rank is None:
+                    dp_local_rank = self.parallel_config.data_parallel_index
+
+                tp_pp_world_size = (
+                    self.parallel_config.pipeline_parallel_size
+                    * self.parallel_config.tensor_parallel_size
+                )
+
+                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                self.local_rank += dp_local_rank * tp_pp_world_size
+                print(f"[VLLM_DEBUG] XPUWorker.init_device: "
+                      f"DP adjusted local_rank={self.local_rank}, "
+                      f"dp_local_rank={dp_local_rank}, "
+                      f"tp_pp_world_size={tp_pp_world_size}, "
+                      f"pid={os.getpid()}",
+                      file=_sys.stderr, flush=True)
+                assert self.local_rank < torch.accelerator.device_count(), (
+                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                    f"device_count={torch.accelerator.device_count()}"
+                )
+
+            print(f"[VLLM_DEBUG] XPUWorker.init_device: setting device "
+                  f"xpu:{self.local_rank}, pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             self.device = torch.device(f"xpu:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -77,6 +117,14 @@ class XPUWorker(Worker):
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: calling "
+              f"init_worker_distributed_environment, "
+              f"rank={self.rank}, local_rank={self.local_rank}, "
+              f"backend={current_platform.dist_backend}, "
+              f"world_size={self.parallel_config.world_size}, "
+              f"distributed_init_method={self.distributed_init_method}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
@@ -84,10 +132,20 @@ class XPUWorker(Worker):
             self.local_rank,
             current_platform.dist_backend,
         )
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: "
+              f"init_worker_distributed_environment done, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
         # global all_reduce needed for overall oneccl warm up
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: "
+              f"xccl warm up all_reduce, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         if torch.distributed.is_xccl_available():
             torch.distributed.all_reduce(torch.zeros(1).xpu())
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: "
+              f"xccl warm up done, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -117,3 +175,8 @@ class XPUWorker(Worker):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+        print(f"[VLLM_DEBUG] XPUWorker.init_device: all done, "
+              f"rank={self.rank}, local_rank={self.local_rank}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
