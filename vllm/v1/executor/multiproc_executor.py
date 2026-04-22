@@ -607,8 +607,16 @@ class WorkerProc:
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
 
+        import sys as _sys
         # Load model
+        print(f"[VLLM_DEBUG] WorkerProc.__init__: calling init_device, "
+              f"rank={rank}, local_rank={local_rank}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         self.worker.init_device()
+        print(f"[VLLM_DEBUG] WorkerProc.__init__: init_device done, "
+              f"rank={rank}, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -616,7 +624,13 @@ class WorkerProc:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
         else:
+            print(f"[VLLM_DEBUG] WorkerProc.__init__: calling load_model, "
+                  f"rank={rank}, pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             self.worker.load_model()
+            print(f"[VLLM_DEBUG] WorkerProc.__init__: load_model done, "
+                  f"rank={rank}, pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling

@@ -217,6 +217,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        import sys as _sys
+        print(f"[VLLM_DEBUG] Worker.init_device: starting, "
+              f"rank={self.rank}, local_rank={self.local_rank}, "
+              f"device_type={self.device_config.device_type}, "
+              f"pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -251,6 +257,9 @@ class Worker(WorkerBase):
                     f"({visible_device_count})."
                 )
 
+            print(f"[VLLM_DEBUG] Worker.init_device: setting device "
+                  f"cuda:{self.local_rank}, pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
@@ -260,6 +269,12 @@ class Worker(WorkerBase):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            print(f"[VLLM_DEBUG] Worker.init_device: calling "
+                  f"init_worker_distributed_environment, "
+                  f"rank={self.rank}, local_rank={self.local_rank}, "
+                  f"backend={current_platform.dist_backend}, "
+                  f"pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -267,6 +282,10 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+            print(f"[VLLM_DEBUG] Worker.init_device: "
+                  f"init_worker_distributed_environment done, "
+                  f"pid={os.getpid()}",
+                  file=_sys.stderr, flush=True)
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner", scope="local")
@@ -1035,6 +1054,12 @@ def init_worker_distributed_environment(
     backend: str = "nccl",
 ) -> None:
     """Initialize the distributed environment."""
+    import sys as _sys
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"rank={rank}, local_rank={local_rank}, backend={backend}, "
+          f"pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
+
     attention_config = vllm_config.attention_config
     parallel_config = vllm_config.parallel_config
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
@@ -1049,6 +1074,12 @@ def init_worker_distributed_environment(
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)
 
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"calling init_distributed_environment, "
+          f"world_size={parallel_config.world_size}, rank={rank}, "
+          f"init_method={init_method}, backend={backend}, "
+          f"timeout={timeout}, pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
     init_distributed_environment(
         parallel_config.world_size,
         rank,
@@ -1057,14 +1088,31 @@ def init_worker_distributed_environment(
         backend,
         timeout,
     )
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"init_distributed_environment done, rank={rank}, "
+          f"pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
 
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"calling ensure_model_parallel_initialized, "
+          f"tp={parallel_config.tensor_parallel_size}, "
+          f"pp={parallel_config.pipeline_parallel_size}, "
+          f"pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"ensure_model_parallel_initialized done, rank={rank}, "
+          f"pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
 
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)
+    print(f"[VLLM_DEBUG] init_worker_distributed_environment: "
+          f"all done, rank={rank}, pid={os.getpid()}",
+          file=_sys.stderr, flush=True)
