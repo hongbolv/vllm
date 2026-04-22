@@ -1329,11 +1329,12 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
             # wrap raised exception to provide more information
             stderr_text = returned.stderr.decode()
             stdout_text = returned.stdout.decode()
-            details = stderr_text
-            if not details.strip() and stdout_text.strip():
+            if not stderr_text.strip() and stdout_text.strip():
                 details = f"(stderr was empty, stdout below)\n{stdout_text}"
-            elif stdout_text.strip():
+            elif stderr_text.strip() and stdout_text.strip():
                 details = f"{stderr_text}\n(stdout)\n{stdout_text}"
+            else:
+                details = stderr_text
             raise RuntimeError(
                 f"Error raised in subprocess:\n{details}"
             ) from e
