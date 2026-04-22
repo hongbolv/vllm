@@ -1327,8 +1327,15 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
             returned.check_returncode()
         except Exception as e:
             # wrap raised exception to provide more information
+            stderr_text = returned.stderr.decode()
+            stdout_text = returned.stdout.decode()
+            details = stderr_text
+            if not details.strip() and stdout_text.strip():
+                details = f"(stderr was empty, stdout below)\n{stdout_text}"
+            elif stdout_text.strip():
+                details = f"{stderr_text}\n(stdout)\n{stdout_text}"
             raise RuntimeError(
-                f"Error raised in subprocess:\n{returned.stderr.decode()}"
+                f"Error raised in subprocess:\n{details}"
             ) from e
 
         with open(output_filepath, "rb") as f:
@@ -1341,12 +1348,19 @@ def _run() -> None:
 
     load_general_plugins()
 
-    fn, output_file = pickle.loads(sys.stdin.buffer.read())
+    try:
+        fn, output_file = pickle.loads(sys.stdin.buffer.read())
 
-    result = fn()
+        result = fn()
 
-    with open(output_file, "wb") as f:
-        f.write(pickle.dumps(result))
+        with open(output_file, "wb") as f:
+            f.write(pickle.dumps(result))
+    except Exception:
+        # Ensure the traceback is written to stderr so the parent process
+        # can include it in its error message.
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
