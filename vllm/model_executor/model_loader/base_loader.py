@@ -44,6 +44,9 @@ class BaseModelLoader(ABC):
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        import os as _os
+        import sys as _sys
+
         device_config = vllm_config.device_config
         load_config = vllm_config.load_config
         load_device = (
@@ -51,17 +54,29 @@ class BaseModelLoader(ABC):
         )
         target_device = torch.device(load_device)
         with set_default_torch_dtype(model_config.dtype):
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"initializing model, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
             with target_device:
                 model = initialize_model(
                     vllm_config=vllm_config,
                     model_config=model_config,
                     prefix=prefix,
                 )
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"model initialized, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
 
             log_model_inspection(model)
 
             logger.debug("Loading weights on %s ...", load_device)
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"loading weights on {load_device}, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
             self.load_weights(model, model_config)
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"weights loaded, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.
@@ -78,7 +93,13 @@ class BaseModelLoader(ABC):
             if _has_online_quant(model):
                 finalize_layerwise_processing(model, model_config)
 
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"processing weights after loading, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
             process_weights_after_loading(model, model_config, target_device)
+            print(f"[VLLM_DEBUG] BaseModelLoader.load_model: "
+                  f"done, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
 
         return model.eval()
 

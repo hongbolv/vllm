@@ -258,6 +258,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return tuple(tasks)
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        import os as _os
+        import sys as _sys
+
+        print(f"[VLLM_DEBUG] GPUModelRunner(gpu/).load_model: "
+              f"starting, pid={_os.getpid()}",
+              file=_sys.stderr, flush=True)
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -267,9 +273,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info("Loading model from scratch...")
 
+            print(f"[VLLM_DEBUG] GPUModelRunner(gpu/).load_model: "
+                  f"calling model_loader.load_model(), pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
             )
+            print(f"[VLLM_DEBUG] GPUModelRunner(gpu/).load_model: "
+                  f"model_loader.load_model() done, pid={_os.getpid()}",
+                  file=_sys.stderr, flush=True)
             if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device

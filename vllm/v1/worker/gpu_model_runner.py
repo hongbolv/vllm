@@ -4749,6 +4749,13 @@ class GPUModelRunner(
         Args:
             load_dummy_weights: load dummy weights instead of real weights.
         """
+        import os as _os
+        import sys as _sys
+
+        print(f"[VLLM_DEBUG] GPUModelRunner.load_model: "
+              f"starting, model={self.model_config.model}, "
+              f"pid={_os.getpid()}",
+              file=_sys.stderr, flush=True)
         logger.info_once(
             "Starting to load model %s...",
             self.model_config.model,
@@ -4765,9 +4772,15 @@ class GPUModelRunner(
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
                 model_loader = get_model_loader(self.load_config)
+                print(f"[VLLM_DEBUG] GPUModelRunner.load_model: "
+                      f"calling model_loader.load_model(), pid={_os.getpid()}",
+                      file=_sys.stderr, flush=True)
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                print(f"[VLLM_DEBUG] GPUModelRunner.load_model: "
+                      f"model_loader.load_model() done, pid={_os.getpid()}",
+                      file=_sys.stderr, flush=True)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device

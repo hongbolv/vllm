@@ -366,6 +366,8 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        import sys as _sys
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (
@@ -378,7 +380,14 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model_config)
 
         weights_to_load = {name for name, _ in model.named_parameters()}
+        print(f"[VLLM_DEBUG] DefaultModelLoader.load_weights: "
+              f"starting model.load_weights(), "
+              f"num_params={len(weights_to_load)}, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        print(f"[VLLM_DEBUG] DefaultModelLoader.load_weights: "
+              f"model.load_weights() done, pid={os.getpid()}",
+              file=_sys.stderr, flush=True)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
