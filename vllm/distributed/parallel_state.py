@@ -1363,6 +1363,19 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    import os
+    pid = os.getpid()
+    print(f"[DEBUG-DP][PID={pid}] init_distributed_environment ENTRY: "
+          f"world_size={world_size}, rank={rank}, local_rank={local_rank}, "
+          f"distributed_init_method={distributed_init_method}, backend={backend}",
+          flush=True)
+    print(f"[DEBUG-DP][PID={pid}] env: RANK={os.environ.get('RANK')}, "
+          f"LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
+          f"WORLD_SIZE={os.environ.get('WORLD_SIZE')}, "
+          f"MASTER_ADDR={os.environ.get('MASTER_ADDR')}, "
+          f"MASTER_PORT={os.environ.get('MASTER_PORT')}",
+          flush=True)
+
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
@@ -1377,6 +1390,13 @@ def init_distributed_environment(
         and not enable_elastic_ep
     ):
         parallel_config = config.parallel_config
+        print(f"[DEBUG-DP][PID={pid}] DP adjustment BEFORE: "
+              f"data_parallel_size={parallel_config.data_parallel_size}, "
+              f"data_parallel_rank={parallel_config.data_parallel_rank}, "
+              f"world_size_across_dp={parallel_config.world_size_across_dp}, "
+              f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
+              f"original_rank={rank}, original_world_size={world_size}",
+              flush=True)
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
         rank = parallel_config.data_parallel_rank * world_size + rank
@@ -1398,6 +1418,11 @@ def init_distributed_environment(
                 rank,
                 distributed_init_method,
             )
+        print(f"[DEBUG-DP][PID={pid}] DP adjustment AFTER: "
+              f"adjusted_rank={rank}, adjusted_world_size={world_size}, "
+              f"ip={ip}, port={port}, "
+              f"distributed_init_method={distributed_init_method}",
+              flush=True)
     if not torch.distributed.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -1420,6 +1445,11 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
+        print(f"[DEBUG-DP][PID={pid}] calling init_process_group: "
+              f"backend={backend}, init_method={distributed_init_method}, "
+              f"world_size={world_size}, rank={rank}, "
+              f"is_initialized_before={torch.distributed.is_initialized()}",
+              flush=True)
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1428,6 +1458,12 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+        print(f"[DEBUG-DP][PID={pid}] init_process_group COMPLETED: "
+              f"is_initialized={torch.distributed.is_initialized()}, "
+              f"world_size={torch.distributed.get_world_size()}, "
+              f"rank={torch.distributed.get_rank()}, "
+              f"backend={torch.distributed.get_backend()}",
+              flush=True)
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout
@@ -1447,6 +1483,11 @@ def init_distributed_environment(
         # local rank not set, this usually happens in single-node
         # setting, where we can use rank as local rank
         local_rank = envs.LOCAL_RANK if distributed_init_method == "env://" else rank
+
+    print(f"[DEBUG-DP][PID={pid}] final local_rank={local_rank}, "
+          f"envs.LOCAL_RANK={envs.LOCAL_RANK}, "
+          f"distributed_init_method={distributed_init_method}",
+          flush=True)
 
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
     if enable_elastic_ep:
