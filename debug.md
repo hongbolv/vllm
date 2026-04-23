@@ -131,6 +131,51 @@ dist.destroy_process_group()
 
 **结论：PyTorch/XCCL 本身在跨进程场景下工作正常，问题是 vLLM 的 DP>1 worker 初始化逻辑导致了 LOCAL_RANK 冲突。**
 
+### 5.3 为什么 `test_xccl.py` 没有出现 LOCAL_RANK 冲突？
+
+`test_xccl.py` 使用 `torchrun --nproc_per_node=4` 启动，这与 vLLM DP>1 场景有本质区别：
+
+| | `torchrun` (test_xccl.py) | vLLM DP>1 |
+|--|---------------------------|-----------|
+| **进程管理** | `torchrun` 统一管理 4 个进程 | 多个 EngineCore 各自独立 spawn worker |
+| **LOCAL_RANK 分配** | `torchrun` 自动分配 0,1,2,3（全局唯一） | 每个 EngineCore 内部从 0 开始（会重复） |
+| **设备绑定** | `torchrun` 设置 `LOCAL_RANK` 环境变量，`xpu(LOCAL_RANK)` 各不相同 | `local_rank` 冲突导致 `xpu(0)` 和 `xpu(1)` 被多个 rank 共享 |
+| **环境变量** | `torchrun` 设置 `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` | vLLM 不依赖这些环境变量，参数通过函数传递，`LOCAL_RANK` 环境变量为 None |
+| **设备可见性** | 所有进程看到全部 4 块 GPU，但 `LOCAL_RANK` 唯一 → 各用各的 GPU | 所有进程看到全部 4 块 GPU，`local_rank` 重复 → 多个 rank 用同一块 GPU |
+
+关键差异：`torchrun` 是**单一启动器管理所有进程**，能确保 `LOCAL_RANK` 全局唯一。vLLM DP>1 是**多个 EngineCore 各自独立 spawn worker**，每个 EngineCore 内部 `local_rank` 从 0 开始，没有跨 EngineCore 的 `local_rank` 协调机制。
+
+### 5.4 如何确认 LOCAL_RANK 冲突是根因？
+
+确认 LOCAL_RANK 冲突是根因，基于以下**三重证据链**：
+
+**证据1：诊断日志直接观测到 local_rank 重复（第六节详细数据）**
+
+诊断打印明确显示 EngineCore 0 的 worker（PID 4185）和 EngineCore 1 的 worker（PID 4189）都使用 `local_rank=0`，EngineCore 0 的 worker（PID 4186）和 EngineCore 1 的 worker（PID 4190）都使用 `local_rank=1`。4 个 XCCL rank 只映射到 2 块物理 GPU。
+
+**证据2：对比排除法 — 所有其他可能原因均已排除**
+
+| 排除的假设 | 排除依据 |
+|-----------|---------|
+| `has_all_vertices_connected: 0` 拓扑问题 | TP=4/DP=1 同样 `=0` 且正常工作 |
+| SYCL kernel 路径问题 | `CCL_SYCL_KERNELS=0` 仍 hang |
+| PyTorch/XCCL 自身缺陷 | `test_xccl.py` 用 `torchrun` 正常工作 |
+| 两阶段 init_process_group | 日志显示 `is_initialized_before=False`，无 destroy/rebuild |
+| TCP rendezvous 失败 | `init_process_group` 成功完成 |
+| allreduce 提交失败 | CCL 报告所有 4 rank 的内核入队 "done" |
+
+所有假设被排除后，**唯一剩余的差异**就是 `local_rank` 分配：TP=4/DP=1 时 `local_rank` 为 0,1,2,3（唯一），DP>1 时为 0,1,0,1（冲突）。
+
+**证据3：代码级根因链条完整**
+
+1. `vllm/v1/engine/core.py` → `DPEngineCoreActor._set_visible_devices()` 中 XPU 分支是 `pass`（不设置 `ZE_AFFINITY_MASK`）
+2. `vllm/distributed/parallel_state.py` → `init_distributed_environment()` 中 DP 调整只修改全局 `rank` 和 `world_size`，**不修改 `local_rank`**
+3. `vllm/v1/worker/xpu_worker.py` → `XPUWorker.init_device()` 中使用 `local_rank` 调用 `torch.xpu.set_device()`
+4. 结果：`local_rank=0` 的两个 worker（rank 0 和 rank 2）都调用 `torch.xpu.set_device(0)` → 都绑定到物理 GPU 0
+5. XCCL communicator 创建时，4 个 rank 声称使用 4 块不同设备，但实际只用了 2 块 → 设备拓扑不一致 → allreduce ring kernel 在设备端死锁
+
+这三重证据（直接观测 + 排除法 + 代码链条）共同确认 LOCAL_RANK 冲突是根因。
+
 ---
 
 ## 六、诊断日志详细分析
