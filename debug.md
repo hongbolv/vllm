@@ -492,21 +492,56 @@ TP=4/DP=1（正常）与 DP>1（hang）的关键差异已从"LOCAL_RANK 冲突"�
 | 3 | **XCCL communicator 创建时的设备 ID 映射** | 每个进程内 XCCL 使用虚拟设备 ID（0 或 1），但跨进程 IPC 需要用物理设备 ID。XCCL/oneCCL 是否正确处理了 `ZE_AFFINITY_MASK` 虚拟化？ |
 | 4 | **CCL 的 `local_proc_count` 检测问题** | CCL 日志显示 `local_proc_count 4`，但实际上每个 affinity 组只有 2 个进程。如果 CCL 错误地认为 4 个进程都在同一组设备上，可能导致通信拓扑构建错误 |
 
-### 10.5 建议的下一步验证
+### 10.5 验证脚本 `test_xccl_cross_affinity.py`
 
-1. **验证假设 1**：运行 `test_xccl.py` 但手动设置不同的 `ZE_AFFINITY_MASK`（2 个进程用 `0,1`，2 个进程用 `2,3`），看是否复现 hang
+已创建 `test_xccl_cross_affinity.py`，支持三种模式来验证跨 `ZE_AFFINITY_MASK` IPC 假设：
+
+#### 运行方式
+
+```bash
+# 模式 A（基线）：不设置 ZE_AFFINITY_MASK，模拟 TP=4/DP=1（预期正常 ✅）
+python test_xccl_cross_affinity.py --mode baseline
+
+# 模式 B（跨 affinity）：分组设置 ZE_AFFINITY_MASK，模拟 DP>1（预期 hang 🔴 如果假设成立）
+python test_xccl_cross_affinity.py --mode cross_affinity
+
+# 模式 C（同组 affinity）：所有进程使用相同 ZE_AFFINITY_MASK（对照组）
+python test_xccl_cross_affinity.py --mode same_affinity
+```
+
+#### 三种模式的设备分配
+
+| 模式 | Rank 0,1 ZE_AFFINITY_MASK | Rank 2,3 ZE_AFFINITY_MASK | 模拟场景 |
+|------|--------------------------|--------------------------|----------|
+| `baseline` | 不设置 | 不设置 | TP=4/DP=1 |
+| `cross_affinity` | `0,1` | `2,3` | DP>1（vLLM 实际行为） |
+| `same_affinity` | `0,1,2,3` | `0,1,2,3` | 对照组 |
+
+#### 工作原理
+
+脚本使用 `multiprocessing.spawn` 启动 4 个 worker 进程（而非 `torchrun`），每个 worker：
+1. 根据 mode 设置 `ZE_AFFINITY_MASK`（在 `import torch` 之前，确保 Level Zero 运行时生效）
+2. 使用 `tcp://` init_method 手动初始化 process group（`world_size=4`）
+3. 执行 `all_reduce` + `torch.xpu.synchronize()`
+4. 打印每步状态，120 秒超时自动终止
+
+#### 预期结果解读
+
+| 模式 A 结果 | 模式 B 结果 | 结论 |
+|------------|------------|------|
+| ✅ 通过 | 🔴 hang | **确认 XCCL 跨 `ZE_AFFINITY_MASK` IPC 是根因** |
+| ✅ 通过 | ✅ 通过 | 排除跨 affinity 假设，需继续调查 |
+| 🔴 hang | 🔴 hang | 问题不在 affinity mask，可能是 `multiprocessing.spawn` vs `torchrun` 差异 |
+
+#### 其他验证步骤
+
+1. **检查 CCL `local_proc_count`**：在 CCL debug 日志中搜索 `local_proc_count`
+   - 如果 `local_proc_count=4` 但实际每个 affinity 组只有 2 个进程，可能导致通信拓扑错误
+
+2. **如果模式 B hang**，尝试设置 `CCL_ZE_IPC_EXCHANGE=sockets` 看是否能绕过：
    ```bash
-   # 如果以下测试 hang，确认 XCCL 跨 affinity mask IPC 问题
-   ZE_AFFINITY_MASK=0,1 torchrun --nproc_per_node=2 test_xccl_2gpu.py &
-   ZE_AFFINITY_MASK=2,3 torchrun --nproc_per_node=2 test_xccl_2gpu.py &
-   # 注意：需要让 4 个进程加入同一个 process group
+   CCL_ZE_IPC_EXCHANGE=sockets python test_xccl_cross_affinity.py --mode cross_affinity
    ```
-
-2. **验证假设 4**：检查 CCL 的 `local_proc_count` 在 DP>1 场景下是否正确
-   - 在 CCL debug 日志中搜索 `local_proc_count` 的值
-   - 如果 `local_proc_count=4` 但实际每个 affinity 组只有 2 个进程，这可能是问题
-
-3. **简化复现**：编写一个测试脚本，4 个进程手动分组使用不同的 `ZE_AFFINITY_MASK`，加入同一个 `init_process_group(world_size=4)`，然后做 `all_reduce` — 如果 hang，则确认是 XCCL/Level Zero 的跨 affinity mask 通信问题
 
 ---
 
