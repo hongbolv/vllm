@@ -100,86 +100,249 @@ torch.xpu.synchronize() ─────→ 等待 all_reduce 完成...
 
 ---
 
-## 五、可能的根因方向
+## 五、CCL Debug 日志分析（实测数据）
 
-| 方向 | 说明 | 可能性 |
-|------|------|--------|
-| **XCCL communicator 跨 DP group 通信链路问题** | `init_process_group` 在 Python 层成功（TCP rendezvous），但 XCCL 底层 communicator 在设备端的通信通道可能未正确建立跨 DP group 的链路 | 高 |
-| **不同 DP group 的 rank 提交时序差异** | 某些 rank 的 XPU queue 中可能有大量待执行操作，导致 all_reduce 在设备端执行时等不齐 | 中 |
-| **XCCL 在 multi-group/跨节点场景的 bug** | TP=4/DP=1 正常，DP>1 异常 → XCCL 可能在处理更大 world size 或跨组通信时有 bug | 高 |
-| **CCL 环境变量配置不匹配** | `CCL_ATL_TRANSPORT` 或 `LOCAL_WORLD_SIZE` 等变量在 DP>1 时可能需要不同配置 | 中 |
+通过设置 `CCL_LOG_LEVEL=debug` 和 `CCL_LOG_FLUSH=1` 收集到的日志，揭示了以下关键信息：
+
+### 5.1 环境与拓扑
+
+| 项目 | 值 |
+|------|------|
+| **GPU 型号** | Intel(R) Arc(TM) Pro B60 Graphics |
+| **设备族** | family6 |
+| **is_single_tile** | 1（每张卡是单 tile 设备） |
+| **has_all_vertices_connected** | **0**（设备之间**没有**全互联拓扑） |
+| **stream 类型** | gpu, in_order: 1 |
+| **WORLD group** | `comm { rank: X, size: 4, id: 1 }` — 4 个 rank |
+
+### 5.2 allreduce 执行流程（从日志还原）
+
+每个 rank 的 CCL 执行路径完全一致：
+
+```
+zeDeviceGetProperties
+zeDeviceGetCommandQueueGroupProperties (×2)
+stream: { type: gpu, in_order: 1, device: Arc Pro B60, device_family: family6 } (×2)
+can_use_sycl_kernels: coll allreduce, local_proc_count 4, comm { rank: X, size: 4, id: 1 }
+selected algo: coll allreduce, algo topo sycl
+ccl_allreduce: |CCL_SYCL| allreduce selects sycl-kernels count: 1, datatype: FLOAT32
+allreduce_sycl: is_single_node
+allreduce_sycl_single_node: |CCL_SYCL| is_single_tile: 1, has_all_vertices_connected: 0
+invoking allreduce LL256 kernel allreduce_ll_ring, count:1 datatype: FLOAT32
+invoking allreduce LL256 kernel arc_allreduce, count:1 datatype: FLOAT32
+invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done    ← ✅ CCL 认为内核已入队
+```
+
+### 5.3 关键时序（PID → Rank 映射）
+
+| PID | Rank | CCL allreduce 入队完成 | VLLM_DEBUG 打印 | 后续 |
+|-----|------|----------------------|-----------------|------|
+| 2267 | [0] | ✅ "done" | ✅ "all_reduce done calling synchronize" | 🔴 无更多输出 |
+| 2268 | [1] | ✅ "done" | ✅ "all_reduce done calling synchronize" | 🔴 无更多输出 |
+| 2271 | [2] | ✅ "done" | ✅ "all_reduce done calling synchronize" | 🔴 无更多输出 |
+| 2272 | [3] | ✅ "done" | ✅ "all_reduce done calling synchronize" | 🔴 无更多输出 |
+
+**所有 4 个 rank 的 CCL 均报告 allreduce 内核入队完成，但 `torch.xpu.synchronize()` 后没有任何输出** — 确认 hang 在 `synchronize()` 处。
+
+### 5.4 日志中的异常信号
+
+**信号1：先前 communicator 的 finalize 操作**
+
+日志开头出现 PID 2441（rank [2]）的 finalize 日志：
+```
+2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
+2441:[2] |CCL_DEBUG| flow_control.cpp:12 ~flow_control: max used credits: 0
+```
+这说明在 warmup all_reduce 之前，已有一个旧的 CCL communicator 被销毁（可能来自 TP group 的 init_process_group）。**`max used credits: 0`** 表示该 communicator 从未被使用过。
+
+**信号2：`has_all_vertices_connected: 0`**
+
+Arc Pro B60 是消费级/专业级 GPU，**没有 GPU 间的高速互联**（不像数据中心 GPU 有 NVLink/XELINK）。CCL 检测到设备间没有全互联拓扑。
+
+**信号3：算法选择了 `allreduce_ll_ring`**
+
+尽管 `has_all_vertices_connected: 0`，CCL 仍然选择了 **LL256 ring 算法**（`allreduce_ll_ring` + `arc_allreduce`）。Ring 算法依赖设备间的直接内存访问。如果设备间没有建立正确的 IPC（Inter-Process Communication）通道，ring 算法的 SYCL kernel 将在设备端死锁 — 每个 rank 等待从邻居读取数据，但邻居的数据永远不可达。
 
 ---
 
-## 六、建议的下一步调试方案
+## 六、更新后的根因分析
 
-### 方案1：启用 XCCL 详细日志
+### ❌ 排除的原因
 
-```bash
-export CCL_LOG_LEVEL=debug
-export CCL_LOG_TO_STDOUT=1
+| 原因 | 排除依据 |
+|------|----------|
+| init_process_group 失败 | CCL 日志证实 comm id=1, size=4 正确创建 |
+| all_reduce 未提交 | 4 个 rank 均显示 "done"（内核已入队） |
+| Python 层调度问题 | 所有 rank 的 Python 代码执行一致 |
+| 个别 rank 未参与 | 4 个 rank 全部进入 allreduce |
+
+### 🔴 确认的问题
+
+```
+CCL 层面                              GPU 设备层面
+──────────────                       ──────────────────
+comm {size:4, id:1} 创建 ✅            TCP rendezvous 成功
+allreduce 算法选择:                    
+  allreduce_ll_ring (LL256) ✅         内核入队到 XPU command queue
+  arc_allreduce ✅                     
+CCL 报告 "done" ✅                     
+                                      ↓
+                                      🔴 SYCL kernel 在设备端执行时死锁
+                                         Ring 算法等待邻居数据
+                                         但 IPC 通道可能未正确建立
+                                         (has_all_vertices_connected: 0)
 ```
 
-运行后观察每个 rank 的 CCL 日志，确认：
-- 每个 rank 的 communicator 是否正确创建
-- 设备端通信通道是否建立
-- all_reduce 操作在哪一步等待
+### 🎯 最可能的根因
 
-### 方案2：逐 rank 检查同步状态
+**CCL 的 LL256 ring allreduce SYCL kernel 在 `has_all_vertices_connected: 0` 的拓扑下，IPC 内存映射未正确建立，导致 ring 通信死锁。**
 
-在 `xpu_worker.py` 第 89 行附近添加：
+具体来说：
+1. CCL 检测到 `is_single_node` = true，`is_single_tile` = 1
+2. 但 `has_all_vertices_connected` = 0 — 设备间没有直接互联
+3. CCL 仍然选择了依赖设备间直接内存访问的 `allreduce_ll_ring` 算法
+4. SYCL kernel 在设备端执行时，尝试通过 Level Zero IPC 读取邻居 rank 的数据
+5. 如果 IPC handle 交换或内存映射有问题，kernel 将永远等待 — 表现为 `synchronize()` hang
 
-```python
-if torch.distributed.is_xccl_available():
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    logger.info("Rank %d/%d: submitting warmup all_reduce...", rank, world_size)
-
-    # barrier 先确保所有 rank 同时开始
-    torch.distributed.barrier()
-    logger.info("Rank %d/%d: barrier passed, submitting all_reduce...", rank, world_size)
-
-    torch.distributed.all_reduce(torch.zeros(1).xpu())
-    logger.info("Rank %d/%d: all_reduce submitted, synchronizing...", rank, world_size)
-
-    torch.xpu.synchronize()
-    logger.info("Rank %d/%d: all_reduce completed!", rank, world_size)
-```
-
-### 方案3：测试点对点通信
-
-用 `send/recv` 替代 `all_reduce`，判断是集合通信问题还是所有通信都有问题：
-
-```python
-if torch.distributed.is_xccl_available():
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        torch.distributed.send(torch.zeros(1).xpu(), dst=1)
-    elif rank == 1:
-        torch.distributed.recv(torch.zeros(1).xpu(), src=0)
-    torch.xpu.synchronize()
-    logger.info("Rank %d: point-to-point test passed!", rank)
-```
-
-### 方案4：缩小 world size 测试
-
-用最小的 world_size=2 测试，排除规模因素：
-
-```bash
-# 只用 2 个 XPU 设备
-torchrun --nproc_per_node=2 ...
-```
+这也解释了为什么 **TP=4/DP=1 正常但 DP>1 异常**：
+- TP=4/DP=1 时 WORLD size = 4，所有 rank 可能使用同一套 IPC 映射
+- DP>1 时可能涉及多组 communicator，IPC 映射可能冲突或未正确重建
 
 ---
 
-## 七、环境信息检查清单
+## 七、建议的下一步调试方案
 
-调试时请确认以下信息：
+### 方案1：强制 CCL 使用非 IPC 算法（最快验证）
+
+```bash
+# 禁用 SYCL kernel 路径，回退到 CPU staging 或其他算法
+export CCL_ALLREDUCE=naive
+# 或者
+export CCL_SYCL_KERNELS=0
+```
+
+如果设置后 hang 消失，则确认是 LL256 ring SYCL kernel 的 IPC 问题。
+
+### 方案2：检查 Level Zero IPC 状态
+
+```bash
+# 启用 Level Zero 调试日志
+export ZE_ENABLE_TRACING_LAYER=1
+export ZET_ENABLE_API_TRACING_EXP=1
+```
+
+观察 IPC handle 的创建、交换、映射是否成功。
+
+### 方案3：对比 TP=4/DP=1 的 CCL 日志
+
+用相同的 `CCL_LOG_LEVEL=debug` 在 **TP=4/DP=1（正常场景）** 下运行，对比：
+- communicator 的创建和 finalize 顺序
+- IPC handle 交换日志
+- allreduce 算法选择是否一致
+
+### 方案4：验证 IPC 内存映射
+
+在 `xpu_worker.py` 中添加简单的 IPC 测试：
+
+```python
+import intel_extension_for_pytorch  # noqa
+import torch
+
+# 测试基本的 IPC 内存操作
+tensor = torch.zeros(1).xpu()
+# 尝试获取 IPC handle
+try:
+    handle = torch.xpu.ipc_collect()
+    logger.info("IPC collect succeeded")
+except Exception as e:
+    logger.error("IPC collect failed: %s", e)
+```
+
+### 方案5：测试纯 XCCL allreduce（脱离 vLLM）
+
+编写最小复现脚本，排除 vLLM 框架的影响：
+
+```python
+# test_xccl.py — 用 torchrun --nproc_per_node=4 运行
+import os
+import torch
+import torch.distributed as dist
+
+os.environ["CCL_LOG_LEVEL"] = "debug"
+os.environ["CCL_LOG_FLUSH"] = "1"
+
+dist.init_process_group(backend="xccl")
+rank = dist.get_rank()
+
+print(f"Rank {rank}: init_process_group done", flush=True)
+
+tensor = torch.zeros(1).xpu(rank)
+dist.all_reduce(tensor)
+print(f"Rank {rank}: all_reduce submitted", flush=True)
+
+torch.xpu.synchronize()
+print(f"Rank {rank}: synchronize done!", flush=True)
+
+dist.destroy_process_group()
+```
+
+```bash
+torchrun --nproc_per_node=4 test_xccl.py
+```
+
+如果最小脚本也 hang → 问题在 CCL/Level Zero 层，需要报告给 Intel。
+如果最小脚本通过 → 问题在 vLLM 的初始化流程中（可能是多组 communicator 创建的副作用）。
+
+---
+
+## 八、环境信息（已确认）
+
+| 项目 | 值 |
+|------|------|
+| GPU | Intel(R) Arc(TM) Pro B60 Graphics × 4 |
+| 设备族 | family6 |
+| 单 tile | 是 |
+| 设备互联 | 无全互联（`has_all_vertices_connected: 0`） |
+
+### 待确认项
 
 - [ ] Intel oneAPI / oneCCL 版本
 - [ ] PyTorch XPU 版本（`torch.__version__` 和 XCCL 支持状态）
-- [ ] XPU 设备数量和拓扑（`xpu-smi` 输出）
-- [ ] 网络配置（如果跨节点）
+- [ ] XPU 设备拓扑详细信息（`xpu-smi topology`）
 - [ ] 完整的环境变量（`CCL_*`, `I_MPI_*` 等）
 - [ ] TP 和 DP 的具体配置值
-- [ ] 每个 rank 的日志输出
+- [ ] `CCL_ALLREDUCE=naive` 或 `CCL_SYCL_KERNELS=0` 测试结果
+
+---
+
+## 附录：CCL Debug 日志（最后 ~100 行关键摘录）
+
+```
+# Rank 0 (PID 2267)
+2267:[0] |CCL_INFO| stream: { type: gpu, in_order: 1, device: Intel(R) Arc(TM) Pro B60 Graphics, device_family: family6 }
+2267:[0] |CCL_DEBUG| sycl_selection.cpp:43 can_use_sycl_kernels: coll allreduce, local_proc_count 4, comm { rank: 0, size: 4, id: 1 }
+2267:[0] |CCL_DEBUG| sycl_selection.cpp:279 can_use_sycl_kernels: selected algo: coll allreduce, algo topo sycl
+2267:[0] |CCL_DEBUG| coll.cpp:1359 ccl_allreduce: |CCL_SYCL| allreduce selects sycl-kernels count: 1, datatype: FLOAT32
+2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:713 allreduce_sycl: is_single_node
+2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:60 allreduce_sycl_single_node: |CCL_SYCL| is_single_tile: 1, has_all_vertices_connected: 0
+2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:76 allreduce_sycl_single_node: invoking allreduce LL256 kernel allreduce_ll_ring, count:1 datatype: FLOAT32
+2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:104 allreduce_sycl_single_node: invoking allreduce LL256 kernel arc_allreduce, count:1 datatype: FLOAT32
+2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
+(Worker pid=2267) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2267
+
+# Rank 1 (PID 2268) — 同样的流程，最后到达
+2268:[1] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
+(Worker pid=2268) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2268
+
+# Rank 2 (PID 2271) — 同上
+2271:[2] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
+(Worker pid=2271) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2271
+
+# Rank 3 (PID 2272) — 同上
+2272:[3] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
+(Worker pid=2272) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2272
+
+# ↑ 所有 rank 到此为止，无更多输出
+# ↓ 600 秒后 ApiServer 超时
+(ApiServer_1 pid=1217) TimeoutError: Timed out waiting for engine core processes to start.
+```
