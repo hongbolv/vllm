@@ -397,6 +397,91 @@ print(f"[DEBUG] rank={self.rank}, local_rank={self.local_rank}, "
 
 ---
 
+## 七、诊断日志分析（init_distributed_environment 打印结果）
+
+### 7.1 日志原始数据（TP=2, DP=2）
+
+```
+# === EngineCore 0 的 worker ===
+(Worker pid=4186) [DEBUG-DP] init_distributed_environment ENTRY: world_size=2, rank=1, local_rank=1, distributed_init_method=tcp://127.0.0.1:41965, backend=xccl
+(Worker pid=4186) env: RANK=None, LOCAL_RANK=1, WORLD_SIZE=None, MASTER_ADDR=None, MASTER_PORT=None
+(Worker pid=4186) DP adjustment BEFORE: data_parallel_size=2, data_parallel_rank=0, world_size_across_dp=4, tensor_parallel_size=2, original_rank=1, original_world_size=2
+(Worker pid=4186) DP adjustment AFTER: adjusted_rank=1, adjusted_world_size=4, ip=127.0.0.1, port=46163, distributed_init_method=tcp://127.0.0.1:46163
+(Worker pid=4186) calling init_process_group: backend=xccl, init_method=tcp://127.0.0.1:46163, world_size=4, rank=1, is_initialized_before=False
+
+(Worker pid=4185) [DEBUG-DP] init_distributed_environment ENTRY: world_size=2, rank=0, local_rank=0, distributed_init_method=tcp://127.0.0.1:41965, backend=xccl
+(Worker pid=4185) env: RANK=None, LOCAL_RANK=0, WORLD_SIZE=None, MASTER_ADDR=None, MASTER_PORT=None
+(Worker pid=4185) DP adjustment BEFORE: data_parallel_size=2, data_parallel_rank=0, world_size_across_dp=4, tensor_parallel_size=2, original_rank=0, original_world_size=2
+(Worker pid=4185) DP adjustment AFTER: adjusted_rank=0, adjusted_world_size=4, ip=127.0.0.1, port=46163, distributed_init_method=tcp://127.0.0.1:46163
+(Worker pid=4185) calling init_process_group: backend=xccl, init_method=tcp://127.0.0.1:46163, world_size=4, rank=0, is_initialized_before=False
+
+# === EngineCore 1 的 worker ===
+(Worker pid=4189) [DEBUG-DP] init_distributed_environment ENTRY: world_size=2, rank=0, local_rank=0, distributed_init_method=tcp://127.0.0.1:51907, backend=xccl
+(Worker pid=4189) env: RANK=None, LOCAL_RANK=0, WORLD_SIZE=None, MASTER_ADDR=None, MASTER_PORT=None
+# (日志截断)
+```
+
+### 7.2 关键发现
+
+#### ✅ 发现1：**不是两阶段初始化**
+
+所有 worker 均显示 `is_initialized_before=False`，说明 **没有** 先创建 TP-only WORLD 组再销毁重建的过程。每个 worker 直接用 DP 调整后的参数调用 `init_process_group`。**此前的"两阶段初始化"假设被证伪。**
+
+#### 🔴 发现2：**LOCAL_RANK 重复 — 不同 EngineCore 的 worker 使用相同的 local_rank**
+
+| PID | EngineCore | data_parallel_rank | original_rank | adjusted_rank | **local_rank** | 使用的 GPU |
+|-----|------------|-------------------|---------------|---------------|----------------|-----------|
+| 4185 | 0 | 0 | 0 | 0 | **0** | xpu:0 |
+| 4186 | 0 | 0 | 1 | 1 | **1** | xpu:1 |
+| 4189 | 1 | 1 | 0 | 2 | **0** | xpu:0 ← 冲突! |
+| 4190 | 1 | 1 | 1 | 3 | **1** | xpu:1 ← 冲突! |
+
+DP 调整只修改了 `rank`（全局 rank）和 `world_size`，**但 `local_rank` 没有调整**。
+每个 EngineCore 从 `local_rank=0` 开始分配 worker，导致：
+- PID 4185（rank=0）和 PID 4189（rank=2）都使用 `torch.device("xpu:0")` — **同一块 GPU**
+- PID 4186（rank=1）和 PID 4190（rank=3）都使用 `torch.device("xpu:1")` — **同一块 GPU**
+
+#### 🔴 发现3：XPU 平台的设备亲和性（ZE_AFFINITY_MASK）可能未正确设置
+
+在 `vllm/v1/engine/core.py` 的 `DPEngineCoreActor._set_visible_devices()` 中：
+
+```python
+def _set_visible_devices(self, vllm_config, local_dp_rank):
+    from vllm.platforms import current_platform
+    if current_platform.is_xpu():
+        pass  # ← XPU 什么都不做！不设置 ZE_AFFINITY_MASK
+    else:
+        # CUDA 平台会设置 CUDA_VISIBLE_DEVICES
+        self._set_cuda_visible_devices(...)
+```
+
+对于 **CUDA 平台**，每个 EngineCore 会设置 `CUDA_VISIBLE_DEVICES` 限制可见 GPU：
+- EngineCore 0: `CUDA_VISIBLE_DEVICES=0,1` → local_rank=0 映射 GPU 0，local_rank=1 映射 GPU 1
+- EngineCore 1: `CUDA_VISIBLE_DEVICES=2,3` → local_rank=0 映射 GPU 2，local_rank=1 映射 GPU 3
+
+对于 **XPU 平台**，这一步被跳过（`pass`）。所有 EngineCore 看到**全部 4 块 GPU**，
+local_rank=0 在两个 EngineCore 中都映射到**物理 GPU 0**。
+
+> **注意**：在 MP（多进程）路径中（`vllm/v1/engine/utils.py`），`set_device_control_env_var()`
+> 会为非 CUDA 平台（包括 XPU）设置 `ZE_AFFINITY_MASK`。但如果用户使用 Ray 路径，
+> `DPEngineCoreActor` 的 XPU 分支是 `pass`，不会设置设备亲和性。
+
+### 7.3 根因结论
+
+**根因是 XPU DP>1 时多个 XCCL rank 映射到同一块物理 GPU 上。**
+
+XCCL `init_process_group(world_size=4)` 创建了一个 4-rank 的通信组，但实际只用了 2 块 GPU（GPU 0 和 GPU 1），每块 GPU 上有 2 个 rank。XCCL 的 allreduce 需要每个 rank 对应唯一的设备，当两个 rank 共享同一设备时，IPC 内存 handle 交换和设备端同步出现死锁。
+
+对比 TP=4/DP=1（正常工作）：所有 4 个 worker 由同一个 EngineCore 生成，local_rank 分别为 0,1,2,3，对应 4 块不同的 GPU。
+
+### 7.4 需要确认的信息
+
+1. **`ZE_AFFINITY_MASK` 的实际值**：需要在诊断打印中添加 `ZE_AFFINITY_MASK` 环境变量的值，确认每个 worker 进程中该变量的设置
+2. **PID 4189/4190 的完整日志**：当前日志被截断，需要确认 EngineCore 1 的 worker 是否使用相同的 port（46163）加入同一个进程组
+3. **使用的 executor backend**：确认是 MP 路径还是 Ray 路径，因为两者的设备亲和性处理方式不同
+
+---
+
 ## 附录：CCL Debug 日志（最后 ~100 行关键摘录）
 
 ```

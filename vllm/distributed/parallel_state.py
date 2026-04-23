@@ -1373,7 +1373,9 @@ def init_distributed_environment(
           f"LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
           f"WORLD_SIZE={os.environ.get('WORLD_SIZE')}, "
           f"MASTER_ADDR={os.environ.get('MASTER_ADDR')}, "
-          f"MASTER_PORT={os.environ.get('MASTER_PORT')}",
+          f"MASTER_PORT={os.environ.get('MASTER_PORT')}, "
+          f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')}, "
+          f"ONEAPI_DEVICE_SELECTOR={os.environ.get('ONEAPI_DEVICE_SELECTOR')}",
           flush=True)
 
     from vllm.config import get_current_vllm_config_or_none
@@ -1486,7 +1488,9 @@ def init_distributed_environment(
 
     print(f"[DEBUG-DP][PID={pid}] final local_rank={local_rank}, "
           f"envs.LOCAL_RANK={envs.LOCAL_RANK}, "
-          f"distributed_init_method={distributed_init_method}",
+          f"distributed_init_method={distributed_init_method}, "
+          f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')}, "
+          f"xpu_device_count={torch.xpu.device_count() if hasattr(torch, 'xpu') and torch.xpu.is_available() else 'N/A'}",
           flush=True)
 
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
