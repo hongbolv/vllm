@@ -100,22 +100,93 @@ torch.xpu.synchronize() ─────→ 等待 all_reduce 完成...
 
 ---
 
-## 五、CCL Debug 日志分析（实测数据）
+## 五、TP=4/DP=1 vs DP>1 的关键差异分析
+
+### ⚠️ 重要：`has_all_vertices_connected: 0` 不是根因
+
+**TP=4/DP=1 时也是同样的硬件拓扑**（Arc Pro B60 × 4，`has_all_vertices_connected: 0`），CCL 也选择了同样的 LL256 ring 算法，但**可以正常工作**。因此 `has_all_vertices_connected: 0` 单独**不能**解释为什么 DP>1 会 hang。
+
+### 5.1 进程组初始化路径差异
+
+差异在于 `vllm/distributed/parallel_state.py` → `init_distributed_environment()` 中的处理逻辑：
+
+**TP=4/DP=1（正常）：**
+```python
+# data_parallel_size == 1，不进入调整逻辑
+# rank 保持原值（0, 1, 2, 3）
+# world_size 保持原值（4）
+# distributed_init_method 使用原始值
+torch.distributed.init_process_group(
+    backend="xccl",
+    world_size=4,     # 原始值
+    rank=rank,        # 0-3 原始值
+    init_method=原始方法,
+)
+```
+
+**DP>1（hang）：**
+```python
+# data_parallel_size > 1，进入调整逻辑
+rank = data_parallel_rank * world_size + rank   # rank 偏移
+world_size = world_size_across_dp               # world_size 扩大
+# 使用新的 TCP 端口和 IP
+ip = data_parallel_master_ip
+port = get_next_dp_init_port()                  # 新端口
+distributed_init_method = get_distributed_init_method(ip, port)
+
+torch.distributed.init_process_group(
+    backend="xccl",
+    world_size=world_size_across_dp,   # 调整后的值
+    rank=调整后的rank,
+    init_method=新的TCP端口,
+)
+```
+
+### 5.2 进程来源差异
+
+| | TP=4/DP=1 | DP>1 |
+|--|-----------|------|
+| **worker 来源** | **同一个** EngineCore 进程派生 | **不同的** EngineCore 进程派生 |
+| **父进程树** | 同一棵进程树 | 不同的进程树 |
+| **rank 值** | 原始 0, 1, 2, 3 | 经过偏移调整 |
+| **world_size** | 原始 4 | `TP × DP`（更大） |
+| **TCP 端口** | 原始端口 | `get_next_dp_init_port()`（新端口） |
+| **init_process_group 参数** | 标准初始化 | 跨进程树的分布式初始化 |
+
+### 5.3 CCL 日志中的两阶段初始化证据
+
+日志中出现了 **PID 2441**（rank [2]）的 communicator finalize：
+```
+2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
+2441:[2] |CCL_DEBUG| flow_control.cpp:12 ~flow_control: max used credits: 0
+```
+
+然后 PID 2267/2268/2271/2272 才建立新的 communicator 执行 allreduce。
+
+这说明 DP>1 场景下存在**两阶段进程组初始化**：
+1. **第一阶段**：TP group 或旧 communicator 初始化（PID 2441，`max used credits: 0` 表示从未使用就被销毁）
+2. **第二阶段**：WORLD group 的 communicator 创建（PID 2267/2268/2271/2272）
+
+在 TP=4/DP=1 场景下，不存在这种两阶段过程。
+
+---
+
+## 六、CCL Debug 日志分析（实测数据）
 
 通过设置 `CCL_LOG_LEVEL=debug` 和 `CCL_LOG_FLUSH=1` 收集到的日志，揭示了以下关键信息：
 
-### 5.1 环境与拓扑
+### 6.1 环境与拓扑
 
 | 项目 | 值 |
 |------|------|
 | **GPU 型号** | Intel(R) Arc(TM) Pro B60 Graphics |
 | **设备族** | family6 |
 | **is_single_tile** | 1（每张卡是单 tile 设备） |
-| **has_all_vertices_connected** | **0**（设备之间**没有**全互联拓扑） |
+| **has_all_vertices_connected** | **0**（设备之间**没有**全互联拓扑，但 TP=4/DP=1 同样如此且正常工作） |
 | **stream 类型** | gpu, in_order: 1 |
 | **WORLD group** | `comm { rank: X, size: 4, id: 1 }` — 4 个 rank |
 
-### 5.2 allreduce 执行流程（从日志还原）
+### 6.2 allreduce 执行流程（从日志还原）
 
 每个 rank 的 CCL 执行路径完全一致：
 
@@ -133,7 +204,7 @@ invoking allreduce LL256 kernel arc_allreduce, count:1 datatype: FLOAT32
 invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done    ← ✅ CCL 认为内核已入队
 ```
 
-### 5.3 关键时序（PID → Rank 映射）
+### 6.3 关键时序（PID → Rank 映射）
 
 | PID | Rank | CCL allreduce 入队完成 | VLLM_DEBUG 打印 | 后续 |
 |-----|------|----------------------|-----------------|------|
@@ -144,28 +215,30 @@ invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done    ← ✅ CCL �
 
 **所有 4 个 rank 的 CCL 均报告 allreduce 内核入队完成，但 `torch.xpu.synchronize()` 后没有任何输出** — 确认 hang 在 `synchronize()` 处。
 
-### 5.4 日志中的异常信号
+### 6.4 日志中的异常信号
 
-**信号1：先前 communicator 的 finalize 操作**
+**信号1：先前 communicator 的 finalize 操作（两阶段初始化）**
 
 日志开头出现 PID 2441（rank [2]）的 finalize 日志：
 ```
 2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
 2441:[2] |CCL_DEBUG| flow_control.cpp:12 ~flow_control: max used credits: 0
 ```
-这说明在 warmup all_reduce 之前，已有一个旧的 CCL communicator 被销毁（可能来自 TP group 的 init_process_group）。**`max used credits: 0`** 表示该 communicator 从未被使用过。
+这说明 DP>1 场景下有**两阶段进程组初始化**：PID 2441 的旧 communicator 先 finalize（`max used credits: 0` 表示从未使用），然后 PID 2267/2268/2271/2272 才建立新 communicator。这在 TP=4/DP=1 场景下不会发生。
 
-**信号2：`has_all_vertices_connected: 0`**
+**信号2：`ze_ipc_event_pool_manager` finalize**
 
-Arc Pro B60 是消费级/专业级 GPU，**没有 GPU 间的高速互联**（不像数据中心 GPU 有 NVLink/XELINK）。CCL 检测到设备间没有全互联拓扑。
+旧 communicator 的 finalize 涉及 `ze_ipc_event_pool_manager.cpp` 的清理。如果旧 communicator 的 IPC event pool 清理不干净，可能导致后续新 communicator 的 Level Zero IPC 资源冲突或状态异常。
 
-**信号3：算法选择了 `allreduce_ll_ring`**
+**信号3：跨进程树的 IPC handle 交换**
 
-尽管 `has_all_vertices_connected: 0`，CCL 仍然选择了 **LL256 ring 算法**（`allreduce_ll_ring` + `arc_allreduce`）。Ring 算法依赖设备间的直接内存访问。如果设备间没有建立正确的 IPC（Inter-Process Communication）通道，ring 算法的 SYCL kernel 将在设备端死锁 — 每个 rank 等待从邻居读取数据，但邻居的数据永远不可达。
+DP>1 时，worker 进程来自**不同的父进程树**（不同的 EngineCore 进程）。Level Zero IPC memory handle 的交换方式可能与同一进程树内不同：
+- 同一进程树内（TP=4/DP=1）：共享地址空间继承，IPC 映射自然有效
+- 跨进程树（DP>1）：需要通过 TCP/共享内存显式交换 IPC handle，映射可能不完整
 
 ---
 
-## 六、更新后的根因分析
+## 七、更新后的根因分析
 
 ### ❌ 排除的原因
 
@@ -175,95 +248,76 @@ Arc Pro B60 是消费级/专业级 GPU，**没有 GPU 间的高速互联**（不
 | all_reduce 未提交 | 4 个 rank 均显示 "done"（内核已入队） |
 | Python 层调度问题 | 所有 rank 的 Python 代码执行一致 |
 | 个别 rank 未参与 | 4 个 rank 全部进入 allreduce |
+| **`has_all_vertices_connected: 0` 拓扑问题** | **TP=4/DP=1 使用同样的拓扑和 LL256 ring 算法，可以正常工作** |
 
 ### 🔴 确认的问题
 
 ```
 CCL 层面                              GPU 设备层面
 ──────────────                       ──────────────────
-comm {size:4, id:1} 创建 ✅            TCP rendezvous 成功
+旧 communicator finalize (PID 2441)    IPC event pool 清理
+  max used credits: 0                  ↓ 可能残留状态
+                                      
+comm {size:4, id:1} 创建 ✅            TCP rendezvous 成功（跨进程树）
 allreduce 算法选择:                    
   allreduce_ll_ring (LL256) ✅         内核入队到 XPU command queue
   arc_allreduce ✅                     
 CCL 报告 "done" ✅                     
                                       ↓
                                       🔴 SYCL kernel 在设备端执行时死锁
-                                         Ring 算法等待邻居数据
-                                         但 IPC 通道可能未正确建立
-                                         (has_all_vertices_connected: 0)
+                                         LL256 ring 依赖 IPC 内存访问
+                                         跨进程树的 IPC handle 交换/映射
+                                         可能不正确或受旧 communicator 影响
 ```
 
 ### 🎯 最可能的根因
 
-**CCL 的 LL256 ring allreduce SYCL kernel 在 `has_all_vertices_connected: 0` 的拓扑下，IPC 内存映射未正确建立，导致 ring 通信死锁。**
+**DP>1 场景下，跨不同 EngineCore 进程树的 XCCL communicator 初始化过程中，Level Zero IPC memory handle 的交换/映射出现问题，导致 LL256 ring allreduce SYCL kernel 在设备端无法完成数据交换而死锁。**
 
-具体来说：
-1. CCL 检测到 `is_single_node` = true，`is_single_tile` = 1
-2. 但 `has_all_vertices_connected` = 0 — 设备间没有直接互联
-3. CCL 仍然选择了依赖设备间直接内存访问的 `allreduce_ll_ring` 算法
-4. SYCL kernel 在设备端执行时，尝试通过 Level Zero IPC 读取邻居 rank 的数据
-5. 如果 IPC handle 交换或内存映射有问题，kernel 将永远等待 — 表现为 `synchronize()` hang
+具体来说，与 TP=4/DP=1 的关键差异：
 
-这也解释了为什么 **TP=4/DP=1 正常但 DP>1 异常**：
-- TP=4/DP=1 时 WORLD size = 4，所有 rank 可能使用同一套 IPC 映射
-- DP>1 时可能涉及多组 communicator，IPC 映射可能冲突或未正确重建
+1. **进程来源不同**：DP>1 的 worker 来自不同的 EngineCore 父进程（不同进程树），而 TP=4/DP=1 所有 worker 来自同一个 EngineCore
+2. **两阶段初始化**：DP>1 存在旧 communicator finalize → 新 communicator 创建的两阶段过程（PID 2441 的 `ze_ipc_event_pool_manager` finalize），可能导致 IPC 资源状态异常
+3. **rank/world_size 调整**：DP>1 时 `init_distributed_environment` 对 rank 做偏移（`data_parallel_rank * world_size + rank`），world_size 扩大为 `world_size_across_dp`，使用新的 TCP 端口 — 这些调整可能影响 CCL communicator 内部的 IPC handle 交换逻辑
+4. **IPC handle 交换方式**：跨不同父进程树时，Level Zero IPC memory handle 的交换可能需要不同的机制（TCP vs 共享内存继承），如果交换不完整，ring 算法的 SYCL kernel 将无法访问邻居 rank 的数据
 
 ---
 
-## 七、建议的下一步调试方案
+## 八、建议的下一步调试方案（按优先级排序）
 
-### 方案1：强制 CCL 使用非 IPC 算法（最快验证）
+### 方案1：对比 TP=4/DP=1 的 CCL 日志（最关键）
+
+用相同的 `CCL_LOG_LEVEL=debug` 和 `CCL_LOG_FLUSH=1` 在 **TP=4/DP=1（正常场景）** 下运行，对比：
+
+1. **是否存在两阶段初始化？** — TP=4/DP=1 是否也有旧 communicator finalize
+2. **IPC 相关日志差异** — 搜索 `ze_ipc`、`ipc_handle`、`ipc_event_pool` 关键字
+3. **communicator 创建参数差异** — `comm { rank: X, size: Y, id: Z }` 的值
+4. **allreduce 算法选择是否一致** — 确认都是 `allreduce_ll_ring`
 
 ```bash
-# 禁用 SYCL kernel 路径，回退到 CPU staging 或其他算法
+# TP=4/DP=1 正常场景
+export CCL_LOG_LEVEL=debug
+export CCL_LOG_FLUSH=1
+# 运行 TP=4/DP=1 配置，收集日志
+```
+
+### 方案2：强制 CCL 使用非 SYCL kernel 算法
+
+```bash
+# 禁用 SYCL kernel 路径
 export CCL_ALLREDUCE=naive
 # 或者
 export CCL_SYCL_KERNELS=0
 ```
 
-如果设置后 hang 消失，则确认是 LL256 ring SYCL kernel 的 IPC 问题。
+如果设置后 DP>1 hang 消失 → 确认问题在 LL256 ring SYCL kernel 的 IPC 内存访问层。
 
-### 方案2：检查 Level Zero IPC 状态
+### 方案3：测试纯 XCCL allreduce（脱离 vLLM）
 
-```bash
-# 启用 Level Zero 调试日志
-export ZE_ENABLE_TRACING_LAYER=1
-export ZET_ENABLE_API_TRACING_EXP=1
-```
-
-观察 IPC handle 的创建、交换、映射是否成功。
-
-### 方案3：对比 TP=4/DP=1 的 CCL 日志
-
-用相同的 `CCL_LOG_LEVEL=debug` 在 **TP=4/DP=1（正常场景）** 下运行，对比：
-- communicator 的创建和 finalize 顺序
-- IPC handle 交换日志
-- allreduce 算法选择是否一致
-
-### 方案4：验证 IPC 内存映射
-
-在 `xpu_worker.py` 中添加简单的 IPC 测试：
+编写最小复现脚本，模拟 DP>1 的跨进程组初始化：
 
 ```python
-import intel_extension_for_pytorch  # noqa
-import torch
-
-# 测试基本的 IPC 内存操作
-tensor = torch.zeros(1).xpu()
-# 尝试获取 IPC handle
-try:
-    handle = torch.xpu.ipc_collect()
-    logger.info("IPC collect succeeded")
-except Exception as e:
-    logger.error("IPC collect failed: %s", e)
-```
-
-### 方案5：测试纯 XCCL allreduce（脱离 vLLM）
-
-编写最小复现脚本，排除 vLLM 框架的影响：
-
-```python
-# test_xccl.py — 用 torchrun --nproc_per_node=4 运行
+# test_xccl_dp.py — 模拟 DP>1 的跨进程组 allreduce
 import os
 import torch
 import torch.distributed as dist
@@ -273,10 +327,11 @@ os.environ["CCL_LOG_FLUSH"] = "1"
 
 dist.init_process_group(backend="xccl")
 rank = dist.get_rank()
+world_size = dist.get_world_size()
 
-print(f"Rank {rank}: init_process_group done", flush=True)
+print(f"Rank {rank}/{world_size}: init_process_group done", flush=True)
 
-tensor = torch.zeros(1).xpu(rank)
+tensor = torch.zeros(1).xpu(rank % torch.xpu.device_count())
 dist.all_reduce(tensor)
 print(f"Rank {rank}: all_reduce submitted", flush=True)
 
@@ -286,23 +341,48 @@ print(f"Rank {rank}: synchronize done!", flush=True)
 dist.destroy_process_group()
 ```
 
+**测试1**：用 `torchrun --nproc_per_node=4` 直接运行（模拟 TP=4/DP=1，预期成功）
+
+**测试2**：手动创建两个进程组（2+2），先创建一个 communicator 再销毁，再创建新的执行 allreduce — 模拟 DP>1 的两阶段初始化
+
+如果测试1通过但测试2 hang → 确认问题在两阶段 communicator 初始化的 IPC 状态管理。
+
+### 方案4：检查 Level Zero IPC 状态
+
 ```bash
-torchrun --nproc_per_node=4 test_xccl.py
+# 启用 Level Zero 调试日志
+export ZE_ENABLE_TRACING_LAYER=1
+export ZET_ENABLE_API_TRACING_EXP=1
 ```
 
-如果最小脚本也 hang → 问题在 CCL/Level Zero 层，需要报告给 Intel。
-如果最小脚本通过 → 问题在 vLLM 的初始化流程中（可能是多组 communicator 创建的副作用）。
+观察 DP>1 场景下 IPC handle 的创建、交换、映射是否有错误或异常。
+
+### 方案5：检查 vLLM DP 初始化参数
+
+在 `xpu_worker.py` 的 `init_device()` 中添加打印，验证 DP>1 时传入的参数：
+
+```python
+# 在 init_worker_distributed_environment 调用前添加
+import sys
+print(f"[DEBUG] rank={self.rank}, local_rank={self.local_rank}, "
+      f"world_size={self.parallel_config.world_size}, "
+      f"dp_size={self.parallel_config.data_parallel_size}, "
+      f"dp_rank={self.parallel_config.data_parallel_rank}, "
+      f"world_size_across_dp={self.parallel_config.world_size_across_dp}, "
+      f"distributed_init_method={self.distributed_init_method}",
+      flush=True, file=sys.stderr)
+```
 
 ---
 
-## 八、环境信息（已确认）
+## 九、环境信息（已确认）
 
 | 项目 | 值 |
 |------|------|
 | GPU | Intel(R) Arc(TM) Pro B60 Graphics × 4 |
 | 设备族 | family6 |
 | 单 tile | 是 |
-| 设备互联 | 无全互联（`has_all_vertices_connected: 0`） |
+| 设备互联 | 无全互联（`has_all_vertices_connected: 0`，但 TP=4/DP=1 同样如此且正常工作） |
 
 ### 待确认项
 
@@ -311,13 +391,23 @@ torchrun --nproc_per_node=4 test_xccl.py
 - [ ] XPU 设备拓扑详细信息（`xpu-smi topology`）
 - [ ] 完整的环境变量（`CCL_*`, `I_MPI_*` 等）
 - [ ] TP 和 DP 的具体配置值
-- [ ] `CCL_ALLREDUCE=naive` 或 `CCL_SYCL_KERNELS=0` 测试结果
+- [ ] TP=4/DP=1 场景下的 CCL debug 日志（用于对比）
+- [ ] `CCL_ALLREDUCE=naive` 或 `CCL_SYCL_KERNELS=0` 在 DP>1 下的测试结果
+- [ ] DP>1 时 `init_distributed_environment` 的实际参数值（rank 偏移、world_size、TCP 端口）
 
 ---
 
 ## 附录：CCL Debug 日志（最后 ~100 行关键摘录）
 
 ```
+# === 第一阶段：旧 communicator finalize（PID 2441，DP>1 独有） ===
+2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
+2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
+2441:[2] |CCL_DEBUG| flow_control.cpp:12 ~flow_control: max used credits: 0
+2441:[2] |CCL_DEBUG| ze_ipc_event_pool_manager.cpp:23 clear: finalize completed
+
+# === 第二阶段：新 communicator 的 allreduce 执行 ===
+
 # Rank 0 (PID 2267)
 2267:[0] |CCL_INFO| stream: { type: gpu, in_order: 1, device: Intel(R) Arc(TM) Pro B60 Graphics, device_family: family6 }
 2267:[0] |CCL_DEBUG| sycl_selection.cpp:43 can_use_sycl_kernels: coll allreduce, local_proc_count 4, comm { rank: 0, size: 4, id: 1 }
@@ -330,7 +420,7 @@ torchrun --nproc_per_node=4 test_xccl.py
 2267:[0] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
 (Worker pid=2267) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2267
 
-# Rank 1 (PID 2268) — 同样的流程，最后到达
+# Rank 1 (PID 2268) — 同样的流程
 2268:[1] |CCL_DEBUG| allreduce_sycl.cpp:106 allreduce_sycl_single_node: invoking allreduce LL256 kernel, count:1 datatype: FLOAT32 done
 (Worker pid=2268) [======VLLM_DEBUG======] XPUWorker.init_device: all_reduce done calling synchronize, pid=2268
 
