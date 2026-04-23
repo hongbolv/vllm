@@ -587,7 +587,67 @@ torch.xpu.synchronize() 永久 hang
 
 ---
 
-## 十一、环境信息
+## 十一、为什么 torchrun 路径（Option B）不触发跨 affinity 通信失败？
+
+### 11.1 问题背景
+
+使用 `torchrun --nproc-per-node=4` 启动 vLLM（Option B），DP=2/TP=2 时可以正常工作。
+为什么这种方式没有触发跨 `ZE_AFFINITY_MASK` IPC 通信失败？
+
+### 11.2 根本原因：`torchrun` 不设置 `ZE_AFFINITY_MASK`
+
+**`torchrun` 启动路径不经过 vLLM 的 `CoreEngineProcManager`**，因此不会调用
+`set_device_control_env_var()`。所有 4 个进程共享同一个 Level Zero 设备命名空间，
+每个进程都能看到全部 4 块 GPU。
+
+| 启动方式 | `ZE_AFFINITY_MASK` | 设备命名空间 | IPC 状态 |
+|----------|-------------------|-------------|---------|
+| **Option A（multiprocessing）** | 进程 0,1 → `0,1`；进程 2,3 → `2,3` | 分裂为 2 个独立命名空间 | ❌ 跨命名空间 IPC 失败 |
+| **Option B（torchrun）** | **未设置**（所有进程看到全部 4 GPU） | 统一命名空间 | ✅ 同一命名空间内 IPC 正常 |
+| **TP=4/DP=1** | 未设置 | 统一命名空间 | ✅ 同一命名空间内 IPC 正常 |
+
+### 11.3 代码路径对比
+
+**Option A（multiprocessing）— 触发 hang 的路径：**
+
+```
+vllm.LLM() → AsyncLLM → CoreEngineProcManager.__init__()
+    → is_dp=True, current_platform.is_xpu()=True（非 cuda_alike）
+    → set_device_control_env_var(vllm_config, local_dp_rank)  ← 设置 ZE_AFFINITY_MASK
+        → EngineCore 0: ZE_AFFINITY_MASK=0,1
+        → EngineCore 1: ZE_AFFINITY_MASK=2,3
+    → 每个 EngineCore spawn worker → init_process_group(world_size=4)
+    → warmup all_reduce → 跨 affinity 边界 → HANG
+```
+
+**Option B（torchrun）— 不触发 hang 的路径：**
+
+```
+torchrun → 直接启动 4 个进程（RANK=0,1,2,3, LOCAL_RANK=0,1,2,3）
+    → 每个进程执行用户脚本 → vllm.LLM(tensor_parallel_size=2)
+    → 不经过 CoreEngineProcManager（torchrun 已管理进程）
+    → ZE_AFFINITY_MASK 未设置（所有进程看到全部 4 GPU）
+    → init_process_group(world_size=4) → warmup all_reduce
+    → 所有 IPC 在同一设备命名空间内 → ✅ 正常
+```
+
+### 11.4 关键差异
+
+1. **进程启动方式不同**：Option A 由 vLLM 的 `CoreEngineProcManager` 分组 spawn，每组设置独立的 `ZE_AFFINITY_MASK`；Option B 由 `torchrun` 统一启动，不设置 `ZE_AFFINITY_MASK`
+
+2. **设备隔离机制不同**：Option A 通过 `ZE_AFFINITY_MASK` 进行设备隔离（创建独立的 Level Zero 命名空间）；Option B 不做设备隔离，每个进程通过 `torch.xpu.set_device(LOCAL_RANK)` 绑定到不同 GPU，但所有 GPU 在同一个命名空间内可见
+
+3. **IPC 跨越边界**：Option A 的 allreduce 需要跨 `ZE_AFFINITY_MASK` 边界通信（失败）；Option B 的 allreduce 在同一设备命名空间内通信（正常）
+
+### 11.5 结论
+
+**这进一步确认了根因：问题不在于 DP>1 的逻辑本身，而在于 vLLM 的 multiprocessing 路径为不同 EngineCore 设置了不同的 `ZE_AFFINITY_MASK`，导致 XCCL 跨 affinity 边界 IPC 通信失败。** `torchrun` 路径因为不设置 `ZE_AFFINITY_MASK` 而完全绕过了这个问题。
+
+这也进一步验证了修复方案 B（统一 `ZE_AFFINITY_MASK`）的可行性——Option B 的正常工作证明，在不分裂 Level Zero 设备命名空间的前提下，DP=2/TP=2 的 XCCL 通信可以正常完成。
+
+---
+
+## 十二、环境信息
 
 | 项目 | 值 |
 |------|------|
