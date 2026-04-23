@@ -57,24 +57,54 @@ class XPUWorker(Worker):
         device = self.device_config.device
 
         # === TRACE: device binding phase ===
-        print(f"[TRACE][PID={pid}] init_device START: "
-              f"rank={self.rank}, local_rank={self.local_rank}, "
-              f"device_count={torch.xpu.device_count()}, "
-              f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')}, "
-              f"ONEAPI_DEVICE_SELECTOR="
-              f"{os.environ.get('ONEAPI_DEVICE_SELECTOR')}",
-              flush=True)
+        print(
+            f"[TRACE][PID={pid}] init_device START: "
+            f"rank={self.rank}, local_rank={self.local_rank}, "
+            f"device_count={torch.xpu.device_count()}, "
+            f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')}, "
+            f"ONEAPI_DEVICE_SELECTOR="
+            f"{os.environ.get('ONEAPI_DEVICE_SELECTOR')}",
+            flush=True,
+        )
         # Print device name for each visible GPU to detect device aliasing
         for i in range(torch.xpu.device_count()):
             try:
                 dev_name = torch.xpu.get_device_name(i)
                 dev_props = torch.xpu.get_device_properties(i)
-                print(f"[TRACE][PID={pid}]   visible xpu:{i} = {dev_name}, "
-                      f"total_memory={dev_props.total_memory}",
-                      flush=True)
+                print(
+                    f"[TRACE][PID={pid}]   visible xpu:{i} = {dev_name}, "
+                    f"total_memory={dev_props.total_memory}",
+                    flush=True,
+                )
             except Exception as e:
-                print(f"[TRACE][PID={pid}]   visible xpu:{i} = ERROR: {e}",
-                      flush=True)
+                print(f"[TRACE][PID={pid}]   visible xpu:{i} = ERROR: {e}", flush=True)
+
+        # Adjust local_rank for DP: when ZE_AFFINITY_MASK is NOT set (all
+        # GPUs visible), offset local_rank by dp_local_rank * tp_pp_size
+        # so each DP group binds to the correct physical GPU subset.
+        # This mirrors the CUDA DP adjustment in gpu_worker.py.
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.data_parallel_size > 1
+            and parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.nnodes_within_dp == 1
+        ):
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            tp_pp_world_size = (
+                parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size
+            )
+
+            self.local_rank += dp_local_rank * tp_pp_world_size
+            assert self.local_rank < torch.xpu.device_count(), (
+                f"DP adjusted local rank {self.local_rank} is out of bounds "
+                f"(device_count={torch.xpu.device_count()})."
+            )
 
         if (
             isinstance(device, torch.device)
@@ -92,12 +122,14 @@ class XPUWorker(Worker):
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
         # === TRACE: confirm actual device after set_device ===
-        print(f"[TRACE][PID={pid}] device bound: "
-              f"rank={self.rank}, local_rank={self.local_rank}, "
-              f"self.device={self.device}, "
-              f"current_device={torch.xpu.current_device()}, "
-              f"device_name={torch.xpu.get_device_name(self.local_rank)}",
-              flush=True)
+        print(
+            f"[TRACE][PID={pid}] device bound: "
+            f"rank={self.rank}, local_rank={self.local_rank}, "
+            f"self.device={self.device}, "
+            f"current_device={torch.xpu.current_device()}, "
+            f"device_name={torch.xpu.get_device_name(self.local_rank)}",
+            flush=True,
+        )
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(
@@ -116,24 +148,30 @@ class XPUWorker(Worker):
         )
 
         # === TRACE: pre-allreduce device state ===
-        print(f"[TRACE][PID={pid}] pre-allreduce: "
-              f"rank={self.rank}, local_rank={self.local_rank}, "
-              f"current_device={torch.xpu.current_device()}, "
-              f"dist_rank={torch.distributed.get_rank()}, "
-              f"dist_world_size={torch.distributed.get_world_size()}, "
-              f"dist_backend={torch.distributed.get_backend()}",
-              flush=True)
+        print(
+            f"[TRACE][PID={pid}] pre-allreduce: "
+            f"rank={self.rank}, local_rank={self.local_rank}, "
+            f"current_device={torch.xpu.current_device()}, "
+            f"dist_rank={torch.distributed.get_rank()}, "
+            f"dist_world_size={torch.distributed.get_world_size()}, "
+            f"dist_backend={torch.distributed.get_backend()}",
+            flush=True,
+        )
 
         # global all_reduce needed for overall oneccl warm up
         if torch.distributed.is_xccl_available():
             warmup_tensor = torch.zeros(1).xpu()
-            print(f"[TRACE][PID={pid}] allreduce warmup: "
-                  f"tensor.device={warmup_tensor.device}, "
-                  f"current_device={torch.xpu.current_device()}",
-                  flush=True)
+            print(
+                f"[TRACE][PID={pid}] allreduce warmup: "
+                f"tensor.device={warmup_tensor.device}, "
+                f"current_device={torch.xpu.current_device()}",
+                flush=True,
+            )
             torch.distributed.all_reduce(warmup_tensor)
-            print(f"[TRACE][PID={pid}] allreduce submitted, "
-                  f"calling synchronize...", flush=True)
+            print(
+                f"[TRACE][PID={pid}] allreduce submitted, calling synchronize...",
+                flush=True,
+            )
             torch.xpu.synchronize()
             print(f"[TRACE][PID={pid}] synchronize DONE", flush=True)
 

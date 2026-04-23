@@ -678,3 +678,61 @@ torchrun → 直接启动 4 个进程（RANK=0,1,2,3, LOCAL_RANK=0,1,2,3）
 # 600 秒后
 (ApiServer_1 pid=1217) TimeoutError: Timed out waiting for engine core processes to start.
 ```
+
+---
+
+## 十二、修复实现（方案 B：统一设备命名空间）
+
+### 12.1 修复思路
+
+核心思想：**不为不同 DP group 设置不同的 `ZE_AFFINITY_MASK`**，让所有进程看到全部 GPU，通过 `torch.xpu.set_device(adjusted_local_rank)` 控制设备绑定。这与 `torchrun`（Option B）成功工作的方式一致。
+
+### 12.2 代码修改
+
+#### 修改 1：`vllm/v1/engine/utils.py` — 跳过 XPU 的 `ZE_AFFINITY_MASK` 设置
+
+在 `CoreEngineProcManager.__init__` 中，multiprocessing 启动 EngineCore 子进程时，跳过为 XPU 平台设置 `ZE_AFFINITY_MASK`：
+
+```python
+# 修改前：
+if is_dp and (
+    not current_platform.is_cuda_alike()
+    or vllm_config.parallel_config.use_ray
+):
+    device_control_context = set_device_control_env_var(...)
+
+# 修改后：
+if is_dp and (
+    (not current_platform.is_cuda_alike() and not current_platform.is_xpu())
+    or vllm_config.parallel_config.use_ray
+):
+    device_control_context = set_device_control_env_var(...)
+```
+
+**效果**：XPU multiprocessing 路径不再为不同 EngineCore 设置不同的 `ZE_AFFINITY_MASK`，所有进程共享同一 Level Zero 设备命名空间。
+
+#### 修改 2：`vllm/v1/worker/xpu_worker.py` — 添加 DP local_rank 偏移
+
+在 `XPUWorker.init_device()` 中，设备绑定前添加 DP local_rank 调整逻辑（与 `gpu_worker.py` 中 CUDA 的调整逻辑对齐）：
+
+```python
+# DP local_rank 调整公式：
+# actual_device_index = dp_local_rank * tp_pp_world_size + tp_local_rank
+#
+# 例如 DP=2/TP=2，4 块 GPU：
+# EngineCore 0 (dp_local_rank=0): worker 0 → 0*2+0=GPU0, worker 1 → 0*2+1=GPU1
+# EngineCore 1 (dp_local_rank=1): worker 0 → 1*2+0=GPU2, worker 1 → 1*2+1=GPU3
+```
+
+### 12.3 预期行为
+
+修复后的进程拓扑（DP=2/TP=2，4 块 GPU）：
+
+| PID | EngineCore | rank | local_rank(原) | dp_local_rank | local_rank(调整后) | ZE_AFFINITY_MASK | 物理 GPU |
+|-----|-----------|------|---------------|--------------|-------------------|-----------------|---------|
+| A | 0 | 0 | 0 | 0 | 0 | 未设置(全部可见) | GPU 0 |
+| B | 0 | 1 | 1 | 0 | 1 | 未设置(全部可见) | GPU 1 |
+| C | 1 | 2 | 0 | 1 | 2 | 未设置(全部可见) | GPU 2 |
+| D | 1 | 3 | 1 | 1 | 3 | 未设置(全部可见) | GPU 3 |
+
+所有进程共享同一 Level Zero 设备命名空间 → XCCL IPC 句柄在同一 driver 上下文内交换 → allreduce 正常完成。
