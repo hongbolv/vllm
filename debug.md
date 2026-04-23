@@ -403,7 +403,71 @@ torch.distributed.init_process_group(
 
 ---
 
-## 十、环境信息
+## 十、验证 Trace 方案
+
+### 10.1 新增 Trace 说明
+
+在 `vllm/v1/worker/xpu_worker.py` 的 `XPUWorker.init_device()` 中添加了详细 trace，用于 **double confirm** LOCAL_RANK 冲突假设：
+
+#### Trace 点 1：`init_device START`（设备绑定前）
+```
+[TRACE][PID=xxxx] init_device START: rank=X, local_rank=Y,
+  device_count=N, ZE_AFFINITY_MASK=..., ONEAPI_DEVICE_SELECTOR=...
+[TRACE][PID=xxxx]   visible xpu:0 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=...
+[TRACE][PID=xxxx]   visible xpu:1 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=...
+...
+```
+**目的**：确认每个 worker 看到的 GPU 列表。如果所有 EngineCore 的 worker 都看到全部 4 块 GPU 且 `ZE_AFFINITY_MASK` 为 None，则确认缺少设备隔离。
+
+#### Trace 点 2：`device bound`（set_device 后）
+```
+[TRACE][PID=xxxx] device bound: rank=X, local_rank=Y,
+  self.device=xpu:Y, current_device=Y, device_name=...
+```
+**目的**：确认 `local_rank` → 实际 GPU 映射。**如果来自不同 EngineCore 的 worker 的 `current_device` 相同，则直接确认 LOCAL_RANK 冲突。**
+
+#### Trace 点 3：`pre-allreduce`（allreduce 前）
+```
+[TRACE][PID=xxxx] pre-allreduce: rank=X, local_rank=Y,
+  current_device=Y, dist_rank=X, dist_world_size=N, dist_backend=xccl
+```
+**目的**：确认进入 allreduce 时的设备状态。
+
+#### Trace 点 4：`allreduce warmup`（tensor 创建后）
+```
+[TRACE][PID=xxxx] allreduce warmup: tensor.device=xpu:Y, current_device=Y
+[TRACE][PID=xxxx] allreduce submitted, calling synchronize...
+[TRACE][PID=xxxx] synchronize DONE    ← 如果出现则表示 allreduce 成功
+```
+**目的**：确认 warmup tensor 在哪块 GPU 上创建。如果 synchronize DONE 不出现，结合 Trace 点 2 的设备映射，可直接确认是否因为 GPU 冲突导致死锁。
+
+### 10.2 预期验证结果
+
+**如果 LOCAL_RANK 冲突是根因，预期看到：**
+
+| PID | rank | local_rank | current_device | 预期物理 GPU |
+|-----|------|------------|----------------|-------------|
+| A | 0 | 0 | 0 | GPU 0 |
+| B | 1 | 1 | 1 | GPU 1 |
+| C | 2 | **0** | **0** | **GPU 0** ← 冲突！应为 GPU 2 |
+| D | 3 | **1** | **1** | **GPU 1** ← 冲突！应为 GPU 3 |
+
+- 所有 worker 的 `device_count` 都是 4（没有设备隔离）
+- `ZE_AFFINITY_MASK` 为 None（未设置）
+- Trace 点 4 的 `synchronize DONE` 不会出现（hang 确认）
+
+**如果 LOCAL_RANK 冲突 NOT 是根因，预期看到：**
+
+- 每个 worker 的 `current_device` 各不相同（0, 1, 2, 3）
+- 需要继续排查其他方向
+
+### 10.3 对比：test_xccl.py 中的预期
+
+使用 `torchrun --nproc_per_node=4` 运行时，`torchrun` 自动设置 `LOCAL_RANK=0,1,2,3`（全局唯一），因此每个 rank 的 `current_device` 分别为 0, 1, 2, 3，不会有冲突。这就是 test_xccl.py 不出现问题的原因。
+
+---
+
+## 十一、环境信息
 
 | 项目 | 值 |
 |------|------|
