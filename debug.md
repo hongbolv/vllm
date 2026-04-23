@@ -54,7 +54,9 @@ ApiServer 在 600 秒后超时（`VLLM_ENGINE_READY_TIMEOUT_S`）。
 6. **TP=4/DP=1 在同一硬件上正常工作** — 相同的 `has_all_vertices_connected: 0` 拓扑和 LL256 ring 算法
 7. **独立 `test_xccl.py` 使用 `torchrun --nproc_per_node=4` 正常工作** — 4 个 rank 全部完成 `init_process_group` + `all_reduce` + `synchronize()`，确认 PyTorch/XCCL 本身没有问题
 8. **诊断日志确认没有两阶段初始化** — 所有 worker 均显示 `is_initialized_before=False`，不存在 `destroy_process_group`
-9. **诊断日志确认 LOCAL_RANK 冲突** — 不同 EngineCore 的 worker 均使用 `local_rank=0`，多个 XCCL rank 映射到同一物理 GPU
+9. ~~诊断日志确认 LOCAL_RANK 冲突~~ — **已被 Trace 数据证伪**：Trace 显示 `ZE_AFFINITY_MASK` 已正确设置（`0,1` 和 `2,3`），每个 rank 映射到唯一物理 GPU
+10. **Trace 确认 `ZE_AFFINITY_MASK` 已设置** — EngineCore 0 的 worker 使用 `ZE_AFFINITY_MASK=0,1`（看到 2 块 GPU），EngineCore 1 使用 `ZE_AFFINITY_MASK=2,3`（看到另外 2 块 GPU）
+11. **Trace 确认设备绑定正确** — `device_count=2`，`current_device=1` 在不同 affinity 组中映射到不同物理 GPU
 
 ---
 
@@ -73,25 +75,32 @@ ApiServer 在 600 秒后超时（`VLLM_ENGINE_READY_TIMEOUT_S`）。
 | 5 | `init_process_group` 失败 | CCL 日志证实 `comm { size: 4, id: 1 }` 正确创建 |
 | 6 | `all_reduce` 未提交 | 所有 4 个 rank 均报告 "done"（内核已入队） |
 | 7 | 个别 rank 未参与 | 4 个 rank 全部进入 allreduce |
+| 8 | **LOCAL_RANK 冲突导致多 rank 映射同一 GPU** | **Trace 数据显示 `ZE_AFFINITY_MASK` 已正确设置，每个 rank 映射到唯一物理 GPU** |
 
-### 4.2 确认的根因：LOCAL_RANK 冲突导致多个 XCCL rank 映射到同一物理 GPU
+### 4.2 当前最可能的根因：XCCL 跨 `ZE_AFFINITY_MASK` IPC 通信问题
 
 ```
-                           EngineCore 0                    EngineCore 1
-                           ──────────────                  ──────────────
-                           Worker 0: local_rank=0 → GPU 0  Worker 2: local_rank=0 → GPU 0 ← 冲突!
-                           Worker 1: local_rank=1 → GPU 1  Worker 3: local_rank=1 → GPU 1 ← 冲突!
+                           EngineCore 0                      EngineCore 1
+                           ZE_AFFINITY_MASK=0,1              ZE_AFFINITY_MASK=2,3
+                           ──────────────────                ──────────────────
+                           Worker 0: xpu:0 → 物理 GPU 0     Worker 2: xpu:0 → 物理 GPU 2
+                           Worker 1: xpu:1 → 物理 GPU 1     Worker 3: xpu:1 → 物理 GPU 3
 
-                           ↓                               ↓
+                           ↓                                 ↓
                            XCCL init_process_group(world_size=4) 创建 4-rank 通信组
-                           但只使用了 2 块物理 GPU，每块 GPU 上有 2 个 rank
+                           4 个 rank 在 4 块不同物理 GPU 上（✅ 设备映射正确）
+                           但 rank 0,1 和 rank 2,3 使用不同的 ZE_AFFINITY_MASK
                            ↓
-                           allreduce LL256 ring kernel 需要每个 rank 对应唯一设备
-                           设备端 IPC 内存交换死锁 → torch.xpu.synchronize() 永久 hang
+                           XCCL IPC 需要跨 affinity mask 边界传输数据
+                           Level Zero IPC 句柄可能无法在不同 affinity 组的进程间正确工作
+                           ↓
+                           allreduce LL256 ring kernel 在设备端死锁
+                           → torch.xpu.synchronize() 永久 hang
 ```
 
 **对比 TP=4/DP=1（正常）：**
-所有 4 个 worker 由同一个 EngineCore 生成，`local_rank` 分别为 0, 1, 2, 3，一一对应 4 块不同的物理 GPU。
+所有 4 个 worker 由同一个 EngineCore 生成，**不设置 `ZE_AFFINITY_MASK`**，所有进程看到全部 4 块 GPU，
+`local_rank` 分别为 0, 1, 2, 3，XCCL IPC 在同一设备命名空间内工作，不存在跨 affinity 边界通信。
 
 ---
 
@@ -145,36 +154,18 @@ dist.destroy_process_group()
 
 关键差异：`torchrun` 是**单一启动器管理所有进程**，能确保 `LOCAL_RANK` 全局唯一。vLLM DP>1 是**多个 EngineCore 各自独立 spawn worker**，每个 EngineCore 内部 `local_rank` 从 0 开始，没有跨 EngineCore 的 `local_rank` 协调机制。
 
-### 5.4 如何确认 LOCAL_RANK 冲突是根因？
+### 5.4 ~~LOCAL_RANK 冲突确认~~ → 已被 Trace 数据证伪
 
-确认 LOCAL_RANK 冲突是根因，基于以下**三重证据链**：
+> **注意**：本节的分析基于第六节的早期诊断日志（PID 4185-4190），当时未观测到 `ZE_AFFINITY_MASK`。
+> 第十节的 Trace 验证（PID 6834-6835）显示 `ZE_AFFINITY_MASK` 已正确设置，
+> LOCAL_RANK 冲突假设不成立。详见第十节分析。
 
-**证据1：诊断日志直接观测到 local_rank 重复（第六节详细数据）**
+~~之前基于三重证据链认为 LOCAL_RANK 冲突是根因，但 Trace 数据显示：~~
+~~1. `ZE_AFFINITY_MASK` 已设置（`0,1` 和 `2,3`）~~
+~~2. `device_count=2`（每个 EngineCore 只看到 2 块 GPU）~~
+~~3. 每个 rank 映射到唯一物理 GPU~~
 
-诊断打印明确显示 EngineCore 0 的 worker（PID 4185）和 EngineCore 1 的 worker（PID 4189）都使用 `local_rank=0`，EngineCore 0 的 worker（PID 4186）和 EngineCore 1 的 worker（PID 4190）都使用 `local_rank=1`。4 个 XCCL rank 只映射到 2 块物理 GPU。
-
-**证据2：对比排除法 — 所有其他可能原因均已排除**
-
-| 排除的假设 | 排除依据 |
-|-----------|---------|
-| `has_all_vertices_connected: 0` 拓扑问题 | TP=4/DP=1 同样 `=0` 且正常工作 |
-| SYCL kernel 路径问题 | `CCL_SYCL_KERNELS=0` 仍 hang |
-| PyTorch/XCCL 自身缺陷 | `test_xccl.py` 用 `torchrun` 正常工作 |
-| 两阶段 init_process_group | 日志显示 `is_initialized_before=False`，无 destroy/rebuild |
-| TCP rendezvous 失败 | `init_process_group` 成功完成 |
-| allreduce 提交失败 | CCL 报告所有 4 rank 的内核入队 "done" |
-
-所有假设被排除后，**唯一剩余的差异**就是 `local_rank` 分配：TP=4/DP=1 时 `local_rank` 为 0,1,2,3（唯一），DP>1 时为 0,1,0,1（冲突）。
-
-**证据3：代码级根因链条完整**
-
-1. `vllm/v1/engine/core.py` → `DPEngineCoreActor._set_visible_devices()` 中 XPU 分支是 `pass`（不设置 `ZE_AFFINITY_MASK`）
-2. `vllm/distributed/parallel_state.py` → `init_distributed_environment()` 中 DP 调整只修改全局 `rank` 和 `world_size`，**不修改 `local_rank`**
-3. `vllm/v1/worker/xpu_worker.py` → `XPUWorker.init_device()` 中使用 `local_rank` 调用 `torch.xpu.set_device()`
-4. 结果：`local_rank=0` 的两个 worker（rank 0 和 rank 2）都调用 `torch.xpu.set_device(0)` → 都绑定到物理 GPU 0
-5. XCCL communicator 创建时，4 个 rank 声称使用 4 块不同设备，但实际只用了 2 块 → 设备拓扑不一致 → allreduce ring kernel 在设备端死锁
-
-这三重证据（直接观测 + 排除法 + 代码链条）共同确认 LOCAL_RANK 冲突是根因。
+当前需要重新分析根因，最可能是 **XCCL 跨 `ZE_AFFINITY_MASK` IPC 通信问题**。
 
 ---
 
@@ -245,19 +236,27 @@ dist.destroy_process_group()
 所有 worker 均显示 `is_initialized_before=False`。**此前的"两阶段初始化"假设被证伪。**
 CCL 日志中 PID 2441 的 finalize 可能是其他模块的短暂初始化（如 torch.xpu 初始化时的内部 communicator），与 vLLM 的 `init_process_group` 无关。
 
-#### 🔴 发现2：LOCAL_RANK 冲突确认
+#### ~~🔴 发现2：LOCAL_RANK 冲突确认~~ → 已被 Trace 证伪
+
+> **注意**：以下数据来自早期运行（PID 4185-4190），Trace 验证（第十节）显示最新运行中
+> `ZE_AFFINITY_MASK` 已正确设置。两次运行可能使用了不同的启动路径或配置。
 
 | PID | EngineCore | dp_rank | 原始 rank | **调整后 rank** | **local_rank** | **映射 GPU** |
 |-----|------------|---------|-----------|----------------|----------------|-------------|
 | 4185 | 0 | 0 | 0 | 0 | **0** | xpu:**0** |
 | 4186 | 0 | 0 | 1 | 1 | **1** | xpu:**1** |
-| 4189 | 1 | 1 | 0 | 2 | **0** | xpu:**0** ← 冲突 |
-| 4190 | 1 | 1 | 1 | 3 | **1** | xpu:**1** ← 冲突 |
+| 4189 | 1 | 1 | 0 | 2 | **0** | xpu:**0** ← ~~冲突~~ (此次运行无 ZE_AFFINITY_MASK) |
+| 4190 | 1 | 1 | 1 | 3 | **1** | xpu:**1** ← ~~冲突~~ (此次运行无 ZE_AFFINITY_MASK) |
 
 DP 调整只修改了全局 `rank`（偏移为 `dp_rank * world_size + rank`）和 `world_size`，
 **但 `local_rank` 没有任何调整**，仍然是每个 EngineCore 内部的 0-indexed 值。
 
-#### 🔴 发现3：XPU 平台缺少 `ZE_AFFINITY_MASK` 设置
+#### ~~🔴 发现3：XPU 平台缺少 `ZE_AFFINITY_MASK` 设置~~ → 在最新 Trace 运行中已正确设置
+
+> **注意**：早期运行（PID 4185-4190）中可能未设置 `ZE_AFFINITY_MASK`，但 Trace 运行（PID 6834-6835）
+> 显示 `ZE_AFFINITY_MASK=0,1` 和 `ZE_AFFINITY_MASK=2,3` 已正确设置。
+> 这表明 `ZE_AFFINITY_MASK` 可能通过 MP（多进程）路径的 `set_device_control_env_var()` 设置，
+> 而非 `DPEngineCoreActor._set_visible_devices()`。
 
 在 `vllm/v1/engine/core.py` 的 `DPEngineCoreActor._set_visible_devices()` 中：
 
@@ -326,12 +325,13 @@ torch.distributed.init_process_group(
 | | TP=4/DP=1 | DP>1 |
 |--|-----------|------|
 | **worker 来源** | 同一个 EngineCore | 不同 EngineCore |
-| **local_rank** | 0, 1, 2, 3（唯一） | 0, 1, 0, 1（冲突） |
-| **GPU 映射** | 4 rank → 4 GPU | 4 rank → 2 GPU |
+| **local_rank** | 0, 1, 2, 3（唯一） | 0, 1, 0, 1（数值重复但 ZE_AFFINITY_MASK 隔离） |
+| **GPU 映射** | 4 rank → 4 GPU（直接映射） | 4 rank → 4 GPU（通过 ZE_AFFINITY_MASK 虚拟化） |
 | **rank 值** | 原始 0-3 | 偏移调整后 0-3 |
 | **world_size** | 原始 4 | `TP × DP` |
 | **TCP 端口** | 原始端口 | 新端口 |
-| **ZE_AFFINITY_MASK** | 不需要（all GPU visible） | ⚠️ 未设置（应该设置） |
+| **ZE_AFFINITY_MASK** | 不设置（所有 GPU 可见） | ⚠️ 设置 `0,1` 和 `2,3`（分组隔离） |
+| **XCCL IPC** | 同一设备命名空间 | ⚠️ 跨 affinity mask 边界 |
 
 ---
 
@@ -379,91 +379,134 @@ torch.distributed.init_process_group(
 
 ---
 
-## 九、根因结论
+## 九、根因结论（已更新）
 
-### 🎯 确定的根因
+### ~~之前的假设：LOCAL_RANK 冲突~~（已被 Trace 数据证伪）
 
-**XPU DP>1 时，多个 XCCL rank 映射到同一块物理 GPU 上，导致 allreduce 在设备端死锁。**
+之前基于第六节的诊断日志（PID 4185-4190 运行），推断 LOCAL_RANK 冲突是根因。
+但第十节的 Trace 验证（PID 6834-6835 运行）显示 `ZE_AFFINITY_MASK` 已正确设置，
+每个 rank 映射到唯一的物理 GPU，**不存在 LOCAL_RANK 冲突**。
 
-具体机制：
-1. DP>1 从多个 EngineCore 进程树生成 worker
-2. 每个 EngineCore 内部 `local_rank` 从 0 开始分配
-3. DP 调整逻辑只修改了全局 `rank` 和 `world_size`，**未调整 `local_rank`**
-4. XPU 平台的 `_set_visible_devices()` 不设置 `ZE_AFFINITY_MASK`（是 `pass`）
-5. 结果：多个 rank 使用相同的 `local_rank` → `torch.device("xpu:0")` 被多个 rank 共享
-6. XCCL communicator 创建了错误的设备拓扑映射
-7. allreduce LL256 ring kernel 的 IPC 内存交换在设备端死锁
+### 🔴 当前状态：根因尚未确定
 
-### 修复方向
+**确认的事实：**
+- 设备映射正确（每个 rank 对应唯一物理 GPU）
+- `ZE_AFFINITY_MASK` 已正确设置（`0,1` 和 `2,3`）
+- allreduce LL256 kernel 入队成功（所有 rank 报告 "done"）
+- `torch.xpu.synchronize()` 永久 hang
 
-需要确保每个 EngineCore 的 worker 使用正确的物理 GPU，有两种可能的方式：
+**最可能的新方向：XCCL 跨 `ZE_AFFINITY_MASK` IPC 通信问题**
 
-1. **设置 `ZE_AFFINITY_MASK`**：在 `DPEngineCoreActor._set_visible_devices()` 中为 XPU 平台设置 `ZE_AFFINITY_MASK`，限制每个 EngineCore 可见的 GPU 设备
-2. **调整 `local_rank`**：在 DP 调整逻辑中，根据 `data_parallel_rank` 偏移 `local_rank`，使其正确映射到不同的物理 GPU
+TP=4/DP=1（正常）与 DP>1（hang）的关键差异已从"LOCAL_RANK 冲突"更新为：
+
+| | TP=4/DP=1（正常） | DP>1（hang） |
+|--|-------------------|-------------|
+| **ZE_AFFINITY_MASK** | 未设置（所有进程看到全部 4 GPU） | 设置为 `0,1` 和 `2,3`（分组隔离） |
+| **XCCL IPC** | 所有 rank 在同一设备命名空间 | rank 跨不同 affinity 组通信 |
+| **设备 ID** | 全局一致（0,1,2,3） | 虚拟化（每个组内 0,1） |
+
+详见第十节的新分析方向和建议的下一步验证。
 
 ---
 
-## 十、验证 Trace 方案
+## 十、Trace 验证结果 — LOCAL_RANK 冲突假设被证伪
 
-### 10.1 新增 Trace 说明
+### 10.1 实际 Trace 日志（TP=2, DP=2, 4 GPU）
 
-在 `vllm/v1/worker/xpu_worker.py` 的 `XPUWorker.init_device()` 中添加了详细 trace，用于 **double confirm** LOCAL_RANK 冲突假设：
+使用设备级 trace patch 运行后，`grep -E "DEBUG-DP|TRACE" ccl_debug.log` 得到以下关键数据：
 
-#### Trace 点 1：`init_device START`（设备绑定前）
 ```
-[TRACE][PID=xxxx] init_device START: rank=X, local_rank=Y,
-  device_count=N, ZE_AFFINITY_MASK=..., ONEAPI_DEVICE_SELECTOR=...
-[TRACE][PID=xxxx]   visible xpu:0 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=...
-[TRACE][PID=xxxx]   visible xpu:1 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=...
-...
+# === EngineCore 0 的 worker（rank=1）===
+(Worker pid=6835) [TRACE][PID=6835] init_device START: rank=1, local_rank=1,
+  device_count=2, ZE_AFFINITY_MASK=0,1, ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+(Worker pid=6835) [TRACE][PID=6835]   visible xpu:0 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=24385683456
+(Worker pid=6835) [TRACE][PID=6835]   visible xpu:1 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=24385683456
+(Worker pid=6835) [TRACE][PID=6835] device bound: rank=1, local_rank=1,
+  self.device=xpu:1, current_device=1, device_name=Intel(R) Arc(TM) Pro B60 Graphics
+(Worker pid=6835) [DEBUG-DP][PID=6835] init_distributed_environment ENTRY:
+  world_size=2, rank=1, local_rank=1, distributed_init_method=tcp://127.0.0.1:46161, backend=xccl
+(Worker pid=6835) [DEBUG-DP][PID=6835] env: RANK=None, LOCAL_RANK=1, WORLD_SIZE=None,
+  MASTER_ADDR=None, MASTER_PORT=None
+(Worker pid=6835) [DEBUG-DP][PID=6835] DP adjustment BEFORE:
+  data_parallel_size=2, data_parallel_rank=0, world_size_across_dp=4,
+  tensor_parallel_size=2, original_rank=1, original_world_size=2
+(Worker pid=6835) [DEBUG-DP][PID=6835] DP adjustment AFTER:
+  adjusted_rank=1, adjusted_world_size=4, ip=127.0.0.1, port=54231,
+  distributed_init_method=tcp://127.0.0.1:54231
+(Worker pid=6835) [DEBUG-DP][PID=6835] calling init_process_group:
+  backend=xccl, init_method=tcp://127.0.0.1:54231, world_size=4, rank=1, is_initialized_before=False
+
+# === EngineCore 1 的 worker（rank=1 → adjusted_rank=3）===
+(Worker pid=6834) [TRACE][PID=6834] init_device START: rank=1, local_rank=1,
+  device_count=2, ZE_AFFINITY_MASK=2,3, ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+(Worker pid=6834) [TRACE][PID=6834]   visible xpu:0 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=24385683456
+(Worker pid=6834) [TRACE][PID=6834]   visible xpu:1 = Intel(R) Arc(TM) Pro B60 Graphics, total_memory=24385683456
+(Worker pid=6834) [TRACE][PID=6834] device bound: rank=1, local_rank=1,
+  self.device=xpu:1, current_device=1, device_name=...
+# (日志在此截断)
 ```
-**目的**：确认每个 worker 看到的 GPU 列表。如果所有 EngineCore 的 worker 都看到全部 4 块 GPU 且 `ZE_AFFINITY_MASK` 为 None，则确认缺少设备隔离。
 
-#### Trace 点 2：`device bound`（set_device 后）
-```
-[TRACE][PID=xxxx] device bound: rank=X, local_rank=Y,
-  self.device=xpu:Y, current_device=Y, device_name=...
-```
-**目的**：确认 `local_rank` → 实际 GPU 映射。**如果来自不同 EngineCore 的 worker 的 `current_device` 相同，则直接确认 LOCAL_RANK 冲突。**
+### 10.2 关键发现：LOCAL_RANK 冲突假设被证伪 ❌
 
-#### Trace 点 3：`pre-allreduce`（allreduce 前）
-```
-[TRACE][PID=xxxx] pre-allreduce: rank=X, local_rank=Y,
-  current_device=Y, dist_rank=X, dist_world_size=N, dist_backend=xccl
-```
-**目的**：确认进入 allreduce 时的设备状态。
+实际 trace 数据与预期的"LOCAL_RANK 冲突"模式**完全不符**：
 
-#### Trace 点 4：`allreduce warmup`（tensor 创建后）
-```
-[TRACE][PID=xxxx] allreduce warmup: tensor.device=xpu:Y, current_device=Y
-[TRACE][PID=xxxx] allreduce submitted, calling synchronize...
-[TRACE][PID=xxxx] synchronize DONE    ← 如果出现则表示 allreduce 成功
-```
-**目的**：确认 warmup tensor 在哪块 GPU 上创建。如果 synchronize DONE 不出现，结合 Trace 点 2 的设备映射，可直接确认是否因为 GPU 冲突导致死锁。
+| 观测项 | 预期（如果 LOCAL_RANK 冲突） | **实际观测** | 结论 |
+|--------|--------------------------|-------------|------|
+| `ZE_AFFINITY_MASK` | None（未设置） | **`0,1` 和 `2,3`**（已正确设置） | ✅ 设备隔离已生效 |
+| `device_count` | 4（看到全部 GPU） | **2**（每个 EngineCore 只看到 2 块） | ✅ 设备可见性正确 |
+| 物理 GPU 映射 | 多个 rank 映射到同一物理 GPU | **各 rank 映射到不同物理 GPU** | ✅ 无冲突 |
 
-### 10.2 预期验证结果
+推导完整的 4-worker 物理 GPU 映射：
 
-**如果 LOCAL_RANK 冲突是根因，预期看到：**
+| Worker | PID | ZE_AFFINITY_MASK | local_rank | current_device | 物理 GPU |
+|--------|-----|-----------------|------------|----------------|---------|
+| EC0-W0 | (未显示) | 0,1 | 0 | 0 | **GPU 0** |
+| EC0-W1 | 6835 | 0,1 | 1 | 1 | **GPU 1** |
+| EC1-W0 | (未显示) | 2,3 | 0 | 0 | **GPU 2** |
+| EC1-W1 | 6834 | 2,3 | 1 | 1 | **GPU 3** |
 
-| PID | rank | local_rank | current_device | 预期物理 GPU |
-|-----|------|------------|----------------|-------------|
-| A | 0 | 0 | 0 | GPU 0 |
-| B | 1 | 1 | 1 | GPU 1 |
-| C | 2 | **0** | **0** | **GPU 0** ← 冲突！应为 GPU 2 |
-| D | 3 | **1** | **1** | **GPU 1** ← 冲突！应为 GPU 3 |
+**每个 rank 映射到唯一的物理 GPU — 不存在 LOCAL_RANK 冲突！**
 
-- 所有 worker 的 `device_count` 都是 4（没有设备隔离）
-- `ZE_AFFINITY_MASK` 为 None（未设置）
-- Trace 点 4 的 `synchronize DONE` 不会出现（hang 确认）
+说明：`ZE_AFFINITY_MASK=0,1` 使进程只看到物理 GPU 0 和 1（作为虚拟 xpu:0 和 xpu:1）；
+`ZE_AFFINITY_MASK=2,3` 使进程只看到物理 GPU 2 和 3（同样作为虚拟 xpu:0 和 xpu:1）。
+因此 `current_device=1` 在不同 EngineCore 中映射到不同的物理 GPU。
 
-**如果 LOCAL_RANK 冲突 NOT 是根因，预期看到：**
+### 10.3 与之前诊断日志的差异说明
 
-- 每个 worker 的 `current_device` 各不相同（0, 1, 2, 3）
-- 需要继续排查其他方向
+之前的诊断日志（第六节，PID 4185-4190）中没有观测到 `ZE_AFFINITY_MASK`。
+最新的 trace 日志（PID 6834-6835）显示 `ZE_AFFINITY_MASK` 已正确设置。
+这可能是因为：
+1. 两次运行使用了不同的启动路径（Ray vs MP）
+2. 或者在两次运行之间有其他配置变化
 
-### 10.3 对比：test_xccl.py 中的预期
+无论原因如何，**最新的 trace 数据明确证明：在当前的运行配置下，LOCAL_RANK 冲突不存在，但 allreduce 仍然 hang。**
 
-使用 `torchrun --nproc_per_node=4` 运行时，`torchrun` 自动设置 `LOCAL_RANK=0,1,2,3`（全局唯一），因此每个 rank 的 `current_device` 分别为 0, 1, 2, 3，不会有冲突。这就是 test_xccl.py 不出现问题的原因。
+### 10.4 新的分析方向
+
+既然 LOCAL_RANK 冲突已被排除，需要重新审视可能的根因：
+
+| # | 新假设 | 分析方向 |
+|---|--------|---------|
+| 1 | **XCCL 跨 ZE_AFFINITY_MASK IPC 通信问题** | 当 4 个进程分属不同 `ZE_AFFINITY_MASK` 组（0,1 vs 2,3）时，XCCL 的 Level Zero IPC 句柄可能无法跨 affinity mask 边界正确工作。TP=4/DP=1 时所有进程看到全部 4 块 GPU，没有 affinity mask 隔离，因此 IPC 正常 |
+| 2 | **`has_all_vertices_connected: 0` 在跨 affinity 场景下的影响** | 之前排除此假设时基于"TP=4/DP=1 也是 0 但正常"。但 TP=4/DP=1 时所有 rank 在同一 affinity 组，DP>1 时 rank 跨不同 affinity 组。拓扑不全互联在跨 affinity 场景下可能产生不同影响 |
+| 3 | **XCCL communicator 创建时的设备 ID 映射** | 每个进程内 XCCL 使用虚拟设备 ID（0 或 1），但跨进程 IPC 需要用物理设备 ID。XCCL/oneCCL 是否正确处理了 `ZE_AFFINITY_MASK` 虚拟化？ |
+| 4 | **CCL 的 `local_proc_count` 检测问题** | CCL 日志显示 `local_proc_count 4`，但实际上每个 affinity 组只有 2 个进程。如果 CCL 错误地认为 4 个进程都在同一组设备上，可能导致通信拓扑构建错误 |
+
+### 10.5 建议的下一步验证
+
+1. **验证假设 1**：运行 `test_xccl.py` 但手动设置不同的 `ZE_AFFINITY_MASK`（2 个进程用 `0,1`，2 个进程用 `2,3`），看是否复现 hang
+   ```bash
+   # 如果以下测试 hang，确认 XCCL 跨 affinity mask IPC 问题
+   ZE_AFFINITY_MASK=0,1 torchrun --nproc_per_node=2 test_xccl_2gpu.py &
+   ZE_AFFINITY_MASK=2,3 torchrun --nproc_per_node=2 test_xccl_2gpu.py &
+   # 注意：需要让 4 个进程加入同一个 process group
+   ```
+
+2. **验证假设 4**：检查 CCL 的 `local_proc_count` 在 DP>1 场景下是否正确
+   - 在 CCL debug 日志中搜索 `local_proc_count` 的值
+   - 如果 `local_proc_count=4` 但实际每个 affinity 组只有 2 个进程，这可能是问题
+
+3. **简化复现**：编写一个测试脚本，4 个进程手动分组使用不同的 `ZE_AFFINITY_MASK`，加入同一个 `init_process_group(world_size=4)`，然后做 `all_reduce` — 如果 hang，则确认是 XCCL/Level Zero 的跨 affinity mask 通信问题
 
 ---
 
