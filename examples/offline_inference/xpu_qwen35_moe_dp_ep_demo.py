@@ -46,8 +46,11 @@ from time import sleep
 MODEL_PATH = "/models/Qwen3.5-35B-A3B"  # local model path, adjust as needed
 TP_SIZE = 2
 DP_SIZE = 2
-MAX_MODEL_LEN = 1024
-GPU_MEMORY_UTILIZATION = 0.9
+MAX_MODEL_LEN = 256
+GPU_MEMORY_UTILIZATION = 0.95
+# Qwen3.5-35B-A3B is a ConditionalGeneration (multimodal) model.
+# For text-only inference, language_model_only=True is required.
+LANGUAGE_MODEL_ONLY = True
 # -----------------------------------------------------------------------------
 
 
@@ -95,6 +98,13 @@ def parse_args():
         action="store_true",
         default=True,
         help="Enforce eager mode (default: True)",
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        default=LANGUAGE_MODEL_ONLY,
+        help="Use language model only, skip multimodal components "
+        "(default: True for Qwen3.5-35B-A3B)",
     )
     return parser.parse_args()
 
@@ -146,6 +156,11 @@ def run_dp_worker(dp_rank, dp_size, args):
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        trust_remote_code=True,
+        language_model_only=args.language_model_only,
+        dtype="float16",
+        num_gpu_blocks_override=100,
+        disable_log_stats=True,
     )
 
     outputs = llm.generate(my_prompts, sampling_params)
@@ -175,6 +190,11 @@ def run_torchrun(args):
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        trust_remote_code=True,
+        language_model_only=args.language_model_only,
+        dtype="float16",
+        num_gpu_blocks_override=100,
+        disable_log_stats=True,
     )
 
     dp_rank = llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
