@@ -132,7 +132,6 @@ if __name__ == "__main__":
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
-        trust_remote_code=True,
         language_model_only=args.language_model_only,
         dtype="float16",
         num_gpu_blocks_override=100,
