@@ -24,7 +24,7 @@ from vllm.utils.system_utils import update_environment_variables
 mp.set_start_method("spawn", force=True)
 
 
-def distributed_run(fn, world_size):
+def distributed_run(fn, world_size, timeout=120):
     number_of_processes = world_size
     processes: list[mp.Process] = []
     for i in range(number_of_processes):
@@ -40,10 +40,33 @@ def distributed_run(fn, world_size):
         p.start()
 
     for p in processes:
-        p.join()
+        p.join(timeout=timeout)
 
-    for p in processes:
-        assert p.exitcode == 0
+    # Check for hung processes and terminate them
+    hung_ranks = []
+    for i, p in enumerate(processes):
+        if p.is_alive():
+            hung_ranks.append(i)
+            p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+
+    if hung_ranks:
+        raise RuntimeError(
+            f"Processes for ranks {hung_ranks} did not finish within "
+            f"{timeout}s timeout (likely hung in a collective operation)"
+        )
+
+    failed_ranks = []
+    for i, p in enumerate(processes):
+        if p.exitcode != 0:
+            failed_ranks.append((i, p.exitcode))
+
+    if failed_ranks:
+        details = ", ".join(f"rank {r} exit code {c}" for r, c in failed_ranks)
+        raise RuntimeError(f"Processes failed: {details}")
 
 
 def worker_fn_wrapper(fn):
@@ -224,6 +247,133 @@ def all_gatherv_worker_fn():
 )
 def test_pynccl_all_gatherv():
     distributed_run(all_gatherv_worker_fn, 2)
+
+
+@worker_fn_wrapper
+def all_gatherv_equal_sizes_worker_fn():
+    """Test all_gatherv when all ranks have equal sizes."""
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    rank = pynccl_comm.rank
+    world_size = pynccl_comm.world_size
+    device = f"cuda:{rank}"
+
+    num_elems = 64
+    sizes = [num_elems] * world_size
+    tensor = torch.arange(num_elems, dtype=torch.float32, device=device) + rank * 1000
+    result = torch.zeros(num_elems * world_size, dtype=torch.float32, device=device)
+    expected = torch.cat(
+        [
+            torch.arange(num_elems, dtype=torch.float32) + r * 1000
+            for r in range(world_size)
+        ]
+    ).to(device)
+
+    pynccl_comm.all_gatherv(result, tensor, sizes=sizes)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-8)
+
+
+@worker_fn_wrapper
+def all_gatherv_single_element_worker_fn():
+    """Test all_gatherv with single element per rank."""
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    rank = pynccl_comm.rank
+    world_size = pynccl_comm.world_size
+    device = f"cuda:{rank}"
+
+    sizes = [1] * world_size
+    tensor = torch.tensor([float(rank + 1)], dtype=torch.float32, device=device)
+    result = torch.zeros(world_size, dtype=torch.float32, device=device)
+    expected = torch.tensor(
+        [float(r + 1) for r in range(world_size)],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    pynccl_comm.all_gatherv(result, tensor, sizes=sizes)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-8)
+
+
+@worker_fn_wrapper
+def all_gatherv_large_imbalance_worker_fn():
+    """Test all_gatherv with large size imbalance between ranks."""
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    rank = pynccl_comm.rank
+    world_size = pynccl_comm.world_size
+    device = f"cuda:{rank}"
+
+    assert world_size <= 8
+    # Large imbalance: rank 0 has 1 element, rank 1 has 1000
+    sizes = [1, 1000, 500, 2, 750, 3, 100, 50][:world_size]
+    num_elems = sizes[rank]
+    tensor = torch.arange(num_elems, dtype=torch.float32, device=device) + rank * 10000
+    result = torch.zeros(sum(sizes), dtype=torch.float32, device=device)
+    expected = torch.cat(
+        [
+            torch.arange(sizes[r], dtype=torch.float32) + r * 10000
+            for r in range(world_size)
+        ]
+    ).to(device)
+
+    pynccl_comm.all_gatherv(result, tensor, sizes=sizes)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-8)
+
+
+@worker_fn_wrapper
+def all_gatherv_float16_worker_fn():
+    """Test all_gatherv with float16 dtype."""
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    rank = pynccl_comm.rank
+    world_size = pynccl_comm.world_size
+    device = f"cuda:{rank}"
+
+    assert world_size <= 8
+    sizes = [30, 50, 40, 20, 60, 10, 35, 45][:world_size]
+    num_elems = sizes[rank]
+    tensor = torch.arange(num_elems, dtype=torch.float16, device=device) + rank * 100
+    result = torch.zeros(sum(sizes), dtype=torch.float16, device=device)
+    expected = torch.cat(
+        [
+            torch.arange(sizes[r], dtype=torch.float16) + r * 100
+            for r in range(world_size)
+        ]
+    ).to(device)
+
+    pynccl_comm.all_gatherv(result, tensor, sizes=sizes)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+@pytest.mark.parametrize(
+    "worker_fn",
+    [
+        all_gatherv_equal_sizes_worker_fn,
+        all_gatherv_single_element_worker_fn,
+        all_gatherv_large_imbalance_worker_fn,
+        all_gatherv_float16_worker_fn,
+    ],
+    ids=[
+        "equal_sizes",
+        "single_element",
+        "large_imbalance",
+        "float16",
+    ],
+)
+def test_pynccl_all_gatherv_comprehensive(worker_fn):
+    distributed_run(worker_fn, 2)
 
 
 @worker_fn_wrapper
