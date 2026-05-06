@@ -221,7 +221,14 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 
 ```python
 # test_equal_size.py — 应该成功
-import torch, torch.distributed as dist
+# torchrun --nproc-per-node=4 /models/test_equal_size.py
+import torch
+import torch.distributed as dist
+try:
+    import intel_extension_for_pytorch  # noqa: F401 — 注册 XPU 后端
+except ImportError:
+    pass
+
 dist.init_process_group(backend="xccl")
 rank = dist.get_rank()
 t = torch.randn(10, 128, device=f"xpu:{rank}")
@@ -233,7 +240,14 @@ dist.destroy_process_group()
 
 ```python
 # test_variable_size.py — 应该 hang
-import torch, torch.distributed as dist
+# torchrun --nproc-per-node=4 /models/test_variable_size.py
+import torch
+import torch.distributed as dist
+try:
+    import intel_extension_for_pytorch  # noqa: F401 — 注册 XPU 后端
+except ImportError:
+    pass
+
 dist.init_process_group(backend="xccl")
 rank = dist.get_rank()
 sizes = [3, 5, 2, 4]
