@@ -6,7 +6,8 @@ Example: Data Parallel + Expert Parallel inference on 4x Intel ARC B60 GPUs.
 This script demonstrates running a Mixture-of-Experts (MoE) model using:
   - Tensor Parallelism (TP=2): each model replica is split across 2 GPUs
   - Data Parallelism (DP=2): 2 independent replicas process different data
-  - Expert Parallelism (EP=true): MoE experts are distributed across TP ranks
+  - Expert Parallelism (EP=true): MoE experts distributed across all 4 GPUs
+    (EP size = DP × TP = 4; each GPU holds N/4 experts)
 
 Total GPUs required: TP × DP = 2 × 2 = 4 (one per ARC B60 card)
 
@@ -22,10 +23,14 @@ Launch with torchrun (single-node, 4 XPUs: TP=2, DP=2, EP=True):
 
 torchrun spawns 4 processes (WORLD_SIZE=4 = TP x DP = 2 x 2):
 
-  RANK 0: vllm dp_rank=0, tp_rank=0   (DP group 0, TP leader)
-  RANK 1: vllm dp_rank=0, tp_rank=1   (DP group 0, TP follower)
-  RANK 2: vllm dp_rank=1, tp_rank=0   (DP group 1, TP leader)
-  RANK 3: vllm dp_rank=1, tp_rank=1   (DP group 1, TP follower)
+  RANK 0: dp_rank=0, tp_rank=0, ep_rank=0  (DP group 0, holds experts 0..N/4-1)
+  RANK 1: dp_rank=0, tp_rank=1, ep_rank=1  (DP group 0, holds experts N/4..N/2-1)
+  RANK 2: dp_rank=1, tp_rank=0, ep_rank=2  (DP group 1, holds experts N/2..3N/4-1)
+  RANK 3: dp_rank=1, tp_rank=1, ep_rank=3  (DP group 1, holds experts 3N/4..N-1)
+
+EP status: With --enable-expert-parallel, EP size = DP × TP = 4. All 4 GPUs
+participate in expert parallelism — each holds a unique N/4 subset of experts.
+Tokens are routed across all ranks via all-to-all communication.
 
 Key rule: TP partners (same dp_rank) MUST process the SAME prompt subset.
 vllm dp_rank = RANK // tensor_parallel_size  (i.e. RANK // 2)
