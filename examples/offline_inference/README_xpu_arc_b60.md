@@ -9,21 +9,25 @@ using the Qwen3.5-35B-A3B model.
 |-----------|-------|-------------|
 | **TP (Tensor Parallelism)** | 2 | Each model replica is split across 2 GPUs |
 | **DP (Data Parallelism)** | 2 | 2 independent replicas process data in parallel |
-| **EP (Expert Parallelism)** | true | MoE experts are partitioned across TP ranks within each DP group |
+| **EP (Expert Parallelism)** | true | MoE experts are distributed across all 4 GPUs (EP size = DP × TP = 4) |
 | **Total GPUs** | 4 | TP × DP = 2 × 2 = 4 |
 | **Model** | Qwen3.5-35B-A3B | MoE model with ~35B params, 3B active |
 
 ### Architecture Diagram
 
 ```
-4x Intel ARC B60 GPUs
-├── DP Rank 0 (GPU 0, GPU 1)
-│   ├── TP Rank 0 (GPU 0) ─── Experts [0, 1, ...]
-│   └── TP Rank 1 (GPU 1) ─── Experts [2, 3, ...]
-└── DP Rank 1 (GPU 2, GPU 3)
-    ├── TP Rank 0 (GPU 2) ─── Experts [0, 1, ...]
-    └── TP Rank 1 (GPU 3) ─── Experts [2, 3, ...]
+4x Intel ARC B60 GPUs (EP size = 4, experts split across ALL GPUs)
+├── DP Rank 0 (GPU 0, GPU 1) ─── Attention: data parallel group 0
+│   ├── EP Rank 0 (GPU 0) ─── Experts [0, 1, ...]
+│   └── EP Rank 1 (GPU 1) ─── Experts [2, 3, ...]
+└── DP Rank 1 (GPU 2, GPU 3) ─── Attention: data parallel group 1
+    ├── EP Rank 2 (GPU 2) ─── Experts [4, 5, ...]
+    └── EP Rank 3 (GPU 3) ─── Experts [6, 7, ...]
 ```
+
+**Note:** With EP enabled, the attention layers use DP (each group processes different
+requests independently), but the MoE expert layers use EP across all 4 GPUs via
+all-to-all communication. Each GPU holds a unique subset of experts (N/4 experts each).
 
 ## Known Limitation: XPU DP>1 with Multiprocessing Backend
 
