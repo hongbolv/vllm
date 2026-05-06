@@ -231,8 +231,12 @@ class PyNcclCommunicator:
         self.nccl.ncclGroupStart()
         for root, split_size in enumerate(sizes):
             dst_slice = output_tensor[split_offset : split_offset + split_size]
+            # On non-root ranks, use dst_slice as sendbuf to ensure valid
+            # buffer size matching count. NCCL ignores sendbuf on non-root
+            # ranks, but requires a valid buffer of at least count elements.
+            sendbuf = input_tensor if root == self.rank else dst_slice
             self.nccl.ncclBroadcast(
-                buffer_type(input_tensor.data_ptr()),
+                buffer_type(sendbuf.data_ptr()),
                 buffer_type(dst_slice.data_ptr()),
                 dst_slice.numel(),
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
