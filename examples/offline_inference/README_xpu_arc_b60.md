@@ -9,7 +9,7 @@ using the Qwen3.5-35B-A3B model.
 |-----------|-------|-------------|
 | **TP (Tensor Parallelism)** | 2 | Each model replica is split across 2 GPUs |
 | **DP (Data Parallelism)** | 2 | 2 independent replicas process data in parallel |
-| **EP (Expert Parallelism)** | true | MoE expert layers are distributed across TP ranks |
+| **EP (Expert Parallelism)** | true | MoE experts are partitioned across TP ranks within each DP group |
 | **Total GPUs** | 4 | TP × DP = 2 × 2 = 4 |
 | **Model** | Qwen3.5-35B-A3B | MoE model with ~35B params, 3B active |
 
@@ -123,20 +123,6 @@ curl http://localhost:8000/v1/completions \
         "prompt": "The future of AI is",
         "max_tokens": 64
     }'
-```
-
-### Direct vllm serve Command
-
-```bash
-vllm serve /home/media/Hongbo/models/Qwen3.5-35B-A3B \
-    --tensor-parallel-size 2 \
-    --enable-expert-parallel \
-    --dtype float16 \
-    --max-model-len 256 \
-    --distributed-executor-backend mp \
-    --enforce-eager \
-    --trust-remote-code \
-    --gpu-memory-utilization 0.95
 ```
 
 ## Key Parameters Explained
