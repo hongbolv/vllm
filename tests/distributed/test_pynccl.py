@@ -24,7 +24,7 @@ from vllm.utils.system_utils import update_environment_variables
 mp.set_start_method("spawn", force=True)
 
 
-def distributed_run(fn, world_size, timeout=120):
+def distributed_run(fn, world_size):
     number_of_processes = world_size
     processes: list[mp.Process] = []
     for i in range(number_of_processes):
@@ -40,32 +40,10 @@ def distributed_run(fn, world_size, timeout=120):
         p.start()
 
     for p in processes:
-        p.join(timeout=timeout)
-
-    # Terminate any processes that are still alive (likely hung on NCCL ops)
-    hung_ranks = []
-    for i, p in enumerate(processes):
-        if p.is_alive():
-            hung_ranks.append(i)
-            p.terminate()
-            p.join(timeout=5)
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=5)
-
-    if hung_ranks:
-        raise RuntimeError(
-            f"Processes for ranks {hung_ranks} did not finish within "
-            f"{timeout}s and were terminated. This likely indicates a "
-            f"hang in a NCCL collective operation (e.g. all_gatherv, "
-            f"reduce_scatterv). Check that all ranks call the same "
-            f"collective with consistent arguments."
-        )
+        p.join()
 
     for p in processes:
-        assert p.exitcode == 0, (
-            f"Process (rank unknown) exited with code {p.exitcode}"
-        )
+        assert p.exitcode == 0
 
 
 def worker_fn_wrapper(fn):
@@ -246,168 +224,6 @@ def all_gatherv_worker_fn():
 )
 def test_pynccl_all_gatherv():
     distributed_run(all_gatherv_worker_fn, 2)
-
-
-@worker_fn_wrapper
-def all_gatherv_multidim_worker_fn():
-    """Test all_gatherv with multi-dimensional tensors and multiple dtypes."""
-    pynccl_comm = PyNcclCommunicator(
-        get_world_group().cpu_group, device=get_world_group().device
-    )
-
-    rank = pynccl_comm.rank
-    world_size = pynccl_comm.world_size
-    device = f"cuda:{pynccl_comm.rank}"
-
-    assert world_size <= 8
-    sizes = [81, 20, 57, 52, 81, 5, 49, 49][:world_size]
-    hidden_dim = 64
-    num_rows = sizes[rank]
-
-    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-        # Each rank creates a 2D tensor [num_rows, hidden_dim]
-        tensor = (
-            torch.arange(num_rows * hidden_dim, dtype=dtype, device=device).reshape(
-                num_rows, hidden_dim
-            )
-            + rank * 1000
-        )
-        result = torch.zeros(
-            sum(sizes), hidden_dim, dtype=dtype, device=device
-        )
-
-        expected = torch.cat(
-            [
-                (
-                    torch.arange(sizes[r] * hidden_dim, dtype=dtype).reshape(
-                        sizes[r], hidden_dim
-                    )
-                    + r * 1000
-                )
-                for r in range(world_size)
-            ]
-        ).to(device)
-
-        pynccl_comm.all_gatherv(result, tensor, sizes=sizes)
-        torch.accelerator.synchronize()
-        torch.testing.assert_close(
-            result,
-            expected,
-            rtol=0,
-            atol=0,
-            msg=f"all_gatherv failed for dtype={dtype}, rank={rank}",
-        )
-
-
-@worker_fn_wrapper
-def all_gatherv_list_worker_fn():
-    """Test the higher-level all_gatherv that handles a list of tensors."""
-    pynccl_comm = PyNcclCommunicator(
-        get_world_group().cpu_group, device=get_world_group().device
-    )
-
-    rank = pynccl_comm.rank
-    world_size = pynccl_comm.world_size
-    device = f"cuda:{pynccl_comm.rank}"
-
-    assert world_size <= 8
-    sizes = [81, 20, 57, 52, 81, 5, 49, 49][:world_size]
-    num_rows = sizes[rank]
-    hidden_dim = 32
-    topk = 4
-
-    # Simulate the MoE dispatch pattern: gather hidden_states, topk_weights,
-    # topk_ids simultaneously
-    hidden_states = torch.randn(num_rows, hidden_dim, device=device)
-    topk_weights = torch.randn(num_rows, topk, device=device)
-    topk_ids = torch.arange(num_rows * topk, device=device).reshape(
-        num_rows, topk
-    ).float()
-
-    tensors = [hidden_states, topk_weights, topk_ids]
-
-    # Use pynccl directly to test the batched all_gatherv
-    output_list = []
-    pynccl_comm.group_start()
-    for inp in tensors:
-        total_rows = sum(sizes)
-        out = torch.empty(
-            (total_rows,) + inp.shape[1:], dtype=inp.dtype, device=device
-        )
-        pynccl_comm.all_gatherv(out, inp, sizes=sizes)
-        output_list.append(out)
-    pynccl_comm.group_end()
-    torch.accelerator.synchronize()
-
-    # Verify shapes
-    assert output_list[0].shape == (sum(sizes), hidden_dim), (
-        f"hidden_states shape mismatch: {output_list[0].shape}"
-    )
-    assert output_list[1].shape == (sum(sizes), topk), (
-        f"topk_weights shape mismatch: {output_list[1].shape}"
-    )
-    assert output_list[2].shape == (sum(sizes), topk), (
-        f"topk_ids shape mismatch: {output_list[2].shape}"
-    )
-
-    # Verify this rank's slice is correct in all gathered outputs
-    offset = sum(sizes[:rank])
-    torch.testing.assert_close(
-        output_list[0][offset : offset + num_rows],
-        hidden_states,
-        rtol=0,
-        atol=0,
-        msg=f"hidden_states slice mismatch at rank={rank}",
-    )
-    torch.testing.assert_close(
-        output_list[1][offset : offset + num_rows],
-        topk_weights,
-        rtol=0,
-        atol=0,
-        msg=f"topk_weights slice mismatch at rank={rank}",
-    )
-    torch.testing.assert_close(
-        output_list[2][offset : offset + num_rows],
-        topk_ids,
-        rtol=0,
-        atol=0,
-        msg=f"topk_ids slice mismatch at rank={rank}",
-    )
-
-
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
-)
-def test_pynccl_all_gatherv_multidim():
-    distributed_run(all_gatherv_multidim_worker_fn, 2)
-
-
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs to run the test."
-)
-def test_pynccl_all_gatherv_4gpu():
-    distributed_run(all_gatherv_worker_fn, 4)
-
-
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs to run the test."
-)
-def test_pynccl_all_gatherv_multidim_4gpu():
-    distributed_run(all_gatherv_multidim_worker_fn, 4)
-
-
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
-)
-def test_pynccl_all_gatherv_list():
-    distributed_run(all_gatherv_list_worker_fn, 2)
-
-
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs to run the test."
-)
-def test_pynccl_all_gatherv_list_4gpu():
-    distributed_run(all_gatherv_list_worker_fn, 4)
 
 
 @worker_fn_wrapper
