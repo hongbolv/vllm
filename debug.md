@@ -153,20 +153,67 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 
 ## 5. 根因总结
 
+### 5.1 结论置信度
+
+> ⚠️ **本分析基于代码审查和已知测试结果的推理，尚未在硬件上完成所有验证步骤。**
+
+| 证据 | 状态 | 说明 |
+|---|---|---|
+| `test_all_gatherv.py` 在 XCCL 上 hang | ✅ **已确认** (用户测试) | variable-size `dist.all_gather` 在 XCCL 后端确实 hang |
+| `xpu_communicator.py` 代码路径分析 | ✅ **已确认** (代码审查) | variable-size 时走 `dist.all_gather(list)` 路径，与测试脚本模式一致 |
+| Qwen3.5 MoE 推理 hang | ✅ **已确认** (用户测试) | DP=2, TP=2, EP=true 下卡在 "Processed prompts: 0%" |
+| Qwen3 MoE 推理成功 | ✅ **已确认** (用户测试) | 相同配置下可正常推理 |
+| Qwen3.5 MoE 的 sizes 不等 | ⚠️ **推测** (待验证) | 需要在 `all_gatherv` 入口加日志确认实际 sizes 值 |
+| Qwen3 MoE 的 sizes 相等 | ⚠️ **推测** (待验证) | 需要同样加日志确认 |
+| equal-size `all_gather` 在 XCCL 上成功 | ⚠️ **推测** (待验证) | 需要运行 `test_equal_size.py` 确认 |
+
+### 5.2 推理逻辑
+
+**已确认的事实:**
+1. `test_all_gatherv.py` 证明: XCCL 后端 + variable-size `dist.all_gather` → hang
+2. `xpu_communicator.py` 代码证明: vLLM 的 `all_gatherv` 在 sizes 不等时走完全相同的代码路径
+3. Qwen3.5 MoE hang，Qwen3 MoE 成功，两者使用相同的 EP 通信代码
+
+**基于以上事实的推理:**
+- 如果 Qwen3.5 MoE 的各 rank sizes 不等 → 走 variable-size 路径 → 触发 XCCL hang（与测试脚本一致）
+- 如果 Qwen3 MoE 的各 rank sizes 相等 → 走 equal-size 路径 → 不触发 hang
+- 这可以解释"相同配置下一个成功一个失败"的现象
+
+### 5.3 待验证项
+
+要将此分析从**推测**升级为**确认**，需要:
+
+1. **在 `all_gatherv` 入口加日志，确认 Qwen3.5 的 sizes 确实不等:**
+   ```python
+   # xpu_communicator.py:all_gatherv 入口
+   import logging
+   logging.warning(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes} input_shape={input_.shape}")
+   ```
+   然后分别用 Qwen3 和 Qwen3.5 运行，对比 sizes 输出。
+
+2. **运行 equal-size `all_gather` 测试，确认 XCCL 在 equal-size 下正常工作:**
+   ```bash
+   torchrun --nproc-per-node=4 /models/test_equal_size.py
+   ```
+
+3. **如果 sizes 确认不等且 equal-size 测试通过，则根因完全确认。**
+
+### 5.4 根因 (当前最佳推测)
+
 ```
 根本原因: XCCL 后端不支持 variable-size dist.all_gather / dist.reduce_scatter
 
 调用链:
   Qwen3.5 MoE inference (DP=2, TP=2, EP=true)
   → EP dispatch (AgRsAll2AllManager.dispatch_router_logits)
-  → dist_group.all_gatherv(tensors, sizes=[M, N])  # M ≠ N
+  → dist_group.all_gatherv(tensors, sizes=[M, N])  # M ≠ N (推测)
   → XpuCommunicator.all_gatherv(sizes=[M, N])
   → sizes are NOT equal → 走 variable-size 路径
   → dist.all_gather(list_of_different_sized_tensors, input_)
-  → XCCL backend 不支持此操作 → HANG
+  → XCCL backend 不支持此操作 → HANG (已通过 test_all_gatherv.py 确认)
 ```
 
-**而 Qwen3 MoE 恰好 sizes 相等，退化为 equal-size 路径，因此不会触发此 bug。**
+**而 Qwen3 MoE 的 sizes 可能相等，退化为 equal-size 路径，因此不触发此 bug（待验证）。**
 
 ## 6. 验证方式
 
