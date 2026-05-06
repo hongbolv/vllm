@@ -102,6 +102,12 @@ def parse_args():
         help="Use language model only, skip multimodal components "
         "(default: True for Qwen3.5-35B-A3B)",
     )
+    parser.add_argument(
+        "--no-ep",
+        action="store_true",
+        default=False,
+        help="Disable expert parallelism (for debugging: isolate EP issues)",
+    )
     return parser.parse_args()
 
 
@@ -123,11 +129,12 @@ if __name__ == "__main__":
 
     from vllm import LLM, SamplingParams
 
+    enable_ep = not args.no_ep
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp_size,
         data_parallel_size=args.dp_size,
-        enable_expert_parallel=True,
+        enable_expert_parallel=enable_ep,
         distributed_executor_backend="external_launcher",
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,

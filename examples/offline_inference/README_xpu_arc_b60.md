@@ -186,3 +186,49 @@ Ensure xccl backend is available:
 ```bash
 python -c "import torch.distributed; print('xccl' in torch.distributed.Backend.backend_list)"
 ```
+
+### Inference Hangs at "Processed prompts: 0%"
+
+If the model initializes successfully but hangs at `Processed prompts: 0%` with
+0.00 toks/s, the issue is most likely in the EP all-to-all collective communication.
+With EP enabled (`ep_size = DP × TP = 4`), every forward pass requires `all_to_all`
+across all 4 GPUs to route tokens to the correct experts.
+
+**Step 1: Test without EP** (isolate whether EP is the cause):
+```bash
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py --no-ep
+```
+The `--no-ep` flag disables expert parallelism. If inference succeeds without EP,
+the hang is in the XCCL `all_to_all` path.
+
+**Step 2: Test TP-only (no DP, no EP)**:
+```bash
+torchrun --nproc-per-node=2 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py --tp-size 2 --dp-size 1 --no-ep
+```
+
+**Step 3: Test XCCL all_to_all directly**:
+```python
+# Save as /tmp/test_a2a.py, run: torchrun --nproc-per-node=4 /tmp/test_a2a.py
+import torch, torch.distributed as dist
+dist.init_process_group(backend="xccl")
+rank = dist.get_rank()
+inp = torch.randn(4, 128, device=f"xpu:{rank}")
+out = torch.empty_like(inp)
+dist.all_to_all_single(out, inp)
+print(f"Rank {rank}: all_to_all succeeded")
+dist.destroy_process_group()
+```
+
+**Step 4: Try CCL environment tuning**:
+```bash
+export CCL_ZE_IPC_EXCHANGE=sockets
+export CCL_ATL_TRANSPORT=ofi
+```
+
+**Step 5: Enable debug logging**:
+```bash
+VLLM_LOGGING_LEVEL=DEBUG torchrun --nproc-per-node=4 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py 2>&1 | tee debug.log
+```
