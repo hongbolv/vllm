@@ -186,8 +186,7 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 1. **在 `all_gatherv` 入口加日志，确认 Qwen3.5 的 sizes 确实不等:**
    ```python
    # xpu_communicator.py:all_gatherv 入口
-   import logging
-   logging.warning(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes} input_shape={input_.shape}")
+   print(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes} input_shape={input_.shape}", flush=True)
    ```
    然后分别用 Qwen3 和 Qwen3.5 运行，对比 sizes 输出。
 
@@ -255,8 +254,7 @@ dist.destroy_process_group()
 在 `xpu_communicator.py:all_gatherv` 入口添加日志:
 ```python
 def all_gatherv(self, input_, dim=0, sizes=None):
-    import logging
-    logging.warning(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes}")
+    print(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes}", flush=True)
     ...
 ```
 
