@@ -54,6 +54,35 @@ class XPUWorker(Worker):
 
     def init_device(self):
         device = self.device_config.device
+
+        # Adjust local_rank for DP: when ZE_AFFINITY_MASK is NOT set (all
+        # GPUs visible), offset local_rank by dp_local_rank * tp_pp_size
+        # so each DP group binds to the correct physical GPU subset.
+        # This is needed because XPU skips ZE_AFFINITY_MASK in DP mode
+        # to avoid XCCL cross-affinity IPC failures (see PR #15).
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.data_parallel_size > 1
+            and parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.nnodes_within_dp == 1
+        ):
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            tp_pp_world_size = (
+                parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size
+            )
+
+            self.local_rank += dp_local_rank * tp_pp_world_size
+            assert self.local_rank < torch.xpu.device_count(), (
+                f"DP adjusted local rank {self.local_rank} is out of bounds "
+                f"(device_count={torch.xpu.device_count()})."
+            )
+
         if (
             isinstance(device, torch.device)
             and device.type == "xpu"

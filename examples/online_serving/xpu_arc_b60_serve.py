@@ -9,19 +9,25 @@ Launches a vLLM OpenAI-compatible server with:
   - Expert Parallelism (EP=true): MoE experts distributed across TP ranks
 
 Hardware: 4x Intel ARC B60 GPUs
+Default Model: /home/media/Hongbo/models/Qwen3.5-35B-A3B
+
+NOTE: This uses the multiprocessing backend which requires the XPU DP fix
+that skips ZE_AFFINITY_MASK and uses DP-adjusted local_rank offsets to avoid
+XCCL cross-affinity IPC failures. torchrun is NOT compatible with vllm serve.
+See PR #15 for details.
 
 Usage:
     # Start the server:
     bash examples/online_serving/xpu_arc_b60_serve.sh
 
     # Or with custom options:
-    bash examples/online_serving/xpu_arc_b60_serve.sh --max-model-len 2048
+    bash examples/online_serving/xpu_arc_b60_serve.sh --max-model-len 512
 
     # Query the server (in another terminal):
     curl http://localhost:8000/v1/completions \
         -H "Content-Type: application/json" \
         -d '{
-            "model": "ibm-research/PowerMoE-3b",
+            "model": "/home/media/Hongbo/models/Qwen3.5-35B-A3B",
             "prompt": "The future of AI is",
             "max_tokens": 64
         }'

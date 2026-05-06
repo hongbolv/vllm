@@ -15,191 +15,285 @@ Hardware Requirements:
   - Intel GPU driver installed
   - PyTorch with XPU support (torch >= 2.8 recommended for xccl backend)
 
-Usage:
-    python examples/offline_inference/xpu_arc_b60_dp_ep.py
+============================================================================
+Option A - multiprocessing (single-node, 4 XPUs: TP=2, DP=2, EP=True)
+============================================================================
 
-    # With custom model (must be a MoE model for EP):
-    python examples/offline_inference/xpu_arc_b60_dp_ep.py \
-        --model="ibm-research/PowerMoE-3b"
+Just run:
+  python examples/offline_inference/xpu_arc_b60_dp_ep.py
 
-    # Adjust max model length for memory constraints:
-    python examples/offline_inference/xpu_arc_b60_dp_ep.py \
-        --model="ibm-research/PowerMoE-3b" \
-        --max-model-len=1024
+The script spawns 2 child processes (dp_rank 0 and 1). Each child process
+runs vllm with tensor_parallel_size=2, which internally spawns 2 TP workers.
+Total GPU usage: 4 XPUs (2 DP groups x 2 TP workers each).
 
-Environment:
-    The script automatically sets ZE_AFFINITY_MASK for each DP rank to control
-    which Intel XPU devices are visible to each process. For 4 ARC B60 GPUs:
-      - DP rank 0 sees GPUs 0,1 (for TP=2)
-      - DP rank 1 sees GPUs 2,3 (for TP=2)
+NOTE: This mode requires the XPU DP fix that skips ZE_AFFINITY_MASK and uses
+DP-adjusted local_rank offsets. Without the fix, XCCL hangs due to cross-
+affinity IPC failures. See PR #15 for details.
+
+============================================================================
+Option B - torchrun (single-node, 4 XPUs: TP=2, DP=2, EP=True)
+============================================================================
+
+torchrun spawns 4 processes (WORLD_SIZE=4 = TP x DP = 2 x 2):
+
+  torchrun --nproc-per-node=4 \
+      examples/offline_inference/xpu_arc_b60_dp_ep.py --torchrun
+
+Process layout:
+  RANK 0: vllm dp_rank=0, tp_rank=0   (DP group 0, TP leader)
+  RANK 1: vllm dp_rank=0, tp_rank=1   (DP group 0, TP follower)
+  RANK 2: vllm dp_rank=1, tp_rank=0   (DP group 1, TP leader)
+  RANK 3: vllm dp_rank=1, tp_rank=1   (DP group 1, TP follower)
+
+Key rule: TP partners (same dp_rank) MUST process the SAME prompt subset.
+vllm dp_rank = RANK // tensor_parallel_size  (i.e. RANK // 2)
+
+NOTE: torchrun mode does NOT set ZE_AFFINITY_MASK, so all processes share
+a unified Level Zero device namespace and XCCL IPC works correctly.
+However, torchrun is NOT compatible with `vllm serve` (OpenAI API server).
 """
 
+import argparse
 import os
+import sys
+from multiprocessing import Process
 from time import sleep
 
-from vllm import LLM, EngineArgs, SamplingParams
-from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import get_open_port
+# ----- configuration --------------------------------------------------------
+MODEL_PATH = "/home/media/Hongbo/models/Qwen3.5-35B-A3B"
+TP_SIZE = 2
+DP_SIZE = 2
+MAX_MODEL_LEN = 256
+GPU_MEMORY_UTILIZATION = 0.95
+# Qwen3.5-35B-A3B is a ConditionalGeneration (multimodal) model.
+# For text-only inference, language_model_only=True is required.
+LANGUAGE_MODEL_ONLY = True
+# -----------------------------------------------------------------------------
 
 
-def create_parser():
-    parser = FlexibleArgumentParser(
-        description="Data Parallel + Expert Parallel on 4x Intel ARC B60"
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Qwen3.5-35B-A3B on 4x Intel ARC B60: TP=2, DP=2, EP=True"
     )
-
-    # Add all engine args
-    EngineArgs.add_cli_args(parser)
-    parser.set_defaults(
-        model="ibm-research/PowerMoE-3b",
-        tensor_parallel_size=2,
-        data_parallel_size=2,
-        enable_expert_parallel=True,
-        dtype="bfloat16",
-        distributed_executor_backend="mp",
-        # ARC B60 has limited memory; set a conservative default
-        max_model_len=1024,
-        # Use enforce_eager by default since XPU graph support is limited
-        enforce_eager=True,
+    parser.add_argument(
+        "--torchrun",
+        action="store_true",
+        help="Use torchrun launch mode (Option B)",
     )
-
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=MODEL_PATH,
+        help=f"Model name or path (default: {MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=TP_SIZE,
+        help=f"Tensor parallel size (default: {TP_SIZE})",
+    )
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=DP_SIZE,
+        help=f"Data parallel size (default: {DP_SIZE})",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=MAX_MODEL_LEN,
+        help=f"Maximum model length (default: {MAX_MODEL_LEN})",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=GPU_MEMORY_UTILIZATION,
+        help=f"GPU memory utilization (default: {GPU_MEMORY_UTILIZATION})",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=True,
+        help="Enforce eager mode (default: True)",
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        default=LANGUAGE_MODEL_ONLY,
+        help="Use language model only, skip multimodal components "
+        "(default: True for Qwen3.5-35B-A3B)",
+    )
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=600,
         help="Number of seconds before unresponsive process is killed.",
     )
+    return parser.parse_args()
 
-    return parser
+
+# ----- sample prompts --------------------------------------------------------
+PROMPTS = [
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
+    "The future of AI is",
+    "Explain quantum computing in simple terms:",
+    "What is the difference between machine learning and deep learning?",
+    "Write a short poem about the ocean:",
+    "Describe the process of photosynthesis:",
+]
 
 
-def main(
-    dp_size,
-    local_dp_rank,
-    global_dp_rank,
-    dp_master_ip,
-    dp_master_port,
-    engine_args,
-):
-    """Main function for each DP rank process."""
-    os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
-    os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
+# ----- Option A: multiprocessing worker -------------------------------------
+def run_dp_worker(dp_rank, dp_size, args):
+    """Worker function for Option A (multiprocessing launch)."""
+    os.environ["VLLM_DP_RANK"] = str(dp_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(dp_rank)
     os.environ["VLLM_DP_SIZE"] = str(dp_size)
-    os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
-    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+    os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
 
-    # Sample prompts for inference
-    prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-        "Intel ARC GPUs are designed for",
-        "Machine learning inference requires",
-        "The advantage of expert parallelism is",
-        "Data parallel processing allows",
-    ] * 10
+    from vllm import LLM, SamplingParams
 
-    # Distribute prompts across DP ranks
-    floor = len(prompts) // dp_size
-    remainder = len(prompts) % dp_size
-
-    def start(rank):
-        return rank * floor + min(rank, remainder)
-
-    prompts = prompts[start(global_dp_rank) : start(global_dp_rank + 1)]
-    if len(prompts) == 0:
-        prompts = ["Placeholder"]
+    # Split prompts across DP ranks
+    my_prompts = [p for i, p in enumerate(PROMPTS) if i % dp_size == dp_rank]
+    if not my_prompts:
+        my_prompts = ["Placeholder"]
 
     print(
-        f"[ARC B60] DP rank {global_dp_rank} processing "
-        f"{len(prompts)} prompts with TP=2, EP=true"
+        f"[ARC B60] DP rank {dp_rank} processing "
+        f"{len(my_prompts)} prompts with TP={args.tp_size}, EP=true"
     )
 
-    # Different sampling params per rank for demonstration
     sampling_params = SamplingParams(
         temperature=0.8,
         top_p=0.95,
-        max_tokens=[16, 32][global_dp_rank % 2],
+        max_tokens=64,
     )
 
-    # Create LLM engine - each DP rank uses 2 GPUs (TP=2)
-    llm = LLM(**engine_args)
-    outputs = llm.generate(prompts, sampling_params)
+    llm = LLM(
+        model=args.model,
+        tensor_parallel_size=args.tp_size,
+        enable_expert_parallel=True,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+        trust_remote_code=True,
+        language_model_only=args.language_model_only,
+        dtype="float16",
+        num_gpu_blocks_override=100,
+        disable_log_stats=True,
+    )
 
-    # Print sample outputs
-    for i, output in enumerate(outputs):
-        if i >= 3:
-            break
+    outputs = llm.generate(my_prompts, sampling_params)
+
+    for output in outputs:
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(
-            f"[ARC B60] DP rank {global_dp_rank}, "
+            f"[ARC B60] DP rank {dp_rank}, "
             f"Prompt: {prompt!r}, "
             f"Generated: {generated_text!r}"
         )
 
-    print(f"[ARC B60] DP rank {global_dp_rank} completed {len(outputs)} generations.")
+    print(f"[ARC B60] DP rank {dp_rank} completed {len(outputs)} generations.")
 
-    # Give engines time to pause their processing loops before exiting
     sleep(1)
 
 
-if __name__ == "__main__":
-    parser = create_parser()
-    args = vars(parser.parse_args())
+# ----- Option B: torchrun worker --------------------------------------------
+def run_torchrun(args):
+    """Worker function for Option B (torchrun launch)."""
+    from vllm import LLM, SamplingParams
 
-    # Extract DP-specific args
-    dp_size = args.pop("data_parallel_size")
-    timeout = args.pop("timeout")
-
-    # Remaining args are engine args
-    engine_args = args
-
-    dp_master_ip = "127.0.0.1"
-    dp_master_port = get_open_port()
-
-    print("=" * 60)
-    print("  vLLM on 4x Intel ARC B60 GPUs")
-    print(
-        f"  Configuration: TP={engine_args.get('tensor_parallel_size', 2)}, "
-        f"DP={dp_size}, EP=true"
+    llm = LLM(
+        model=args.model,
+        tensor_parallel_size=args.tp_size,
+        data_parallel_size=args.dp_size,
+        enable_expert_parallel=True,
+        distributed_executor_backend="external_launcher",
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+        trust_remote_code=True,
+        language_model_only=args.language_model_only,
+        dtype="float16",
+        num_gpu_blocks_override=100,
+        disable_log_stats=True,
     )
-    print(f"  Model: {engine_args.get('model', 'ibm-research/PowerMoE-3b')}")
-    print(f"  Backend: {engine_args.get('distributed_executor_backend', 'mp')}")
-    print("=" * 60)
 
-    from multiprocessing import Process
+    dp_rank = llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
+    dp_size = llm.llm_engine.vllm_config.parallel_config.data_parallel_size
 
-    procs = []
-    for local_dp_rank in range(dp_size):
-        global_dp_rank = local_dp_rank
-        proc = Process(
-            target=main,
-            args=(
-                dp_size,
-                local_dp_rank,
-                global_dp_rank,
-                dp_master_ip,
-                dp_master_port,
-                engine_args,
-            ),
+    # Split prompts across DP ranks
+    my_prompts = [p for i, p in enumerate(PROMPTS) if i % dp_size == dp_rank]
+    if not my_prompts:
+        my_prompts = ["Placeholder"]
+
+    print(f"[ARC B60] DP rank {dp_rank} processing {len(my_prompts)} prompts")
+
+    sampling_params = SamplingParams(
+        temperature=0.8,
+        top_p=0.95,
+        max_tokens=64,
+    )
+
+    outputs = llm.generate(my_prompts, sampling_params)
+
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(
+            f"[ARC B60] DP rank {dp_rank}, "
+            f"Prompt: {prompt!r}, "
+            f"Generated: {generated_text!r}"
         )
-        proc.start()
-        procs.append(proc)
 
-    exit_code = 0
-    for proc in procs:
-        proc.join(timeout=timeout)
-        if proc.exitcode is None:
-            print(f"Killing process {proc.pid} that didn't stop in time.")
-            proc.kill()
-            exit_code = 1
-        elif proc.exitcode:
-            exit_code = proc.exitcode
 
-    if exit_code == 0:
-        print("\n" + "=" * 60)
-        print("  All DP ranks completed successfully!")
-        print("=" * 60)
+# ----- main ------------------------------------------------------------------
+if __name__ == "__main__":
+    args = parse_args()
 
-    exit(exit_code)
+    if args.torchrun:
+        # Option B: torchrun launch
+        print("[Option B] torchrun mode")
+        run_torchrun(args)
+    else:
+        # Option A: multiprocessing launch
+        print(
+            f"[Option A] multiprocessing mode: DP={args.dp_size}, "
+            f"TP={args.tp_size}, EP=True"
+        )
+        print(f"  Model: {args.model}")
+
+        # Set shared master port for all DP workers
+        from vllm.utils.network_utils import get_open_port
+
+        master_port = str(get_open_port())
+        os.environ["VLLM_DP_MASTER_PORT"] = master_port
+
+        procs = []
+        for dp_rank in range(args.dp_size):
+            proc = Process(
+                target=run_dp_worker,
+                args=(dp_rank, args.dp_size, args),
+            )
+            proc.start()
+            procs.append(proc)
+
+        exit_code = 0
+        for proc in procs:
+            proc.join(timeout=args.timeout)
+            if proc.exitcode is None:
+                print(f"Killing process {proc.pid} (timed out after {args.timeout}s)")
+                proc.kill()
+                exit_code = 1
+            elif proc.exitcode:
+                exit_code = proc.exitcode
+
+        if exit_code == 0:
+            print("\n" + "=" * 60)
+            print("  All DP ranks completed successfully!")
+            print("=" * 60)
+
+        sys.exit(exit_code)

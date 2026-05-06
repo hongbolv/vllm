@@ -19,8 +19,8 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-ibm-research/PowerMoE-3b}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024}"
+MODEL="${MODEL:-/home/media/Hongbo/models/Qwen3.5-35B-A3B}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-256}"
 PORT="${PORT:-8000}"
 
 echo "============================================================"
@@ -29,14 +29,21 @@ echo "  Model: ${MODEL}"
 echo "  Config: TP=2, DP=2, EP=true"
 echo "  Port: ${PORT}"
 echo "============================================================"
+echo ""
+echo "  NOTE: This uses the multiprocessing backend which requires"
+echo "  the XPU DP fix (skip ZE_AFFINITY_MASK + DP local_rank"
+echo "  adjustment). See PR #15 for details."
+echo "============================================================"
 
 vllm serve "${MODEL}" \
     --tensor-parallel-size 2 \
     --data-parallel-size 2 \
     --enable-expert-parallel \
-    --dtype bfloat16 \
+    --dtype float16 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --distributed-executor-backend mp \
     --enforce-eager \
+    --trust-remote-code \
+    --gpu-memory-utilization 0.95 \
     --port "${PORT}" \
     "$@"
