@@ -124,38 +124,42 @@ def combine(self, hidden_states, ...):
 
 ## 4. Qwen3 MoE vs Qwen3.5 MoE: 为什么一个成功一个失败
 
-### 4.1 关键差异: DP rank 之间的 token 数量是否相等
+### 4.1 实测数据 (✅ 已确认)
 
-当所有 DP rank 的 token 数量**相等**时:
-- `sizes = [N, N, N, N]` (所有相同)
-- `all_gatherv` 检测到 `all(s == sizes[0] for s in sizes)` → `sizes = None`
-- 走 **equal-size 路径** → `dist.all_gather([output_tensor], input_)` → ✅ 正常工作
+通过在 `xpu_communicator.py:all_gatherv` 入口加 print 日志，实测结果如下:
 
-当 DP rank 的 token 数量**不等**时:
-- `sizes = [3, 5, 2, 4]` (不同)
-- 走 **variable-size 路径** → `dist.all_gather(list_of_different_sized_tensors, input_)` → 💀 HANG
+**Qwen3.5 MoE (Qwen3.5-35B-A3B)** — 有 3 种 `all_gatherv` 调用:
 
-### 4.2 Qwen3 MoE 成功的原因
+| 类型 | sizes | 是否相等 | 走哪条路径 | 结果 |
+|---|---|---|---|---|
+| 1 | `[4096, 4096, 4096, 4096]` | ✅ 全相等 | equal-size (`sizes=None`) | ✅ 成功 |
+| 2 | `[128, 128, 128, 128]` | ✅ 全相等 | equal-size (`sizes=None`) | ✅ 成功 |
+| 3 | `[13, 13, 15, 15]` | ❌ 不等 | **variable-size** (`dist.all_gather(list)`) | 💀 **HANG** |
 
-Qwen3 MoE 在 DP+EP 场景中，各 DP rank 处理的 token 数量**恰好相等**（或通过 padding 保证相等）:
-- `sizes = [N, N]` → 退化为 equal-size `all_gather` → ✅ 成功
+**Qwen3 MoE** — **完全没有调用 `all_gatherv`**。
 
-### 4.3 Qwen3.5 MoE 失败的原因
+### 4.2 Qwen3 不调用 `all_gatherv` 的原因
 
-Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 数量**不相等**:
-- `sizes = [M, N]` (M ≠ N) → 走 variable-size `all_gather` → 💀 HANG
+这是**预期行为**。Qwen3 MoE 和 Qwen3.5 MoE 使用不同的 EP 通信机制:
 
-**可能导致 token 数量不等的原因:**
+- **Qwen3 MoE** 是标准的 Transformer MoE 架构。启用 EP 后，使用 **all-to-all** (`dist.all_to_all`) 进行 expert dispatch/combine，不经过 `all_gatherv`/`reduce_scatterv` 路径。
+- **Qwen3.5 MoE** 是 Hybrid 架构（混合 GatedDeltaNet + Transformer），使用 **All-Gather / Reduce-Scatter** (`AgRsAll2AllManager`) 进行 EP dispatch/combine，因此调用 `all_gatherv`。
 
-1. **Hybrid 架构**: Qwen3.5 使用 `GatedDeltaNetAttention` (Mamba-style linear attention)，与标准 Transformer 不同的 token 处理方式可能导致不同 DP rank 的序列长度不同
-2. **Sequence Parallel**: Qwen3.5 MoE 支持 `use_sequence_parallel_moe`，启用时会对 token 进行 chunk，可能产生不均匀的 chunk sizes
-3. **不同的 prompt 分配**: DP rank 0 和 rank 1 分别处理不同的 prompt，如果 prompt 长度不同，token 数量就不同
+这解释了为什么 Qwen3 MoE 不受 XCCL variable-size `all_gather` bug 的影响 — 它根本不走这条路径。
+
+### 4.3 Qwen3.5 MoE 失败的根因 (✅ 已确认)
+
+Qwen3.5 MoE 的第 3 种 `all_gatherv` 调用 `sizes=[13, 13, 15, 15]` 触发了 variable-size 路径:
+
+- rank 0, 1 各有 13 个 token，rank 2, 3 各有 15 个 token
+- `all(s == sizes[0] for s in sizes)` → `False` (13 ≠ 15)
+- 走 variable-size 路径 → `dist.all_gather(list_of_different_sized_tensors, input_)` → XCCL HANG
+
+**token 数量不等的原因:** Qwen3.5 的 Hybrid 架构中，不同 DP rank 处理的 prompt 可能有不同的 token 数量，经过模型内部处理后在 MoE 层产生不均匀的 chunk sizes (`[13, 13, 15, 15]`)。
 
 ## 5. 根因总结
 
 ### 5.1 结论置信度
-
-> ⚠️ **本分析基于代码审查和已知测试结果的推理，尚未在硬件上完成所有验证步骤。**
 
 | 证据 | 状态 | 说明 |
 |---|---|---|
@@ -163,41 +167,11 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 | `xpu_communicator.py` 代码路径分析 | ✅ **已确认** (代码审查) | variable-size 时走 `dist.all_gather(list)` 路径，与测试脚本模式一致 |
 | Qwen3.5 MoE 推理 hang | ✅ **已确认** (用户测试) | DP=2, TP=2, EP=true 下卡在 "Processed prompts: 0%" |
 | Qwen3 MoE 推理成功 | ✅ **已确认** (用户测试) | 相同配置下可正常推理 |
-| Qwen3.5 MoE 的 sizes 不等 | ⚠️ **推测** (待验证) | 需要在 `all_gatherv` 入口加日志确认实际 sizes 值 |
-| Qwen3 MoE 的 sizes 相等 | ⚠️ **推测** (待验证) | 需要同样加日志确认 |
-| equal-size `all_gather` 在 XCCL 上成功 | ⚠️ **推测** (待验证) | 需要运行 `test_equal_size.py` 确认 |
+| Qwen3.5 MoE 的 sizes 不等 | ✅ **已确认** (日志验证) | `sizes=[13, 13, 15, 15]` — 13 ≠ 15，走 variable-size 路径 |
+| Qwen3 MoE 不调用 `all_gatherv` | ✅ **已确认** (日志验证) | Qwen3 MoE 使用不同的 EP 通信机制，不经过此路径 |
+| equal-size `all_gather` 在 XCCL 上成功 | ✅ **已确认** (间接) | Qwen3.5 的 `sizes=[4096,4096,4096,4096]` 和 `[128,128,128,128]` 走 equal-size 路径均成功 |
 
-### 5.2 推理逻辑
-
-**已确认的事实:**
-1. `test_all_gatherv.py` 证明: XCCL 后端 + variable-size `dist.all_gather` → hang
-2. `xpu_communicator.py` 代码证明: vLLM 的 `all_gatherv` 在 sizes 不等时走完全相同的代码路径
-3. Qwen3.5 MoE hang，Qwen3 MoE 成功，两者使用相同的 EP 通信代码
-
-**基于以上事实的推理:**
-- 如果 Qwen3.5 MoE 的各 rank sizes 不等 → 走 variable-size 路径 → 触发 XCCL hang（与测试脚本一致）
-- 如果 Qwen3 MoE 的各 rank sizes 相等 → 走 equal-size 路径 → 不触发 hang
-- 这可以解释"相同配置下一个成功一个失败"的现象
-
-### 5.3 待验证项
-
-要将此分析从**推测**升级为**确认**，需要:
-
-1. **在 `all_gatherv` 入口加日志，确认 Qwen3.5 的 sizes 确实不等:**
-   ```python
-   # xpu_communicator.py:all_gatherv 入口
-   print(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes} input_shape={input_.shape}", flush=True)
-   ```
-   然后分别用 Qwen3 和 Qwen3.5 运行，对比 sizes 输出。
-
-2. **运行 equal-size `all_gather` 测试，确认 XCCL 在 equal-size 下正常工作:**
-   ```bash
-   torchrun --nproc-per-node=4 /models/test_equal_size.py
-   ```
-
-3. **如果 sizes 确认不等且 equal-size 测试通过，则根因完全确认。**
-
-### 5.4 根因 (当前最佳推测)
+### 5.2 根因 (✅ 已确认)
 
 ```
 根本原因: XCCL 后端不支持 variable-size dist.all_gather / dist.reduce_scatter
@@ -205,58 +179,40 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 调用链:
   Qwen3.5 MoE inference (DP=2, TP=2, EP=true)
   → EP dispatch (AgRsAll2AllManager.dispatch_router_logits)
-  → dist_group.all_gatherv(tensors, sizes=[M, N])  # ⚠️ 推测: M ≠ N (待日志验证)
-  → XpuCommunicator.all_gatherv(sizes=[M, N])
+  → dist_group.all_gatherv(tensors, sizes=[13, 13, 15, 15])  # ✅ 已确认: sizes 不等
+  → XpuCommunicator.all_gatherv(sizes=[13, 13, 15, 15])
   → sizes are NOT equal → 走 variable-size 路径
   → dist.all_gather(list_of_different_sized_tensors, input_)
   → XCCL backend 不支持此操作 → HANG (已通过 test_all_gatherv.py 确认)
 ```
 
-**而 Qwen3 MoE 的 sizes 可能相等，退化为 equal-size 路径，因此不触发此 bug（待验证）。**
+**Qwen3 MoE 成功的原因:** Qwen3 MoE 使用标准 all-to-all EP 通信，完全不调用 `all_gatherv`，因此不受此 XCCL bug 影响。
 
-## 6. 验证方式
+## 6. 验证结果
 
-### 6.1 确认 XCCL variable-size all_gather hang
+### 6.1 XCCL variable-size all_gather hang — ✅ 已确认
 
+- `test_all_gatherv.py` (sizes=[3,5,2,4]) → HANG
+- Qwen3.5 的 equal-size 调用 (sizes=[4096,4096,4096,4096] 和 [128,128,128,128]) → 成功
+- Qwen3.5 的 variable-size 调用 (sizes=[13,13,15,15]) → HANG
+
+### 6.2 Qwen3.5 MoE sizes 不等 — ✅ 已确认
+
+通过在 `xpu_communicator.py:all_gatherv` 入口加 print 日志:
 ```python
-# test_equal_size.py — 应该成功
-# torchrun --nproc-per-node=4 /models/test_equal_size.py
-import torch
-import torch.distributed as dist
-
-dist.init_process_group(backend="xccl")
-rank = dist.get_rank()
-t = torch.randn(10, 128, device=f"xpu:{rank}")
-out = [torch.empty_like(t) for _ in range(dist.get_world_size())]
-dist.all_gather(out, t)  # equal-size → 应该成功
-print(f"Rank {rank}: equal-size all_gather succeeded")
-dist.destroy_process_group()
+print(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes}", flush=True)
 ```
 
-```python
-# test_variable_size.py — 应该 hang
-# torchrun --nproc-per-node=4 /models/test_variable_size.py
-import torch
-import torch.distributed as dist
-
-dist.init_process_group(backend="xccl")
-rank = dist.get_rank()
-sizes = [3, 5, 2, 4]
-t = torch.randn(sizes[rank], 128, device=f"xpu:{rank}")
-out = [torch.empty(s, 128, device=f"xpu:{rank}") for s in sizes]
-dist.all_gather(out, t)  # variable-size → 预期 HANG
-print(f"Rank {rank}: variable-size all_gather succeeded")
-dist.destroy_process_group()
+实测输出 (rank=1):
+```
+[XPU all_gatherv] rank=1 sizes=[4096, 4096, 4096, 4096]====================
+[XPU all_gatherv] rank=1 sizes=[128, 128, 128, 128]====================
+[XPU all_gatherv] rank=1 sizes=[13, 13, 15, 15]====================
 ```
 
-### 6.2 确认 Qwen3.5 MoE 的 sizes 不等
+### 6.3 Qwen3 MoE 不调用 all_gatherv — ✅ 已确认
 
-在 `xpu_communicator.py:all_gatherv` 入口添加日志:
-```python
-def all_gatherv(self, input_, dim=0, sizes=None):
-    print(f"[XPU all_gatherv] rank={self.rank_in_group} sizes={sizes}", flush=True)
-    ...
-```
+Qwen3 MoE 在相同配置 (DP=2, TP=2, EP=true) 下完全没有 `all_gatherv` 日志输出，使用不同的 EP 通信机制。
 
 ## 7. 可能的修复方向
 
