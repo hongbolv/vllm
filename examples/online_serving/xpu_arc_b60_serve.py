@@ -1,23 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Example: Online serving with vLLM on 4x Intel ARC B60 GPUs.
+Example: Online serving with vLLM on Intel ARC B60 GPUs.
 
 Launches a vLLM OpenAI-compatible server with:
   - Tensor Parallelism (TP=2): model split across 2 GPUs per replica
-  - Data Parallelism (DP=2): 2 replicas for higher throughput
   - Expert Parallelism (EP=true): MoE experts distributed across TP ranks
 
-Hardware: 4x Intel ARC B60 GPUs
+Hardware: 4x Intel ARC B60 GPUs (TP=2 uses 2 GPUs)
 Default Model: /home/media/Hongbo/models/Qwen3.5-35B-A3B
 
-NOTE: This uses the multiprocessing backend which requires the XPU DP fix
-that skips ZE_AFFINITY_MASK and uses DP-adjusted local_rank offsets to avoid
-XCCL cross-affinity IPC failures. torchrun is NOT compatible with vllm serve.
-See PR #15 for details.
+NOTE: DP>1 with `vllm serve` on XPU is not yet supported due to XCCL
+cross-ZE_AFFINITY_MASK IPC failures (see PR #15). For DP>1 offline
+inference, use torchrun with the offline script instead.
 
 Usage:
-    # Start the server:
+    # Start the server (TP=2, DP=1):
     bash examples/online_serving/xpu_arc_b60_serve.sh
 
     # Or with custom options:

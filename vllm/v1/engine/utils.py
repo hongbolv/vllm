@@ -146,10 +146,7 @@ class CoreEngineProcManager:
                     contextlib.nullcontext()
                 )
                 if is_dp and (
-                    (
-                        not current_platform.is_cuda_alike()
-                        and not current_platform.is_xpu()
-                    )
+                    not current_platform.is_cuda_alike()
                     or vllm_config.parallel_config.use_ray
                 ):
                     device_control_context = set_device_control_env_var(

@@ -3,7 +3,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Launch vLLM OpenAI-compatible server on 4x Intel ARC B60 GPUs
-# Configuration: TP=2, DP=2, EP=true
+# Configuration: TP=2, DP=1, EP=true (TP-only for serving)
+#
+# NOTE: DP>1 with the multiprocessing backend on XPU is not yet supported
+# due to XCCL cross-ZE_AFFINITY_MASK IPC failures (see PR #15).
+# For DP>1 offline inference, use torchrun with the offline script instead:
+#   torchrun --nproc-per-node=4 examples/offline_inference/xpu_arc_b60_dp_ep.py
 #
 # Prerequisites:
 #   - 4x Intel ARC B60 GPUs with drivers installed
@@ -14,7 +19,7 @@
 #
 # Usage:
 #   bash examples/online_serving/xpu_arc_b60_serve.sh
-#   bash examples/online_serving/xpu_arc_b60_serve.sh --max-model-len 2048
+#   bash examples/online_serving/xpu_arc_b60_serve.sh --max-model-len 512
 #   bash examples/online_serving/xpu_arc_b60_serve.sh --model "your-moe-model"
 
 set -euo pipefail
@@ -26,18 +31,12 @@ PORT="${PORT:-8000}"
 echo "============================================================"
 echo "  vLLM Server on 4x Intel ARC B60 GPUs"
 echo "  Model: ${MODEL}"
-echo "  Config: TP=2, DP=2, EP=true"
+echo "  Config: TP=2, DP=1, EP=true"
 echo "  Port: ${PORT}"
-echo "============================================================"
-echo ""
-echo "  NOTE: This uses the multiprocessing backend which requires"
-echo "  the XPU DP fix (skip ZE_AFFINITY_MASK + DP local_rank"
-echo "  adjustment). See PR #15 for details."
 echo "============================================================"
 
 vllm serve "${MODEL}" \
     --tensor-parallel-size 2 \
-    --data-parallel-size 2 \
     --enable-expert-parallel \
     --dtype float16 \
     --max-model-len "${MAX_MODEL_LEN}" \

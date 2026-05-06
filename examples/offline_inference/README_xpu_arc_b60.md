@@ -25,26 +25,24 @@ using the Qwen3.5-35B-A3B model.
     └── TP Rank 1 (GPU 3) ─── Experts [2, 3, ...]
 ```
 
-## Known Limitation: XPU DP>1 XCCL Cross-Affinity IPC Failure
+## Known Limitation: XPU DP>1 with Multiprocessing Backend
 
-When `DP > 1` on XPU, the standard multiprocessing launch path sets different
-`ZE_AFFINITY_MASK` values for each DP group (e.g., `0,1` for DP rank 0 and
-`2,3` for DP rank 1). This creates isolated Level Zero device namespaces.
-XCCL's IPC mechanism uses `zeMemGetIpcHandle()` / `zeMemOpenIpcHandle()` for
-cross-process GPU memory sharing, but the IPC handles contain device indices
-that are **local to each process's ZE_AFFINITY_MASK namespace**. This causes
-GPU memory address mismatches and allreduce ring deadlocks.
+When `DP > 1` on XPU using the multiprocessing backend (`--distributed-executor-backend mp`),
+vLLM sets different `ZE_AFFINITY_MASK` values for each DP group (e.g., `0,1` for DP rank 0
+and `2,3` for DP rank 1). This creates isolated Level Zero device namespaces. XCCL's IPC
+mechanism uses `zeMemGetIpcHandle()` / `zeMemOpenIpcHandle()` for cross-process GPU memory
+sharing, but the IPC handles contain device indices that are **local to each process's
+ZE_AFFINITY_MASK namespace**. This causes GPU memory address mismatches and allreduce ring
+deadlocks.
 
-**Fix applied in this branch:**
-1. `vllm/v1/engine/utils.py`: Skips `ZE_AFFINITY_MASK` for XPU platform, so
-   all processes share a unified Level Zero device namespace.
-2. `vllm/v1/worker/xpu_worker.py`: Adds DP `local_rank` adjustment — when
-   `data_parallel_size > 1`, computes effective local_rank as
-   `local_rank + dp_local_rank * tp_pp_world_size` to bind each worker to
-   the correct physical GPU.
+**Workaround:** Use `torchrun` with `distributed_executor_backend="external_launcher"` for
+DP>1 offline inference. torchrun does NOT set `ZE_AFFINITY_MASK`, so all processes share a
+unified Level Zero device namespace and XCCL IPC works correctly.
 
-See [PR #15](https://github.com/hongbolv/vllm/pull/15) for the full root cause
-analysis and debug details.
+**Limitation:** `vllm serve` (OpenAI API server) uses the multiprocessing backend internally
+and is therefore limited to DP=1 on XPU until the cross-affinity IPC issue is resolved.
+
+See [PR #15](https://github.com/hongbolv/vllm/pull/15) for the full root cause analysis.
 
 ## Prerequisites
 
@@ -85,31 +83,32 @@ is required.
 
 ## Usage
 
-### Option A: Multiprocessing Launch (Recommended for `vllm serve`)
+### Offline Inference with DP=2 (torchrun)
 
 ```bash
-# Offline inference
-python examples/offline_inference/xpu_arc_b60_dp_ep.py
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py
+```
 
-# With custom model path:
-python examples/offline_inference/xpu_arc_b60_dp_ep.py \
+With custom model path:
+```bash
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py \
     --model="/home/media/Hongbo/models/Qwen3.5-35B-A3B" \
     --max-model-len=256
 ```
 
-### Option B: torchrun Launch (For Python API scripts only)
-
-```bash
-torchrun --nproc-per-node=4 \
-    examples/offline_inference/xpu_arc_b60_dp_ep.py --torchrun
+Process layout (WORLD_SIZE=4 = TP × DP = 2 × 2):
+```
+RANK 0: vllm dp_rank=0, tp_rank=0   (DP group 0, TP leader)
+RANK 1: vllm dp_rank=0, tp_rank=1   (DP group 0, TP follower)
+RANK 2: vllm dp_rank=1, tp_rank=0   (DP group 1, TP leader)
+RANK 3: vllm dp_rank=1, tp_rank=1   (DP group 1, TP follower)
 ```
 
-**Note:** torchrun mode does NOT set `ZE_AFFINITY_MASK`, so all processes share
-a unified Level Zero device namespace and XCCL IPC works without the fix.
-However, torchrun is **NOT compatible with `vllm serve`** (OpenAI API server)
-because `vllm serve` internally manages DP processes via `CoreEngineProcManager`.
+### Online Serving (API Server, TP=2 only)
 
-### Online Serving (API Server)
+Due to the XPU DP limitation, `vllm serve` currently runs with TP=2, DP=1:
 
 ```bash
 bash examples/online_serving/xpu_arc_b60_serve.sh
@@ -131,7 +130,6 @@ curl http://localhost:8000/v1/completions \
 ```bash
 vllm serve /home/media/Hongbo/models/Qwen3.5-35B-A3B \
     --tensor-parallel-size 2 \
-    --data-parallel-size 2 \
     --enable-expert-parallel \
     --dtype float16 \
     --max-model-len 256 \
@@ -148,19 +146,19 @@ Splits the model's weight tensors across 2 GPUs. Each GPU holds half of each
 layer's parameters and performs partial computation, then communicates results
 via all-reduce operations using the xccl backend.
 
-### `--data-parallel-size 2` (DP=2)
+### `--data-parallel-size 2` (DP=2, torchrun only)
 Creates 2 independent model replicas. Each replica processes different requests
-concurrently, effectively doubling throughput.
+concurrently, effectively doubling throughput. Only available with torchrun
+launch for offline inference.
 
 ### `--enable-expert-parallel` (EP=true)
 For Mixture-of-Experts (MoE) models, distributes experts across the TP group
 instead of replicating them. With TP=2 and a model having N experts, each GPU
 holds N/2 experts, reducing memory per GPU.
 
-### `--distributed-executor-backend mp`
-Uses Python multiprocessing for launching workers. Required for `vllm serve`
-on XPU. The XPU DP fix ensures this works correctly by skipping
-`ZE_AFFINITY_MASK` and using DP-adjusted local_rank offsets.
+### `--distributed-executor-backend external_launcher`
+Used with torchrun for DP>1 on XPU. torchrun manages process spawning and
+sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE` environment variables.
 
 ### `--enforce-eager`
 Disables graph compilation. Recommended for Intel ARC B60 since XPU graph
@@ -189,16 +187,9 @@ python -c "import torch; print(torch.xpu.device_count())"
 ### Out of Memory
 Reduce `--max-model-len` or `--gpu-memory-utilization`:
 ```bash
-python examples/offline_inference/xpu_arc_b60_dp_ep.py --max-model-len=128
+torchrun --nproc-per-node=4 \
+    examples/offline_inference/xpu_arc_b60_dp_ep.py --max-model-len=128
 ```
-
-### DP>1 Hangs (allreduce deadlock)
-This is the XCCL cross-`ZE_AFFINITY_MASK` IPC issue. Ensure the fix from
-PR #15 is applied:
-1. `vllm/v1/engine/utils.py` must skip `ZE_AFFINITY_MASK` for XPU
-2. `vllm/v1/worker/xpu_worker.py` must adjust local_rank for DP
-
-Or use torchrun (Option B) as a workaround for Python API scripts.
 
 ### Communication Errors
 Ensure xccl backend is available:
