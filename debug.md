@@ -206,7 +206,7 @@ Qwen3.5 MoE (Qwen3.5-35B-A3B) 在 DP+EP 场景中，各 DP rank 处理的 token 
 调用链:
   Qwen3.5 MoE inference (DP=2, TP=2, EP=true)
   → EP dispatch (AgRsAll2AllManager.dispatch_router_logits)
-  → dist_group.all_gatherv(tensors, sizes=[M, N])  # M ≠ N (推测)
+  → dist_group.all_gatherv(tensors, sizes=[M, N])  # ⚠️ 推测: M ≠ N (待日志验证)
   → XpuCommunicator.all_gatherv(sizes=[M, N])
   → sizes are NOT equal → 走 variable-size 路径
   → dist.all_gather(list_of_different_sized_tensors, input_)
