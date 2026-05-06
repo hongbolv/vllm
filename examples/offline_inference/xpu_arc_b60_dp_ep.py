@@ -44,7 +44,7 @@ cross-affinity IPC failure that occurs with the multiprocessing launch path
 import argparse
 
 # ----- configuration --------------------------------------------------------
-MODEL_PATH = "/home/media/Hongbo/models/Qwen3.5-35B-A3B"
+MODEL_PATH = "/models/Qwen3.5-35B-A3B"
 TP_SIZE = 2
 DP_SIZE = 2
 MAX_MODEL_LEN = 256

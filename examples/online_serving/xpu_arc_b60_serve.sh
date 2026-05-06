@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-/home/media/Hongbo/models/Qwen3.5-35B-A3B}"
+MODEL="${MODEL:-/models/Qwen3.5-35B-A3B}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-256}"
 PORT="${PORT:-8000}"
 

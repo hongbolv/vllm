@@ -8,7 +8,7 @@ Launches a vLLM OpenAI-compatible server with:
   - Expert Parallelism (EP=true): MoE experts distributed across TP ranks
 
 Hardware: 4x Intel ARC B60 GPUs (TP=2 uses 2 GPUs)
-Default Model: /home/media/Hongbo/models/Qwen3.5-35B-A3B
+Default Model: /models/Qwen3.5-35B-A3B
 
 NOTE: DP>1 with `vllm serve` on XPU is not yet supported due to XCCL
 cross-ZE_AFFINITY_MASK IPC failures (see PR #15). For DP>1 offline
@@ -25,7 +25,7 @@ Usage:
     curl http://localhost:8000/v1/completions \
         -H "Content-Type: application/json" \
         -d '{
-            "model": "/home/media/Hongbo/models/Qwen3.5-35B-A3B",
+            "model": "/models/Qwen3.5-35B-A3B",
             "prompt": "The future of AI is",
             "max_tokens": 64
         }'

@@ -79,7 +79,7 @@ VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e . -v
 
 ### Model
 
-The default model path is `/home/media/Hongbo/models/Qwen3.5-35B-A3B`.
+The default model path is `/models/Qwen3.5-35B-A3B`.
 Qwen3.5-35B-A3B is a Mixture-of-Experts model with ~35B total parameters
 and ~3B active parameters per token. It is a ConditionalGeneration
 (multimodal) model; for text-only inference, `language_model_only=True`
@@ -98,7 +98,7 @@ With custom model path:
 ```bash
 torchrun --nproc-per-node=4 \
     examples/offline_inference/xpu_arc_b60_dp_ep.py \
-    --model="/home/media/Hongbo/models/Qwen3.5-35B-A3B" \
+    --model="/models/Qwen3.5-35B-A3B" \
     --max-model-len=256
 ```
 
@@ -123,7 +123,7 @@ Query the server:
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "/home/media/Hongbo/models/Qwen3.5-35B-A3B",
+        "model": "/models/Qwen3.5-35B-A3B",
         "prompt": "The future of AI is",
         "max_tokens": 64
     }'
