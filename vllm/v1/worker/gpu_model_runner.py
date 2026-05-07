@@ -4420,11 +4420,16 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
+        print(f"[TRACE dp={_dp}] sample_tokens: ModelRunnerOutput built, "
+              f"use_async={self.use_async_scheduling}", flush=True)
+
         if not self.use_async_scheduling:
             print(f"[TRACE dp={_dp}] sample_tokens: returning output (sync)",
                   flush=True)
             return output
 
+        print(f"[TRACE dp={_dp}] sample_tokens: ENTER AsyncGPUModelRunnerOutput",
+              flush=True)
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
@@ -4436,6 +4441,8 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
             )
+        print(f"[TRACE dp={_dp}] sample_tokens: EXIT AsyncGPUModelRunnerOutput",
+              flush=True)
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
@@ -4446,6 +4453,8 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        print(f"[TRACE dp={_dp}] sample_tokens: returning output (async)",
+              flush=True)
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
