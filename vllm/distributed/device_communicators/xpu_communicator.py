@@ -73,6 +73,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        import sys
         world_size = self.world_size
 
         if dim < 0:
@@ -100,11 +101,37 @@ class XpuCommunicator(DeviceCommunicatorBase):
             # Use all_reduce + slice as a workaround: all_reduce the full
             # concatenated tensor so every rank holds the reduced result,
             # then each rank extracts its own variable-size slice.
+            print(
+                f"[XPU reduce_scatterv] rank={self.rank_in_group} "
+                f"BEFORE all_reduce (variable-size) sizes={sizes} "
+                f"input_tensor.shape={input_tensor.shape}",
+                flush=True,
+                file=sys.stderr,
+            )
             dist.all_reduce(input_tensor, group=self.device_group)
+            print(
+                f"[XPU reduce_scatterv] rank={self.rank_in_group} "
+                f"AFTER all_reduce (variable-size)",
+                flush=True,
+                file=sys.stderr,
+            )
             offset = sum(sizes[: self.rank_in_group])
             output.copy_(input_tensor[offset : offset + chunk_size])
         else:
+            print(
+                f"[XPU reduce_scatterv] rank={self.rank_in_group} "
+                f"BEFORE reduce_scatter_tensor (equal-size) "
+                f"input_tensor.shape={input_tensor.shape}",
+                flush=True,
+                file=sys.stderr,
+            )
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+            print(
+                f"[XPU reduce_scatterv] rank={self.rank_in_group} "
+                f"AFTER reduce_scatter_tensor (equal-size)",
+                flush=True,
+                file=sys.stderr,
+            )
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
@@ -114,6 +141,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        import sys
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
@@ -122,6 +150,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
+
+        print(
+            f"[XPU all_gatherv] rank={self.rank_in_group} ENTER "
+            f"sizes={sizes} "
+            f"input_type={'list' if isinstance(input_, list) else 'tensor'} "
+            f"input_shape={[x.shape for x in input_] if isinstance(input_, list) else input_.shape}",
+            flush=True,
+            file=sys.stderr,
+        )
 
         def _all_gather_single(input_: torch.Tensor, sizes: list[int] | None = None):
             input_size = input_.size()
@@ -155,11 +192,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     dtype=input_.dtype,
                     device=input_.device,
                 )
-                import sys
                 print(
                     f"[XPU all_gatherv] rank={self.rank_in_group} "
-                    f"BEFORE all_gather_into_tensor sizes={sizes} "
-                    f"max_size={max_size}",
+                    f"BEFORE all_gather_into_tensor (variable-size) "
+                    f"sizes={sizes} max_size={max_size} "
+                    f"padded.shape={padded.shape} gathered.shape={gathered.shape}",
                     flush=True,
                     file=sys.stderr,
                 )
@@ -168,7 +205,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 )
                 print(
                     f"[XPU all_gatherv] rank={self.rank_in_group} "
-                    f"AFTER  all_gather_into_tensor",
+                    f"AFTER all_gather_into_tensor (variable-size)",
                     flush=True,
                     file=sys.stderr,
                 )
@@ -179,15 +216,45 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 ]
                 output_tensor = torch.cat(chunks, dim=0)
             else:
-                dist.all_gather([output_tensor], input_, group=self.device_group)
+                # Equal-size path: use all_gather_into_tensor (XCCL supported)
+                # instead of dist.all_gather(list, ...) which may hang on XCCL.
+                print(
+                    f"[XPU all_gatherv] rank={self.rank_in_group} "
+                    f"BEFORE all_gather_into_tensor (equal-size) "
+                    f"input_.shape={input_.shape} output_tensor.shape={output_tensor.shape}",
+                    flush=True,
+                    file=sys.stderr,
+                )
+                dist.all_gather_into_tensor(
+                    output_tensor, input_, group=self.device_group
+                )
+                print(
+                    f"[XPU all_gatherv] rank={self.rank_in_group} "
+                    f"AFTER all_gather_into_tensor (equal-size)",
+                    flush=True,
+                    file=sys.stderr,
+                )
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
-            return _all_gather_single(input_, sizes)
+            result = _all_gather_single(input_, sizes)
+            print(
+                f"[XPU all_gatherv] rank={self.rank_in_group} EXIT "
+                f"output.shape={result.shape}",
+                flush=True,
+                file=sys.stderr,
+            )
+            return result
 
         output_list = []
         for inp in input_:
             output_list.append(_all_gather_single(inp, sizes=sizes))
+        print(
+            f"[XPU all_gatherv] rank={self.rank_in_group} EXIT "
+            f"output_list len={len(output_list)}",
+            flush=True,
+            file=sys.stderr,
+        )
         return output_list
 
     def gather(
