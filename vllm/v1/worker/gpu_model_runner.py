@@ -4217,6 +4217,8 @@ class GPUModelRunner(
             output.kv_connector_output = kv_connector_output
             return output
 
+        print("[TRACE] sample_tokens: ENTER", flush=True)
+
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -4239,8 +4241,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        print("[TRACE] sample_tokens: ENTER _sample", flush=True)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        print("[TRACE] sample_tokens: EXIT _sample", flush=True)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4351,6 +4355,7 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        print("[TRACE] sample_tokens: ENTER bookkeeping", flush=True)
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4367,6 +4372,8 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        print("[TRACE] sample_tokens: EXIT bookkeeping", flush=True)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4386,6 +4393,8 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        print("[TRACE] sample_tokens: building ModelRunnerOutput",
+              flush=True)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4409,6 +4418,8 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            print("[TRACE] sample_tokens: returning output (sync)",
+                  flush=True)
             return output
 
         with record_function_or_nullcontext(
