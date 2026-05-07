@@ -96,32 +96,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
-            # XCCL hangs on variable-size dist.reduce_scatter, so we
-            # pad each chunk to the max size, use uniform
-            # reduce_scatter_tensor, and slice the result.
-            max_size = max(sizes)
-            input_splits = input_tensor.split(sizes, dim=0)
-            padded_chunks = []
-            for split in input_splits:
-                if split.shape[0] < max_size:
-                    pad = torch.zeros(
-                        (max_size - split.shape[0],) + split.shape[1:],
-                        dtype=split.dtype,
-                        device=split.device,
-                    )
-                    padded_chunks.append(torch.cat([split, pad], dim=0))
-                else:
-                    padded_chunks.append(split)
-            padded_input = torch.cat(padded_chunks, dim=0)
-            padded_output = torch.empty(
-                (max_size,) + input_tensor.shape[1:],
-                dtype=input_tensor.dtype,
-                device=input_tensor.device,
-            )
-            dist.reduce_scatter_tensor(
-                padded_output, padded_input, group=self.device_group
-            )
-            output = padded_output[:chunk_size]
+            # if inputs shape in different ranks is not the same using reduce_scatter
+            input_splits = list(input_tensor.split(sizes, dim=0))
+            dist.reduce_scatter(output, input_splits, group=self.device_group)
         else:
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
         # Reshape before returning
@@ -158,31 +135,17 @@ class XpuCommunicator(DeviceCommunicatorBase):
             )
 
             if sizes is not None:
-                # XCCL hangs on variable-size dist.all_gather, so we
-                # pad input to the max size, use uniform
-                # all_gather_into_tensor, and slice each rank's result.
-                max_size = max(sizes)
-                if input_.shape[0] < max_size:
-                    pad = torch.zeros(
-                        (max_size - input_.shape[0],) + input_.shape[1:],
-                        dtype=input_.dtype,
-                        device=input_.device,
+                all_gather_list = []
+                for size in sizes:
+                    all_gather_list.append(
+                        torch.empty(
+                            (size,) + input_.shape[1:],
+                            dtype=input_.dtype,
+                            device=input_.device,
+                        )
                     )
-                    padded_input = torch.cat([input_, pad], dim=0)
-                else:
-                    padded_input = input_
-                padded_output = torch.empty(
-                    (max_size * world_size,) + input_.shape[1:],
-                    dtype=input_.dtype,
-                    device=input_.device,
-                )
-                dist.all_gather_into_tensor(
-                    padded_output, padded_input, group=self.device_group
-                )
-                chunks = padded_output.split(max_size, dim=0)
-                output_tensor = torch.cat(
-                    [chunks[i][: sizes[i]] for i in range(world_size)], dim=0
-                )
+                dist.all_gather(all_gather_list, input_, group=self.device_group)
+                output_tensor = torch.cat(all_gather_list, dim=0)
             else:
                 dist.all_gather([output_tensor], input_, group=self.device_group)
             return output_tensor
