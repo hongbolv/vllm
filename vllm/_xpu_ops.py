@@ -121,6 +121,12 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    print(f"[TRACE] _gdn_attention_core_xpu_impl: "
+          f"core_attn_out.size(0)={core_attn_out.size(0)}, "
+          f"num_actual_tokens={attn_metadata.num_actual_tokens}, "
+          f"match={core_attn_out.size(0) == attn_metadata.num_actual_tokens}",
+          flush=True)
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
