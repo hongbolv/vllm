@@ -140,22 +140,30 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
             if sizes is not None:
                 # XCCL does not support variable-size dist.all_gather.
-                # Use N sequential broadcasts as a workaround: each rank
-                # broadcasts its own slice to all other ranks.  The total
-                # data transferred is identical to all_gather; only latency
-                # increases linearly with world_size (O(N) rounds vs O(1)).
-                all_gather_list = []
-                for root, size in enumerate(sizes):
-                    buf = torch.empty(
-                        (size,) + input_.shape[1:],
-                        dtype=input_.dtype,
-                        device=input_.device,
-                    )
-                    if root == self.rank_in_group:
-                        buf.copy_(input_)
-                    dist.broadcast(buf, src=root, group=self.device_group)
-                    all_gather_list.append(buf)
-                output_tensor = torch.cat(all_gather_list, dim=0)
+                # Workaround: pad this rank's input to max(sizes), perform an
+                # equal-size all_gather_into_tensor (which XCCL supports), then
+                # strip the padding from each rank's slice.
+                max_size = max(sizes)
+                padded = torch.zeros(
+                    (max_size,) + input_.shape[1:],
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                padded[: sizes[self.rank_in_group]].copy_(input_)
+                gathered = torch.empty(
+                    (world_size * max_size,) + input_.shape[1:],
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered, padded, group=self.device_group
+                )
+                # Extract each rank's real (unpadded) rows.
+                chunks = [
+                    gathered[r * max_size : r * max_size + size]
+                    for r, size in enumerate(sizes)
+                ]
+                output_tensor = torch.cat(chunks, dim=0)
             else:
                 dist.all_gather([output_tensor], input_, group=self.device_group)
             return output_tensor
