@@ -127,6 +127,8 @@ def _gdn_attention_core_xpu_impl(
           f"match={core_attn_out.size(0) == attn_metadata.num_actual_tokens}",
           flush=True)
 
+    print("[TRACE] _gdn_attention_core_xpu_impl: ENTER gdn_attention kernel",
+          flush=True)
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
@@ -152,6 +154,8 @@ def _gdn_attention_core_xpu_impl(
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
+    print("[TRACE] _gdn_attention_core_xpu_impl: EXIT gdn_attention kernel",
+          flush=True)
 
 
 def _gdn_attention_core_xpu_fake(
