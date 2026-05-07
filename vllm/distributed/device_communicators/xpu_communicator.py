@@ -144,7 +144,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 # equal-size all_gather_into_tensor (which XCCL supports), then
                 # strip the padding from each rank's slice.
                 max_size = max(sizes)
-                padded = torch.zeros(
+                padded = torch.empty(
                     (max_size,) + input_.shape[1:],
                     dtype=input_.dtype,
                     device=input_.device,
