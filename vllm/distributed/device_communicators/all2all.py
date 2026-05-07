@@ -71,24 +71,23 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        logger.info(
-            "[TRACE] rank=%d dispatch_router_logits ENTER all_gatherv: "
-            "sizes=%s, num_tensors=%d, tensor_shapes=%s, ts=%.6f",
-            dist_group.rank_in_group,
-            sizes,
-            len(tensors_to_gather),
-            [list(t.shape) for t in tensors_to_gather],
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} "
+            f"dispatch_router_logits ENTER all_gatherv: "
+            f"sizes={sizes}, num_tensors={len(tensors_to_gather)}, "
+            f"tensor_shapes={[list(t.shape) for t in tensors_to_gather]}, "
+            f"ts={time.time():.6f}",
+            flush=True,
         )
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
             sizes=sizes,
         )
-        logger.info(
-            "[TRACE] rank=%d dispatch_router_logits EXIT all_gatherv: ts=%.6f",
-            dist_group.rank_in_group,
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} "
+            f"dispatch_router_logits EXIT all_gatherv: ts={time.time():.6f}",
+            flush=True,
         )
 
         if extra_tensors is not None:
@@ -120,24 +119,23 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        logger.info(
-            "[TRACE] rank=%d dispatch ENTER all_gatherv: "
-            "sizes=%s, num_tensors=%d, tensor_shapes=%s, ts=%.6f",
-            dist_group.rank_in_group,
-            sizes,
-            len(tensors_to_gather),
-            [list(t.shape) for t in tensors_to_gather],
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} dispatch ENTER "
+            f"all_gatherv: sizes={sizes}, "
+            f"num_tensors={len(tensors_to_gather)}, "
+            f"tensor_shapes={[list(t.shape) for t in tensors_to_gather]}, "
+            f"ts={time.time():.6f}",
+            flush=True,
         )
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
             sizes=sizes,
         )
-        logger.info(
-            "[TRACE] rank=%d dispatch EXIT all_gatherv: ts=%.6f",
-            dist_group.rank_in_group,
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} dispatch EXIT "
+            f"all_gatherv: ts={time.time():.6f}",
+            flush=True,
         )
 
         hidden_states = gathered_tensors[0]
@@ -161,19 +159,18 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        logger.info(
-            "[TRACE] rank=%d combine ENTER reduce_scatterv: "
-            "sizes=%s, hidden_states_shape=%s, ts=%.6f",
-            dist_group.rank_in_group,
-            sizes,
-            list(hidden_states.shape),
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} combine ENTER "
+            f"reduce_scatterv: sizes={sizes}, "
+            f"hidden_states_shape={list(hidden_states.shape)}, "
+            f"ts={time.time():.6f}",
+            flush=True,
         )
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-        logger.info(
-            "[TRACE] rank=%d combine EXIT reduce_scatterv: ts=%.6f",
-            dist_group.rank_in_group,
-            time.time(),
+        print(
+            f"[TRACE] rank={dist_group.rank_in_group} combine EXIT "
+            f"reduce_scatterv: ts={time.time():.6f}",
+            flush=True,
         )
         return hidden_states
 
