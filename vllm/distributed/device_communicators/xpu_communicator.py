@@ -155,8 +155,22 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     dtype=input_.dtype,
                     device=input_.device,
                 )
+                import sys
+                print(
+                    f"[XPU all_gatherv] rank={self.rank_in_group} "
+                    f"BEFORE all_gather_into_tensor sizes={sizes} "
+                    f"max_size={max_size}",
+                    flush=True,
+                    file=sys.stderr,
+                )
                 dist.all_gather_into_tensor(
                     gathered, padded, group=self.device_group
+                )
+                print(
+                    f"[XPU all_gatherv] rank={self.rank_in_group} "
+                    f"AFTER  all_gather_into_tensor",
+                    flush=True,
+                    file=sys.stderr,
                 )
                 # Extract each rank's real (unpadded) rows.
                 chunks = [
