@@ -3978,7 +3978,11 @@ class GPUModelRunner(
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            # Attention metadata needs padded sizes when CUDAGraph FULL
+            # mode is active, or when DP padding has increased the token
+            # count (e.g. for equal-size EP collectives on XPU).
+            has_dp_padding = num_tokens_padded > num_tokens_unpadded
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or has_dp_padding
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
