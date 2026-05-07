@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import time
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -98,9 +100,42 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
             # if inputs shape in different ranks is not the same using reduce_scatter
             input_splits = list(input_tensor.split(sizes, dim=0))
+            logger.info(
+                "[TRACE] rank=%d reduce_scatterv ENTER variable-size "
+                "dist.reduce_scatter: sizes=%s, input_shape=%s, "
+                "output_shape=%s, split_shapes=%s, ts=%.6f",
+                self.rank_in_group,
+                sizes,
+                list(input_tensor.shape),
+                list(output.shape),
+                [list(s.shape) for s in input_splits],
+                time.time(),
+            )
             dist.reduce_scatter(output, input_splits, group=self.device_group)
+            logger.info(
+                "[TRACE] rank=%d reduce_scatterv EXIT variable-size "
+                "dist.reduce_scatter: ts=%.6f",
+                self.rank_in_group,
+                time.time(),
+            )
         else:
+            logger.info(
+                "[TRACE] rank=%d reduce_scatterv ENTER uniform "
+                "dist.reduce_scatter_tensor: sizes=%s, input_shape=%s, "
+                "output_shape=%s, ts=%.6f",
+                self.rank_in_group,
+                sizes,
+                list(input_tensor.shape),
+                list(output.shape),
+                time.time(),
+            )
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+            logger.info(
+                "[TRACE] rank=%d reduce_scatterv EXIT uniform "
+                "dist.reduce_scatter_tensor: ts=%.6f",
+                self.rank_in_group,
+                time.time(),
+            )
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
@@ -144,10 +179,40 @@ class XpuCommunicator(DeviceCommunicatorBase):
                             device=input_.device,
                         )
                     )
+                logger.info(
+                    "[TRACE] rank=%d all_gatherv ENTER variable-size "
+                    "dist.all_gather: sizes=%s, input_shape=%s, "
+                    "gather_list_shapes=%s, ts=%.6f",
+                    self.rank_in_group,
+                    sizes,
+                    list(input_.shape),
+                    [list(t.shape) for t in all_gather_list],
+                    time.time(),
+                )
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
+                logger.info(
+                    "[TRACE] rank=%d all_gatherv EXIT variable-size "
+                    "dist.all_gather: ts=%.6f",
+                    self.rank_in_group,
+                    time.time(),
+                )
                 output_tensor = torch.cat(all_gather_list, dim=0)
             else:
+                logger.info(
+                    "[TRACE] rank=%d all_gatherv ENTER uniform "
+                    "dist.all_gather: input_shape=%s, "
+                    "output_shape=%s, ts=%.6f",
+                    self.rank_in_group,
+                    list(input_.shape),
+                    list(output_tensor.shape),
+                    time.time(),
+                )
                 dist.all_gather([output_tensor], input_, group=self.device_group)
+                logger.info(
+                    "[TRACE] rank=%d all_gatherv EXIT uniform dist.all_gather: ts=%.6f",
+                    self.rank_in_group,
+                    time.time(),
+                )
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
