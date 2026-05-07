@@ -3981,8 +3981,8 @@ class GPUModelRunner(
             # Attention metadata needs padded sizes when CUDAGraph FULL
             # mode is active, or when DP padding has increased the token
             # count (e.g. for equal-size EP collectives on XPU).
-            has_dp_padding = num_tokens_padded > num_tokens_unpadded
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or has_dp_padding
+            dp_padding_applied = num_tokens_padded > num_tokens_unpadded
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
