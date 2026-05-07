@@ -249,7 +249,22 @@ dist.all_gather_into_tensor(gathered, padded_input, group=self.device_group)
 
 这需要在 Intel oneCCL / PyTorch XPU 层面修复，不在 vLLM 范围内。
 
-## 8. 相关代码文件
+## 8. FAQ
+
+### Q: Qwen3.5 必然会调用 all_gatherv 吗？
+
+**是的**。在 XPU 上启用 EP 时，vLLM 只能使用 `AgRsAll2AllManager`（见 `xpu_communicator.py:25-42`），无论 `all2all_backend` 配置为何值，XPU 都会 fallback 到 `AgRsAll2AllManager`。该 manager 的 `dispatch` 和 `dispatch_router_logits` 方法都调用 `dist_group.all_gatherv()`（见 `all2all.py:74, 109`）。因此 Qwen3.5 + EP + XPU 必然经过 `all_gatherv` 路径。
+
+### Q: 修复 ZE_AFFINITY_MASK 问题后，是否还会遇到 all_gatherv hang？
+
+**是的，两个问题完全独立。**
+
+- **ZE_AFFINITY_MASK 问题**（PR #15 Option A）：解决 GPU 亲和性/可见性问题，确保每个进程能正确访问对应的 GPU
+- **all_gatherv hang 问题**：XCCL 后端不支持 variable-size `dist.all_gather`，当各 rank 的 token 数不同时 hang
+
+修复 ZE_AFFINITY_MASK 后，Qwen3.5 仍然会调用 `all_gatherv`，仍然会出现 `sizes=[13, 13, 15, 15]` 这样的 unequal sizes，仍然会触发 XCCL hang。这两个问题需要分别修复。
+
+## 9. 相关代码文件
 
 | 文件 | 说明 |
 |---|---|
