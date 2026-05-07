@@ -606,7 +606,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-        print(f"[TRACE] gdn_linear_attn forward_xpu: "
+        _rank = (torch.distributed.get_rank()
+                 if torch.distributed.is_initialized() else -1)
+        print(f"[TRACE rank={_rank}] gdn_linear_attn forward_xpu: "
               f"hidden_states.shape={hidden_states.shape}, "
               f"num_tokens={num_tokens}", flush=True)
 

@@ -16,6 +16,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import (
+    get_dp_group,
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -173,7 +174,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        print(f"[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts "
+        _dp = get_dp_group().rank_in_group
+        print(f"[TRACE dp={_dp}] Qwen3NextSparseMoeBlock.forward ENTER experts "
               f"num_tokens={num_tokens}", flush=True)
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
@@ -186,7 +188,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
-        print("[TRACE] Qwen3NextSparseMoeBlock.forward EXIT experts",
+        print(f"[TRACE dp={_dp}] Qwen3NextSparseMoeBlock.forward EXIT experts",
               flush=True)
 
         if self.is_sequence_parallel:
@@ -408,7 +410,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         self_attention_output = torch.empty_like(hidden_states)
-        print(f"[TRACE] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
+        _dp = get_dp_group().rank_in_group
+        print(f"[TRACE dp={_dp}] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
               f"type={self.layer_type} ENTER attn", flush=True)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -424,7 +427,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
-        print(f"[TRACE] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
+        print(f"[TRACE dp={_dp}] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
               f"type={self.layer_type} EXIT attn", flush=True)
 
         if self.layer_scale:
@@ -439,10 +442,10 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        print(f"[TRACE] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
+        print(f"[TRACE dp={_dp}] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
               f"ENTER mlp ({type(self.mlp).__name__})", flush=True)
         hidden_states = self.mlp(hidden_states)
-        print(f"[TRACE] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
+        print(f"[TRACE dp={_dp}] Qwen3NextDecoderLayer.forward layer={self.layer_idx} "
               f"EXIT mlp", flush=True)
 
         if self.layer_scale:

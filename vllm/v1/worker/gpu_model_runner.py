@@ -4098,7 +4098,8 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        print("[TRACE] execute_model: model forward complete, "
+        _dp = self.parallel_config.data_parallel_rank
+        print(f"[TRACE dp={_dp}] execute_model: model forward complete, "
               f"type(model_output)={type(model_output).__name__}",
               flush=True)
 
@@ -4113,7 +4114,7 @@ class GPUModelRunner(
 
             hs_shape = (hidden_states.shape
                        if hasattr(hidden_states, 'shape') else 'N/A')
-            print(f"[TRACE] execute_model: postprocess ENTER, "
+            print(f"[TRACE dp={_dp}] execute_model: postprocess ENTER, "
                   f"hidden_states.shape={hs_shape}", flush=True)
 
             if not self.broadcast_pp_output:
@@ -4134,13 +4135,13 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                print("[TRACE] execute_model: ENTER logits_indices gather",
+                print(f"[TRACE dp={_dp}] execute_model: ENTER logits_indices gather",
                       flush=True)
                 sample_hidden_states = hidden_states[logits_indices]
-                print("[TRACE] execute_model: ENTER compute_logits",
+                print(f"[TRACE dp={_dp}] execute_model: ENTER compute_logits",
                       flush=True)
                 logits = self.model.compute_logits(sample_hidden_states)
-                print("[TRACE] execute_model: EXIT compute_logits",
+                print(f"[TRACE dp={_dp}] execute_model: EXIT compute_logits",
                       flush=True)
             else:
                 # Rare case.
@@ -4172,7 +4173,8 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
-        print("[TRACE] execute_model: setting execute_model_state", flush=True)
+        print(f"[TRACE dp={_dp}] execute_model: "
+              "setting execute_model_state", flush=True)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4192,7 +4194,7 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        print("[TRACE] execute_model: returning None (success)", flush=True)
+        print(f"[TRACE dp={_dp}] execute_model: returning None (success)", flush=True)
         return None
 
     @torch.inference_mode
@@ -4217,7 +4219,8 @@ class GPUModelRunner(
             output.kv_connector_output = kv_connector_output
             return output
 
-        print("[TRACE] sample_tokens: ENTER", flush=True)
+        _dp = self.parallel_config.data_parallel_rank
+        print(f"[TRACE dp={_dp}] sample_tokens: ENTER", flush=True)
 
         # Unpack ephemeral state.
         (
@@ -4241,10 +4244,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        print("[TRACE] sample_tokens: ENTER _sample", flush=True)
+        print(f"[TRACE dp={_dp}] sample_tokens: ENTER _sample", flush=True)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-        print("[TRACE] sample_tokens: EXIT _sample", flush=True)
+        print(f"[TRACE dp={_dp}] sample_tokens: EXIT _sample", flush=True)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4355,7 +4358,7 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        print("[TRACE] sample_tokens: ENTER bookkeeping", flush=True)
+        print(f"[TRACE dp={_dp}] sample_tokens: ENTER bookkeeping", flush=True)
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4373,7 +4376,7 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        print("[TRACE] sample_tokens: EXIT bookkeeping", flush=True)
+        print(f"[TRACE dp={_dp}] sample_tokens: EXIT bookkeeping", flush=True)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4393,7 +4396,7 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        print("[TRACE] sample_tokens: building ModelRunnerOutput",
+        print(f"[TRACE dp={_dp}] sample_tokens: building ModelRunnerOutput",
               flush=True)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -4418,7 +4421,7 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
-            print("[TRACE] sample_tokens: returning output (sync)",
+            print(f"[TRACE dp={_dp}] sample_tokens: returning output (sync)",
                   flush=True)
             return output
 
