@@ -216,13 +216,20 @@ Qwen3 MoE 在相同配置 (DP=2, TP=2, EP=true) 下完全没有 `all_gatherv` �
 
 ## 7. 可能的修复方向
 
-### 方案 A: 在 XPU communicator 中用多次 broadcast 替代 variable-size all_gather
+### 方案 A: 在 XPU communicator 中用多次 broadcast 替代 variable-size all_gather ✅ 已实现
+
+**副作用分析:**
+- **性能**: N 次顺序 broadcast（O(N) 通信轮次）替代 1 次 all_gather（O(1) 轮次）。对于 world_size=4，需要 4 次 broadcast。总数据传输量与 all_gather 相同，但延迟线性增加。对于 Qwen3.5 触发的 `sizes=[13,13,15,15]` 这样的小型 tensor，性能差异可忽略不计。
+- **正确性**: 完全等价于 variable-size all_gather — 每个 rank 最终持有所有 rank 的数据，拼接结果完全相同。
+- **内存**: 与原始方案相同。
+- **结论**: **无功能性副作用**，仅有轻微的性能开销（多几次同步点）。
+
+对称地，`reduce_scatterv` 的 variable-size `dist.reduce_scatter` 同样会 hang。修复方案：用 `all_reduce` + 取切片替代（全量规约后每个 rank 提取自己的 slice），已一并实现。
 
 ```python
-# xpu_communicator.py 中的 all_gatherv, sizes != None 时:
+# xpu_communicator.py 中的 all_gatherv, sizes != None 时 (已实现):
 if sizes is not None:
-    # 不使用 dist.all_gather (XCCL 不支持 variable-size)
-    # 而是用 N 次 broadcast 模拟
+    # XCCL 不支持 variable-size dist.all_gather，改用 N 次 broadcast
     all_gather_list = []
     for root, size in enumerate(sizes):
         buf = torch.empty((size,) + input_.shape[1:], dtype=input_.dtype, device=input_.device)
@@ -231,6 +238,13 @@ if sizes is not None:
         dist.broadcast(buf, src=root, group=self.device_group)
         all_gather_list.append(buf)
     output_tensor = torch.cat(all_gather_list, dim=0)
+
+# xpu_communicator.py 中的 reduce_scatterv, sizes 不等时 (已实现):
+if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+    # XCCL 不支持 variable-size dist.reduce_scatter，改用 all_reduce + slice
+    dist.all_reduce(input_tensor, group=self.device_group)
+    offset = sum(sizes[:self.rank_in_group])
+    output.copy_(input_tensor[offset:offset + chunk_size])
 ```
 
 ### 方案 B: 将 variable-size 输入 pad 到相同大小

@@ -96,9 +96,13 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
-            # if inputs shape in different ranks is not the same using reduce_scatter
-            input_splits = list(input_tensor.split(sizes, dim=0))
-            dist.reduce_scatter(output, input_splits, group=self.device_group)
+            # XCCL does not support variable-size dist.reduce_scatter.
+            # Use all_reduce + slice as a workaround: all_reduce the full
+            # concatenated tensor so every rank holds the reduced result,
+            # then each rank extracts its own variable-size slice.
+            dist.all_reduce(input_tensor, group=self.device_group)
+            offset = sum(sizes[: self.rank_in_group])
+            output.copy_(input_tensor[offset : offset + chunk_size])
         else:
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
         # Reshape before returning
@@ -135,16 +139,22 @@ class XpuCommunicator(DeviceCommunicatorBase):
             )
 
             if sizes is not None:
+                # XCCL does not support variable-size dist.all_gather.
+                # Use N sequential broadcasts as a workaround: each rank
+                # broadcasts its own slice to all other ranks.  The total
+                # data transferred is identical to all_gather; only latency
+                # increases linearly with world_size (O(N) rounds vs O(1)).
                 all_gather_list = []
-                for size in sizes:
-                    all_gather_list.append(
-                        torch.empty(
-                            (size,) + input_.shape[1:],
-                            dtype=input_.dtype,
-                            device=input_.device,
-                        )
+                for root, size in enumerate(sizes):
+                    buf = torch.empty(
+                        (size,) + input_.shape[1:],
+                        dtype=input_.dtype,
+                        device=input_.device,
                     )
-                dist.all_gather(all_gather_list, input_, group=self.device_group)
+                    if root == self.rank_in_group:
+                        buf.copy_(input_)
+                    dist.broadcast(buf, src=root, group=self.device_group)
+                    all_gather_list.append(buf)
                 output_tensor = torch.cat(all_gather_list, dim=0)
             else:
                 dist.all_gather([output_tensor], input_, group=self.device_group)
