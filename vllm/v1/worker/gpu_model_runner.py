@@ -4098,6 +4098,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        print("[TRACE] execute_model: model forward complete, "
+              f"type(model_output)={type(model_output).__name__}",
+              flush=True)
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4106,6 +4110,11 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            hs_shape = (hidden_states.shape
+                       if hasattr(hidden_states, 'shape') else 'N/A')
+            print(f"[TRACE] execute_model: postprocess ENTER, "
+                  f"hidden_states.shape={hs_shape}", flush=True)
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -4125,8 +4134,14 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                print("[TRACE] execute_model: ENTER logits_indices gather",
+                      flush=True)
                 sample_hidden_states = hidden_states[logits_indices]
+                print("[TRACE] execute_model: ENTER compute_logits",
+                      flush=True)
                 logits = self.model.compute_logits(sample_hidden_states)
+                print("[TRACE] execute_model: EXIT compute_logits",
+                      flush=True)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4157,6 +4172,7 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        print("[TRACE] execute_model: setting execute_model_state", flush=True)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4176,6 +4192,7 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        print("[TRACE] execute_model: returning None (success)", flush=True)
         return None
 
     @torch.inference_mode
