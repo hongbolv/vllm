@@ -109,7 +109,19 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 f"ts={time.time():.6f}",
                 flush=True,
             )
+            torch.xpu.synchronize()
+            print(
+                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
+                f"variable-size BEFORE collective: ts={time.time():.6f}",
+                flush=True,
+            )
             dist.reduce_scatter(output, input_splits, group=self.device_group)
+            print(
+                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
+                f"variable-size AFTER collective (pre-sync): ts={time.time():.6f}",
+                flush=True,
+            )
+            torch.xpu.synchronize()
             print(
                 f"[TRACE] rank={self.rank_in_group} reduce_scatterv EXIT "
                 f"variable-size dist.reduce_scatter: ts={time.time():.6f}",
@@ -123,7 +135,19 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 f"output_shape={list(output.shape)}, ts={time.time():.6f}",
                 flush=True,
             )
+            torch.xpu.synchronize()
+            print(
+                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
+                f"uniform BEFORE collective: ts={time.time():.6f}",
+                flush=True,
+            )
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+            print(
+                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
+                f"uniform AFTER collective (pre-sync): ts={time.time():.6f}",
+                flush=True,
+            )
+            torch.xpu.synchronize()
             print(
                 f"[TRACE] rank={self.rank_in_group} reduce_scatterv EXIT "
                 f"uniform dist.reduce_scatter_tensor: ts={time.time():.6f}",
@@ -181,7 +205,20 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     f"ts={time.time():.6f}",
                     flush=True,
                 )
+                torch.xpu.synchronize()
+                print(
+                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
+                    f"variable-size BEFORE collective: ts={time.time():.6f}",
+                    flush=True,
+                )
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
+                print(
+                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
+                    f"variable-size AFTER collective (pre-sync): "
+                    f"ts={time.time():.6f}",
+                    flush=True,
+                )
+                torch.xpu.synchronize()
                 print(
                     f"[TRACE] rank={self.rank_in_group} all_gatherv EXIT "
                     f"variable-size dist.all_gather: ts={time.time():.6f}",
@@ -196,7 +233,19 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     f"ts={time.time():.6f}",
                     flush=True,
                 )
+                torch.xpu.synchronize()
+                print(
+                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
+                    f"uniform BEFORE collective: ts={time.time():.6f}",
+                    flush=True,
+                )
                 dist.all_gather([output_tensor], input_, group=self.device_group)
+                print(
+                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
+                    f"uniform AFTER collective (pre-sync): ts={time.time():.6f}",
+                    flush=True,
+                )
+                torch.xpu.synchronize()
                 print(
                     f"[TRACE] rank={self.rank_in_group} all_gatherv EXIT "
                     f"uniform dist.all_gather: ts={time.time():.6f}",
