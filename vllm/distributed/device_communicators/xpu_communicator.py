@@ -201,7 +201,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     flush=True,
                 )
                 torch.xpu.synchronize()
-                dist.all_gather([output_tensor], input_, group=self.device_group)
+                dist.all_gather_into_tensor(
+                    output_tensor, input_, group=self.device_group
+                )
                 torch.xpu.synchronize()
                 self._collective_counter -= 1
                 print(
