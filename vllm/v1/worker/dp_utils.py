@@ -39,16 +39,32 @@ def _run_ar(
     padded_num_tokens_per_ubatch: int,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    iter_count: int = 0,
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
-    tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
+    # Row 0: orig tokens, Row 1: padded tokens, Row 2: ubatch flag,
+    # Row 3: cudagraph_mode, Row 4: iteration counter (for deadlock detection)
+    tensor = torch.zeros(5, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
+    tensor[4][dp_rank] = iter_count
     dist.all_reduce(tensor, group=group)
+    # Deadlock risk check: warn if any DP rank is on a different iteration.
+    # A gap of >= 1 iteration means one rank may enter collective N+1 while
+    # another is still in collective N, causing a communicator deadlock.
+    iter_counts = tensor[4]  # shape: [dp_size]
+    if int(iter_counts.max().item()) != int(iter_counts.min().item()):
+        print(
+            f"[WARN deadlock-risk] dp_rank={dp_rank} iter={iter_count} "
+            f"iter_counts_across_dp={iter_counts.tolist()} — "
+            "DP ranks are on different iterations; "
+            "cross-iteration collective mismatch may cause a hang!",
+            flush=True,
+        )
     return tensor
 
 
@@ -102,6 +118,7 @@ def _synchronize_dp_ranks(
     should_attempt_ubatching: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    iter_count: int = 0,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
@@ -132,6 +149,7 @@ def _synchronize_dp_ranks(
         padded_num_tokens_per_ubatch=num_tokens_padded,
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
+        iter_count=iter_count,
     )
 
     # Synchronize cudagraph_mode across ranks first (take min).
@@ -147,7 +165,10 @@ def _synchronize_dp_ranks(
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    # Also force DP padding when expert parallelism is enabled to ensure
+    # equal-size collectives (xccl workaround for unequal-size corruption).
+    should_dp_pad = (synced_cudagraph_mode != 0 or should_ubatch
+                     or parallel_config.enable_expert_parallel)
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True
@@ -166,6 +187,7 @@ def coordinate_batch_across_dp(
     num_tokens_padded: int | None = None,
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
+    iter_count: int = 0,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     Coordinates amongst all DP ranks to determine if and how the full batch
@@ -181,6 +203,8 @@ def coordinate_batch_across_dp(
             only contains single token decodes
         cudagraph_mode: The cudagraph mode for this rank (0=NONE, 1=PIECEWISE, 2=FULL).
             DP padding is enabled when synced cudagraph mode across ranks is not NONE.
+        iter_count: Current iteration counter for this rank (used for deadlock
+            risk detection — warns if DP ranks are on different iterations).
 
     Returns: tuple[
         ubatch_slices: if this is set then all DP ranks have agreed to
@@ -217,6 +241,7 @@ def coordinate_batch_across_dp(
             should_attempt_ubatching,
             cudagraph_mode,
             parallel_config,
+            iter_count=iter_count,
         )
     )
 

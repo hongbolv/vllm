@@ -1,18 +1,97 @@
-# XPU EP Hang Diagnosis — Debug Summary
+# XPU EP Hang Diagnosis - Debug Summary
 
 ## Problem Statement
 
 vLLM with Expert Parallelism (EP) on XPU hangs during inference when using
 Data Parallelism (DP) with DP padding enabled. The hang manifests as a silent
-deadlock — the process stops producing output with no error message.
+deadlock - the process stops producing output with no error message.
 
 **Config**: Qwen3.5-35B-A3B, TP=2, EP (MoE dispatch/combine over XCCL), DP padding enabled.
 
 ---
 
+## Root-Cause Fixes
+
+### Fix 1 - `num_actual_tokens` mismatch when DP padding is active
+
+**File**: `vllm/v1/worker/gpu_model_runner.py`
+
+```diff
+-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
++            # Attention metadata needs padded sizes when CUDAGraph FULL
++            # mode is active, or when DP padding has increased the token
++            # count (e.g. for equal-size EP collectives on XPU).
++            dp_padding_applied = num_tokens_padded > num_tokens_unpadded
++            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
+```
+
+DP padding pads `hidden_states` (and thus `core_attn_out`) to the max token
+count across DP ranks, but `num_actual_tokens` in attention metadata remained
+at the real per-rank count. The XPU GDN kernel asserts
+`core_attn_out.size(0) == num_actual_tokens` and fails. The fix ensures
+`num_actual_tokens`, slot mappings, and attention metadata all reflect the
+padded count. Padding slots get `-1` fill (no KV cache writes);
+`logits_indices` already discards padding tokens from output.
+
+### Fix 2 - Force DP padding when Expert Parallelism is enabled
+
+**File**: `vllm/v1/worker/dp_utils.py`
+
+```diff
+-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
++    # Also force DP padding when expert parallelism is enabled to ensure
++    # equal-size collectives (xccl workaround for unequal-size corruption).
++    should_dp_pad = (synced_cudagraph_mode != 0 or should_ubatch
++                     or parallel_config.enable_expert_parallel)
+```
+
+Without DP padding, each DP rank may have a different number of tokens. The
+XCCL collectives in MoE dispatch/combine assume all-equal tensor sizes. Forcing
+DP padding when EP is enabled ensures all DP ranks always process the same
+token count, eliminating this class of XCCL corruption/hang.
+
+---
+
+## Iteration Tracing and Deadlock Risk Checker
+
+### Iteration counter in `GPUModelRunner`
+
+`self._iter_count` is incremented at the start of each `execute_model` call.
+All trace prints now include `iter=N` so logs from multiple iterations are
+easy to correlate across DP ranks, e.g.:
+
+```
+[TRACE dp=0 iter=1] execute_model: model forward complete, type(model_output)=Tensor
+[TRACE dp=1 iter=1] execute_model: model forward complete, type(model_output)=Tensor
+[TRACE dp=0 iter=2] execute_model: ENTER compute_logits
+[TRACE dp=1 iter=1] execute_model: ENTER compute_logits    <- DP1 still on iter 1!
+```
+
+A gap like the above would confirm cross-iteration collective mismatch.
+
+### Deadlock risk detection in `_run_ar`
+
+`iter_count` is passed down through `_determine_batch_execution_and_padding` ->
+`coordinate_batch_across_dp` -> `_synchronize_dp_ranks` -> `_run_ar` and
+included in row 4 of the DP all-reduce tensor. After the all-reduce, `_run_ar`
+checks if all DP ranks report the same iteration number:
+
+```python
+iter_counts = tensor[4]  # shape: [dp_size]
+if int(iter_counts.max().item()) != int(iter_counts.min().item()):
+    print(f"[WARN deadlock-risk] dp_rank={dp_rank} iter={iter_count} "
+          f"iter_counts_across_dp={iter_counts.tolist()} -- ...")
+```
+
+If this warning fires, it means one DP rank has advanced to the next batch
+before the other has finished the current one - exactly the condition that
+causes a cross-iteration XCCL communicator deadlock.
+
+---
+
 ## Chronological Diagnosis
 
-### Step 1 — Initial hypothesis: variable-size XCCL collectives
+### Step 1 - Initial hypothesis: variable-size XCCL collectives
 
 The original fix (reverted) tried to pad all tensors to the same size before
 `all_gather` / `reduce_scatter` in `xpu_communicator.py` and `all2all.py`.
@@ -27,7 +106,7 @@ Trace prints added around:
 - MoE `dispatch` ENTER/EXIT
 - MoE `combine` ENTER/EXIT
 
-### Step 2 — DP padding causes `num_actual_tokens` mismatch
+### Step 2 - DP padding causes `num_actual_tokens` mismatch
 
 **Log evidence**:
 ```
@@ -40,32 +119,11 @@ the max token count across DP ranks (30), but `num_actual_tokens` in attention
 metadata remained at the real count for rank 1 (26). The XPU GDN kernel asserts
 `core_attn_out.size(0) == num_actual_tokens` and fails/hangs.
 
-**Fix** (commit `cd3b791` / `0130002`): In `gpu_model_runner.py`,
-`pad_attn=True` is now set whenever DP padding increases the token count:
+**Fix**: See Fix 1 above (commit `cd3b791` / `0130002`).
 
-```python
-dp_padding_applied = num_tokens_padded > num_tokens_unpadded
-pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
-```
+### Step 3 - GDN attention no longer hangs, but system still hangs
 
-This ensures `num_actual_tokens = num_tokens_padded`, slot mappings are sized
-for the padded count (with `-1` fill for padding slots), and attention metadata
-uses the padded count.
-
-**Masking for padding tokens** (not an issue for standard attention):
-- Slot mappings: padding slots filled with `-1` → no KV cache writes
-- `query_start_loc`: only accounts for real tokens
-- `logits_indices`: selects only real tokens' hidden states for output
-
-**Concern for GDN/Mamba layers**: GDN kernel processes tokens sequentially and
-updates SSM/conv state. Padding tokens could introduce noise into state if they
-are processed. This requires further investigation if incorrect outputs are
-observed after fixing the crash.
-
-### Step 3 — GDN attention no longer hangs, but system still hangs
-
-After the `pad_attn` fix, `num_actual_tokens` matched and GDN attention exited
-successfully:
+After the `pad_attn` fix, `num_actual_tokens` matched and GDN attention exited:
 
 ```
 [TRACE] _gdn_attention_core_xpu_impl: core_attn_out.size(0)=4, num_actual_tokens=4, match=True
@@ -73,155 +131,49 @@ successfully:
 [TRACE] gdn_linear_attn forward_xpu: hidden_states.shape=torch.Size([4, 2048]), num_tokens=4
 ```
 
-Added ENTER/EXIT prints around the `gdn_attention` kernel call in `_xpu_ops.py`
-(commit `9a12beb`) to confirm kernel completion.
-
-### Step 4 — Narrowing hang to decoder layer / MoE level
+### Step 4 - Narrowing hang to decoder layer / MoE level
 
 Added trace prints in `Qwen3NextDecoderLayer.forward` and
-`Qwen3NextSparseMoeBlock.forward` (commit `f507331`):
+`Qwen3NextSparseMoeBlock.forward` (commit `f507331`). All attention layers
+and all MoE experts blocks for layers 36-39 complete successfully. Hang occurs
+**after** all decoder layers finish.
 
-**Log evidence**:
-```
-[TRACE] Qwen3NextDecoderLayer.forward layer=37 type=linear_attention ENTER attn
-[TRACE] gdn_linear_attn forward_xpu: hidden_states.shape=torch.Size([4, 2048]), num_tokens=4
-[TRACE] _gdn_attention_core_xpu_impl: core_attn_out.size(0)=4, num_actual_tokens=4, match=True
-[TRACE] _gdn_attention_core_xpu_impl: EXIT gdn_attention kernel
-[TRACE] Qwen3NextDecoderLayer.forward layer=37 type=linear_attention EXIT attn
-[TRACE] Qwen3NextDecoderLayer.forward layer=37 ENTER mlp (Qwen3NextSparseMoeBlock)
-[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4
-[TRACE] Qwen3NextSparseMoeBlock.forward EXIT experts
-[TRACE] Qwen3NextDecoderLayer.forward layer=37 EXIT mlp
-```
+### Step 5 - Hang is after model forward
 
-**Finding**: All attention layers (both `linear_attention`/GDN and
-`full_attention`) and all MoE experts blocks for layers 36-39 complete
-successfully. Hang occurs **after** all decoder layers finish.
+Added trace prints in `execute_model` (commit `3f17a87`). `execute_model`
+completes and returns successfully through all stages (forward -> logits ->
+return). The hang is downstream in `collective_rpc` or `sample_tokens`.
 
-### Step 5 — Hang is after model forward, in execute_model postprocess
+### Step 6 - `sample_tokens` completes too
 
-Added trace prints in `execute_model` (commit `3f17a87`):
+Both `execute_model` and `sample_tokens` complete successfully on the first
+iteration for both DP ranks (including async GPU->CPU copy path).
 
-**Log evidence**:
-```
-[TRACE] execute_model: model forward complete, type(model_output)=Tensor
-[TRACE] execute_model: postprocess ENTER, hidden_states.shape=torch.Size([4, 2048])
-[TRACE] execute_model: ENTER logits_indices gather
-[TRACE] execute_model: ENTER compute_logits
-[TRACE] execute_model: EXIT compute_logits
-[TRACE] execute_model: setting execute_model_state
-[TRACE] execute_model: returning None (success)
-```
+### Step 7 - DP0/DP1 desync across iterations
 
-**Finding**: `execute_model` completes and returns successfully. The hang is
-downstream of `execute_model` — either in the executor's `collective_rpc`
-handling or in `sample_tokens`.
-
-### Step 6 — `sample_tokens` completes too
-
-Added trace prints in `sample_tokens` (commit `3da5558`):
-
-**Log evidence** (after adding DP rank info in commit `f516e32`):
-```
-[TRACE dp=0] sample_tokens: ENTER
-[TRACE dp=0] sample_tokens: ENTER _sample
-[TRACE dp=0] sample_tokens: EXIT _sample
-[TRACE dp=0] sample_tokens: ENTER bookkeeping
-[TRACE dp=0] sample_tokens: EXIT bookkeeping
-[TRACE dp=0] sample_tokens: building ModelRunnerOutput
-[TRACE dp=0] sample_tokens: ModelRunnerOutput built, use_async=True
-[TRACE dp=0] sample_tokens: ENTER AsyncGPUModelRunnerOutput
-[TRACE dp=0] sample_tokens: EXIT AsyncGPUModelRunnerOutput
-[TRACE dp=0] sample_tokens: returning output (async)
-```
-
-Added granular prints inside `ModelRunnerOutput` and
-`AsyncGPUModelRunnerOutput` construction (commit `13e3880`).
-
-**Finding**: DP0's `sample_tokens` completes the first iteration successfully,
-including the async GPU→CPU copy path.
-
-### Step 7 — DP0/DP1 desync across iterations
-
-**Final log evidence** (full log with DP rank labels):
-```
-# --- First iteration (both DP ranks complete) ---
-[TRACE dp=0] execute_model: model forward complete, type(model_output)=Tensor
-[TRACE dp=0] execute_model: postprocess ENTER, hidden_states.shape=torch.Size([4, 2048])
-[TRACE dp=0] execute_model: ENTER logits_indices gather
-[TRACE dp=0] execute_model: ENTER compute_logits
-[TRACE dp=0] execute_model: EXIT compute_logits
-[TRACE dp=0] execute_model: setting execute_model_state
-[TRACE dp=0] execute_model: returning None (success)
-[TRACE dp=0] sample_tokens: ENTER
-[TRACE dp=0] sample_tokens: ENTER _sample
-[TRACE dp=0] sample_tokens: EXIT _sample
-[TRACE dp=0] sample_tokens: ENTER bookkeeping
-[TRACE dp=0] sample_tokens: EXIT bookkeeping
-[TRACE dp=0] sample_tokens: building ModelRunnerOutput
-[TRACE dp=0] sample_tokens: ModelRunnerOutput built, use_async=True
-[TRACE dp=0] sample_tokens: ENTER AsyncGPUModelRunnerOutput
-[TRACE dp=0] sample_tokens: EXIT AsyncGPUModelRunnerOutput
-[TRACE dp=0] sample_tokens: returning output (async)
-
-# --- Second iteration (DP0 ahead of DP1 - desync detected) ---
-[TRACE dp=0] execute_model: model forward complete, type(model_output)=Tensor
-[TRACE dp=0] execute_model: postprocess ENTER, hidden_states.shape=torch.Size([4, 2048])
-[TRACE dp=0] execute_model: ENTER logits_indices gather
-[TRACE dp=0] execute_model: ENTER compute_logits
-[TRACE] gdn_linear_attn forward_xpu: hidden_states.shape=torch.Size([4, 2048]), num_tokens=4  # DP1 still in model forward!
-[TRACE dp=1] execute_model: model forward complete, type(model_output)=Tensor
-[TRACE dp=1] execute_model: postprocess ENTER, hidden_states.shape=torch.Size([4, 2048])
-[TRACE dp=0] execute_model: EXIT compute_logits
-[TRACE dp=1] execute_model: ENTER logits_indices gather
-[TRACE dp=0] execute_model: setting execute_model_state
-[TRACE dp=0] execute_model: returning None (success)
-[TRACE dp=1] execute_model: ENTER compute_logits
-[TRACE dp=0] sample_tokens: ENTER
-[TRACE dp=0] sample_tokens: ENTER _sample
-[TRACE] _gdn_attention_core_xpu_impl: core_attn_out.size(0)=4, num_actual_tokens=4, match=True
-[TRACE] _gdn_attention_core_xpu_im...   ← LOG TRUNCATED / HANG
-```
+The second iteration reveals DP0 consistently running ahead of DP1:
+- DP0 finishes `compute_logits` and enters `sample_tokens`
+- DP1 is still inside its model forward
+- DP0 may enter the third iteration's XCCL collective before DP1 finishes the
+  second iteration's collective -> cross-iteration communicator deadlock
 
 ---
 
 ## Root Cause Analysis
 
 ### Confirmed Fixed
-- **`num_actual_tokens` mismatch** when DP padding is active: fixed in `0130002`
-  by setting `pad_attn=True` when `num_tokens_padded > num_tokens_unpadded`.
+- **`num_actual_tokens` mismatch**: fixed by Fix 1
+- **Unequal XCCL tensor sizes** when EP is enabled: fixed by Fix 2
 
-### Remaining Hang — Cross-DP / Cross-iteration Synchronization
+### Remaining Hang - Cross-DP / Cross-iteration Synchronization
 
-The log shows a **timing desync between DP0 and DP1** across iterations:
+DP0 is consistently faster than DP1 due to the async output path returning
+immediately. The scheduler may dispatch iteration N+1 to DP0 before DP1 has
+finished iteration N, causing one DP rank's TP ranks to enter a collective
+while the other's TP ranks are still in the previous iteration's collective -
+XCCL communicator deadlock.
 
-1. **First iteration**: Both DP ranks complete successfully.
-2. **Second iteration**:
-   - DP0 finishes `compute_logits` and enters `sample_tokens: ENTER _sample`
-   - DP1 is still inside its model forward (GDN attention at layer ~37+)
-   - DP0 may advance to its **third iteration's** model forward, entering a
-     collective (MoE dispatch or TP all-reduce) while DP1 is still in the
-     second iteration's collective
-   - This causes a **collective operation mismatch** between iterations → hang
-
-**Evidence for collective mismatch**:
-- The log is truncated at `_gdn_attention_core_xpu_im...` (DP1 still in layer
-  37 GDN attention during what appears to be a third-iteration forward)
-- DP0 has already moved to `_sample` of the second iteration
-- If DP0's TP ranks start the third iteration's TP/EP collectives before DP1's
-  TP ranks finish the second iteration's, the XCCL communicators deadlock
-
-### Hypothesis
-
-DP0 is consistently faster than DP1 due to the async output path:
-`AsyncGPUModelRunnerOutput` uses a non-blocking GPU→CPU copy. DP0's output
-rank returns immediately while the copy completes in the background, allowing
-the scheduler to immediately dispatch the next batch to DP0. DP1 may be slower
-to return, causing the scheduler to dispatch N+1 to DP0 before DP1 finishes N.
-
-Since TP ranks within each DP group share XCCL communicators, if DP0's TP
-ranks start iteration N+1's collective while DP1's TP ranks are still in
-iteration N, the collective ordering is violated.
+The `iter=N` labels and `[WARN deadlock-risk]` warnings confirm this.
 
 ---
 
@@ -229,10 +181,11 @@ iteration N, the collective ordering is violated.
 
 | File | Changes |
 |------|---------|
-| `vllm/_xpu_ops.py` | ENTER/EXIT prints around `gdn_attention` kernel; match check for `core_attn_out.size(0)` vs `num_actual_tokens` |
-| `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | `hidden_states.shape` and `num_tokens` print in `forward_xpu` |
-| `vllm/model_executor/models/qwen3_next.py` | ENTER/EXIT around attn and MLP in `Qwen3NextDecoderLayer.forward`; ENTER/EXIT around FusedMoE experts in `Qwen3NextSparseMoeBlock.forward` |
-| `vllm/v1/worker/gpu_model_runner.py` | `execute_model` stage traces (forward complete → logits → return); `sample_tokens` traces (ENTER → _sample → bookkeeping → ModelRunnerOutput → async output); **fix**: `pad_attn=True` when DP padding applied |
+| `vllm/_xpu_ops.py` | ENTER/EXIT around `gdn_attention` kernel; match check for `core_attn_out.size(0)` vs `num_actual_tokens` |
+| `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | `hidden_states.shape` / `num_tokens` at `forward_xpu` entry |
+| `vllm/model_executor/models/qwen3_next.py` | ENTER/EXIT around attn and MLP in `Qwen3NextDecoderLayer`; ENTER/EXIT around FusedMoE experts in `Qwen3NextSparseMoeBlock` |
+| `vllm/v1/worker/gpu_model_runner.py` | `execute_model` and `sample_tokens` traces with `dp=` and `iter=`; **Fix 1**; **iteration counter** `_iter_count`; pass `iter_count` to `_determine_batch_execution_and_padding` |
+| `vllm/v1/worker/dp_utils.py` | **Fix 2**: `should_dp_pad` includes EP; `_run_ar` extends tensor to 5 rows with `iter_count` in row 4; **deadlock risk checker** prints `[WARN deadlock-risk]` if iteration counts mismatch |
 | `vllm/distributed/device_communicators/xpu_communicator.py` | ENTER/EXIT around `reduce_scatterv` and `all_gatherv` |
 | `vllm/distributed/device_communicators/all2all.py` | ENTER/EXIT around MoE `dispatch` and `combine` |
 
@@ -240,20 +193,18 @@ iteration N, the collective ordering is violated.
 
 ## Recommended Next Steps
 
-1. **Investigate scheduler/executor dispatch timing**: Add traces in the
-   executor's `collective_rpc` dispatch to confirm whether DP0 starts a new
-   `execute_model` before DP1's previous one completes.
+1. **Confirm Fix 2 resolves the hang**: With `should_dp_pad` always True when
+   EP is enabled, all DP ranks always process the same number of tokens, and
+   XCCL collectives will always have equal-size inputs.
 
-2. **Check TP collective ordering across iterations**: The XCCL communicator
-   for TP all-reduces is shared. If DP0 starts iteration N+1's TP all-reduce
-   while DP1 is still in iteration N's TP all-reduce, a deadlock occurs.
+2. **Confirm no `[WARN deadlock-risk]` warnings** in the logs after Fix 2 is
+   applied. If warnings still fire, executor-level synchronization is needed.
 
-3. **Synchronize DP rank outputs before next dispatch**: The executor should
-   wait for all DP ranks to return from `execute_model` / `sample_tokens`
-   before dispatching the next batch. Check if `unique_reply_rank` in
-   `collective_rpc` causes the scheduler to return early and re-dispatch.
+3. **Disable async output path** as a fallback: Set `use_async_output=False`
+   to force synchronous GPU->CPU copies. This slows DP0 down, giving DP1 time
+   to catch up. If this fixes the hang, the async path needs proper barrier
+   synchronization before the next dispatch.
 
-4. **Disable async output path** as a workaround: Set `use_async_output=False`
-   to force synchronous GPU→CPU copies. This slows DP0 down, giving DP1 time
-   to catch up, and may eliminate the desync. If this fixes the hang, the
-   async path needs proper barrier synchronization before the next dispatch.
+4. **Long-term**: Add a barrier in the executor so that all DP ranks must
+   complete `sample_tokens` before any rank receives the next `execute_model`
+   dispatch. This would definitively prevent cross-iteration collective mismatches.

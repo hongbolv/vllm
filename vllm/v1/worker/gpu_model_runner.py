@@ -858,6 +858,8 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+        # Iteration counter for cross-DP deadlock risk tracing.
+        self._iter_count: int = 0
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3603,6 +3605,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        iter_count: int = 0,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3669,6 +3672,7 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
+                    iter_count=iter_count,
                 )
             )
 
@@ -3833,6 +3837,9 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        # Increment iteration counter for cross-DP deadlock risk tracing.
+        self._iter_count += 1
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -3938,6 +3945,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                iter_count=self._iter_count,
             )
 
             logger.debug(
@@ -4099,7 +4107,8 @@ class GPUModelRunner(
             )
 
         _dp = self.parallel_config.data_parallel_rank
-        print(f"[TRACE dp={_dp}] execute_model: model forward complete, "
+        _iter = self._iter_count
+        print(f"[TRACE dp={_dp} iter={_iter}] execute_model: model forward complete, "
               f"type(model_output)={type(model_output).__name__}",
               flush=True)
 
@@ -4114,7 +4123,7 @@ class GPUModelRunner(
 
             hs_shape = (hidden_states.shape
                        if hasattr(hidden_states, 'shape') else 'N/A')
-            print(f"[TRACE dp={_dp}] execute_model: postprocess ENTER, "
+            print(f"[TRACE dp={_dp} iter={_iter}] execute_model: postprocess ENTER, "
                   f"hidden_states.shape={hs_shape}", flush=True)
 
             if not self.broadcast_pp_output:
@@ -4135,13 +4144,16 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                print(f"[TRACE dp={_dp}] execute_model: ENTER logits_indices gather",
+                print(f"[TRACE dp={_dp} iter={_iter}] execute_model: "
+                      "ENTER logits_indices gather",
                       flush=True)
                 sample_hidden_states = hidden_states[logits_indices]
-                print(f"[TRACE dp={_dp}] execute_model: ENTER compute_logits",
+                print(f"[TRACE dp={_dp} iter={_iter}] execute_model: "
+                      "ENTER compute_logits",
                       flush=True)
                 logits = self.model.compute_logits(sample_hidden_states)
-                print(f"[TRACE dp={_dp}] execute_model: EXIT compute_logits",
+                print(f"[TRACE dp={_dp} iter={_iter}] execute_model: "
+                      "EXIT compute_logits",
                       flush=True)
             else:
                 # Rare case.
@@ -4173,7 +4185,7 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
-        print(f"[TRACE dp={_dp}] execute_model: "
+        print(f"[TRACE dp={_dp} iter={_iter}] execute_model: "
               "setting execute_model_state", flush=True)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4194,7 +4206,8 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        print(f"[TRACE dp={_dp}] execute_model: returning None (success)", flush=True)
+        print(f"[TRACE dp={_dp} iter={_iter}] execute_model: "
+              "returning None (success)", flush=True)
         return None
 
     @torch.inference_mode
@@ -4220,7 +4233,8 @@ class GPUModelRunner(
             return output
 
         _dp = self.parallel_config.data_parallel_rank
-        print(f"[TRACE dp={_dp}] sample_tokens: ENTER", flush=True)
+        _iter = self._iter_count
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: ENTER", flush=True)
 
         # Unpack ephemeral state.
         (
@@ -4244,10 +4258,12 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        print(f"[TRACE dp={_dp}] sample_tokens: ENTER _sample", flush=True)
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: ENTER _sample",
+              flush=True)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-        print(f"[TRACE dp={_dp}] sample_tokens: EXIT _sample", flush=True)
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: EXIT _sample",
+              flush=True)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4358,7 +4374,8 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        print(f"[TRACE dp={_dp}] sample_tokens: ENTER bookkeeping", flush=True)
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: ENTER bookkeeping",
+              flush=True)
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4376,7 +4393,8 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        print(f"[TRACE dp={_dp}] sample_tokens: EXIT bookkeeping", flush=True)
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: EXIT bookkeeping",
+              flush=True)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4396,7 +4414,7 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        print(f"[TRACE dp={_dp}] sample_tokens: building ModelRunnerOutput",
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: building ModelRunnerOutput",
               flush=True)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -4420,15 +4438,16 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
-        print(f"[TRACE dp={_dp}] sample_tokens: ModelRunnerOutput built, "
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: ModelRunnerOutput built, "
               f"use_async={self.use_async_scheduling}", flush=True)
 
         if not self.use_async_scheduling:
-            print(f"[TRACE dp={_dp}] sample_tokens: returning output (sync)",
+            print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: returning output (sync)",
                   flush=True)
             return output
 
-        print(f"[TRACE dp={_dp}] sample_tokens: ENTER AsyncGPUModelRunnerOutput",
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: "
+              "ENTER AsyncGPUModelRunnerOutput",
               flush=True)
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
@@ -4441,7 +4460,8 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
             )
-        print(f"[TRACE dp={_dp}] sample_tokens: EXIT AsyncGPUModelRunnerOutput",
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: "
+              "EXIT AsyncGPUModelRunnerOutput",
               flush=True)
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -4453,7 +4473,7 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
-        print(f"[TRACE dp={_dp}] sample_tokens: returning output (async)",
+        print(f"[TRACE dp={_dp} iter={_iter}] sample_tokens: returning output (async)",
               flush=True)
         return async_output
 
