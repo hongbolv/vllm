@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import time
-
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -24,6 +22,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
+        # Per-rank counter for MoE collective diagnosis:
+        # incremented (+1) before each collective+sync, decremented (-1) after.
+        # If the last printed counter is 0, the collective completed normally.
+        # A stuck counter (last value > 0) identifies the hanging collective.
+        self._collective_counter: int = 0
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -100,57 +103,35 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
             # if inputs shape in different ranks is not the same using reduce_scatter
             input_splits = list(input_tensor.split(sizes, dim=0))
+            self._collective_counter += 1
             print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv ENTER "
-                f"variable-size dist.reduce_scatter: sizes={sizes}, "
-                f"input_shape={list(input_tensor.shape)}, "
-                f"output_shape={list(output.shape)}, "
-                f"split_shapes={[list(s.shape) for s in input_splits]}, "
-                f"ts={time.time():.6f}",
+                f"[COUNTER] rank={self.rank_in_group} "
+                f"reduce_scatterv/variable-size counter={self._collective_counter}",
                 flush=True,
             )
             torch.xpu.synchronize()
-            print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
-                f"variable-size BEFORE collective: ts={time.time():.6f}",
-                flush=True,
-            )
             dist.reduce_scatter(output, input_splits, group=self.device_group)
-            print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
-                f"variable-size AFTER collective (pre-sync): ts={time.time():.6f}",
-                flush=True,
-            )
             torch.xpu.synchronize()
+            self._collective_counter -= 1
             print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv EXIT "
-                f"variable-size dist.reduce_scatter: ts={time.time():.6f}",
+                f"[COUNTER] rank={self.rank_in_group} "
+                f"reduce_scatterv/variable-size counter={self._collective_counter}",
                 flush=True,
             )
         else:
+            self._collective_counter += 1
             print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv ENTER "
-                f"uniform dist.reduce_scatter_tensor: sizes={sizes}, "
-                f"input_shape={list(input_tensor.shape)}, "
-                f"output_shape={list(output.shape)}, ts={time.time():.6f}",
+                f"[COUNTER] rank={self.rank_in_group} "
+                f"reduce_scatterv/uniform counter={self._collective_counter}",
                 flush=True,
             )
             torch.xpu.synchronize()
-            print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
-                f"uniform BEFORE collective: ts={time.time():.6f}",
-                flush=True,
-            )
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
-            print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv "
-                f"uniform AFTER collective (pre-sync): ts={time.time():.6f}",
-                flush=True,
-            )
             torch.xpu.synchronize()
+            self._collective_counter -= 1
             print(
-                f"[TRACE] rank={self.rank_in_group} reduce_scatterv EXIT "
-                f"uniform dist.reduce_scatter_tensor: ts={time.time():.6f}",
+                f"[COUNTER] rank={self.rank_in_group} "
+                f"reduce_scatterv/uniform counter={self._collective_counter}",
                 flush=True,
             )
         # Reshape before returning
@@ -196,59 +177,36 @@ class XpuCommunicator(DeviceCommunicatorBase):
                             device=input_.device,
                         )
                     )
+                self._collective_counter += 1
                 print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv ENTER "
-                    f"variable-size dist.all_gather: sizes={sizes}, "
-                    f"input_shape={list(input_.shape)}, "
-                    f"gather_list_shapes="
-                    f"{[list(t.shape) for t in all_gather_list]}, "
-                    f"ts={time.time():.6f}",
+                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"all_gatherv/variable-size counter={self._collective_counter}",
                     flush=True,
                 )
                 torch.xpu.synchronize()
-                print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
-                    f"variable-size BEFORE collective: ts={time.time():.6f}",
-                    flush=True,
-                )
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
-                print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
-                    f"variable-size AFTER collective (pre-sync): "
-                    f"ts={time.time():.6f}",
-                    flush=True,
-                )
                 torch.xpu.synchronize()
+                self._collective_counter -= 1
                 print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv EXIT "
-                    f"variable-size dist.all_gather: ts={time.time():.6f}",
+                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"all_gatherv/variable-size counter={self._collective_counter}",
                     flush=True,
                 )
                 output_tensor = torch.cat(all_gather_list, dim=0)
             else:
+                self._collective_counter += 1
                 print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv ENTER "
-                    f"uniform dist.all_gather: input_shape={list(input_.shape)}"
-                    f", output_shape={list(output_tensor.shape)}, "
-                    f"ts={time.time():.6f}",
+                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"all_gatherv/uniform counter={self._collective_counter}",
                     flush=True,
                 )
                 torch.xpu.synchronize()
-                print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
-                    f"uniform BEFORE collective: ts={time.time():.6f}",
-                    flush=True,
-                )
                 dist.all_gather([output_tensor], input_, group=self.device_group)
-                print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv "
-                    f"uniform AFTER collective (pre-sync): ts={time.time():.6f}",
-                    flush=True,
-                )
                 torch.xpu.synchronize()
+                self._collective_counter -= 1
                 print(
-                    f"[TRACE] rank={self.rank_in_group} all_gatherv EXIT "
-                    f"uniform dist.all_gather: ts={time.time():.6f}",
+                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"all_gatherv/uniform counter={self._collective_counter}",
                     flush=True,
                 )
             return output_tensor
