@@ -215,16 +215,17 @@ to identify the exact hang point.
 
 ---
 
-### Step 10 — New run (TP=1, Fix 3 NOT applied): hang after iter=17 async copy
+### Step 10 — New run (TP=2, Fix 3 NOT applied): hang after iter=17 async copy
 
-**Log evidence** (fresh run, last completed iteration):
+**Log evidence** (fresh run, last completed iteration — log is **truncated** at
+`[TRACE dp=1 iter...`; Group B tp=1 process traces are cut off):
 
 ```
 [TRACE dp=0 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
 [TRACE dp=1 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
-[TRACE dp=0 iter=17] _run_ar: ENTER dist.all_reduce
-[TRACE dp=1 iter=17] _run_ar: ENTER dist.all_reduce
-[TRACE dp=0 iter=17] _run_ar: EXIT dist.all_reduce
+[TRACE dp=0 iter=17] _run_ar: ENTER dist.all_reduce     ← Group A (RANK=0, tp=0)
+[TRACE dp=1 iter=17] _run_ar: ENTER dist.all_reduce     ← Group A (RANK=2, tp=0)
+[TRACE dp=0 iter=17] _run_ar: EXIT dist.all_reduce      ← Group A exits
 [TRACE dp=1 iter=17] _run_ar: EXIT dist.all_reduce
 [TRACE dp=0 iter=17] execute_model: model forward complete ...
 # ... all of execute_model and sample_tokens complete for dp=0 and dp=1
@@ -232,26 +233,35 @@ to identify the exact hang point.
 [TRACE dp=0 iter=17] sample_tokens: ENTER AsyncGPUModelRunnerOutput
 [TRACE dp=0 iter=17] sample_tokens: EXIT AsyncGPUModelRunnerOutput
 [TRACE dp=0 iter=17] sample_tokens: returning output (async)
-# ... dp=1 also enters and returns from sample_tokens (async)
-# Then: NOTHING. Zero output from any process for iter=18.
-# No iter=18 execute_model: ENTER trace appears.
+[TRACE dp=1 iter=17] execute_model: model forward complete ...
+# ... dp=1 execute_model and sample_tokens complete (shown in full log)
+[TRACE dp=1 iter...   ← LOG TRUNCATED HERE (Group B tp=1 traces cut off)
+# Then: NOTHING for iter=18 on any process.
 ```
 
 **Key observations**:
 
-1. **TP=1 in this run**: Only ONE `_run_ar` ENTER/EXIT pair per dp_rank per
-   iteration (vs. TWO in the previous TP=2 run). With TP=1 and DP=2, there is
-   only one DP communicator group across 2 processes. This is a different hardware
-   configuration than the previous TP=2 run.
+1. **TP=2 confirmed (same configuration as previous run)**: The log excerpt shows
+   only ONE `_run_ar` ENTER/EXIT pair in the visible portion, but the log is
+   **truncated** at `[TRACE dp=1 iter...`. With TP=2, DP=2, there are two
+   independent DP communicator groups:
+   - **Group A**: `{RANK=0 (dp=0,tp=0), RANK=2 (dp=1,tp=0)}` — visible in excerpt
+   - **Group B**: `{RANK=1 (dp=0,tp=1), RANK=3 (dp=1,tp=1)}` — in truncated portion
+
+   The earlier step 9 run (TP=2, iter=13) showed TWO `_run_ar` ENTER/EXIT pairs
+   because the log was not truncated and Group B traces appeared after Group A. In
+   the iter=17 log, Group B traces are simply cut off by the truncation.
+
+   The initial analysis (Step 10 as first written) incorrectly inferred TP=1 from
+   the single visible `_run_ar` pair. The actual configuration is TP=2.
 
 2. **Fix 3 NOT applied**: `use_async=True` in both dp ranks' sample_tokens traces
    confirms the async scheduling fix was not active in this run.
 
-3. **No iter=18 ENTER trace**: The very first line of `execute_model` is the ENTER
-   trace (before any collective). Its complete absence means `execute_model` was
-   never called for iter=18. The hang is **in the scheduler**, between the time
-   iter=17's `sample_tokens` returns and the time the scheduler decides to queue
-   iter=18.
+3. **No iter=18 ENTER trace in the full log**: The complete absence of any
+   `iter=18 execute_model: ENTER` on any of the 4 processes means `execute_model`
+   was never called for iter=18. The hang is **in the scheduler**, waiting for
+   iter=17's async GPU→CPU copy to complete before queuing iter=18.
 
 4. **Root cause — async copy hang (GPU-side silent hang)**:
 
@@ -315,9 +325,9 @@ hiding it in the async copy. The hang iteration's last ENTER trace before
 
 ## Recommended Next Steps
 
-1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–17 succeed)**:
+1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–17 succeed on TP=2, DP=2)**:
    Both Fix 1 and Fix 2 are working. The system now processes iter=1 (prefill)
-   through iter=17 (16th decode step) successfully on both DP ranks.
+   through iter=17 (16th decode step) successfully on all 4 processes (TP=2 × DP=2).
 
 2. ~~**Confirm iter=3 hang location with new traces**~~ **✓ CONFIRMED (resolved)**:
    The `dist.all_reduce` in `_run_ar` completes normally for all iterations.
