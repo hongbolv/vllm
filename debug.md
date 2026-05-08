@@ -215,36 +215,87 @@ to identify the exact hang point.
 
 ---
 
+### Step 10 — New run (TP=1, Fix 3 NOT applied): hang after iter=17 async copy
+
+**Log evidence** (fresh run, last completed iteration):
+
+```
+[TRACE dp=0 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
+[TRACE dp=1 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
+[TRACE dp=0 iter=17] _run_ar: ENTER dist.all_reduce
+[TRACE dp=1 iter=17] _run_ar: ENTER dist.all_reduce
+[TRACE dp=0 iter=17] _run_ar: EXIT dist.all_reduce
+[TRACE dp=1 iter=17] _run_ar: EXIT dist.all_reduce
+[TRACE dp=0 iter=17] execute_model: model forward complete ...
+# ... all of execute_model and sample_tokens complete for dp=0 and dp=1
+[TRACE dp=0 iter=17] sample_tokens: ModelRunnerOutput built, use_async=True
+[TRACE dp=0 iter=17] sample_tokens: ENTER AsyncGPUModelRunnerOutput
+[TRACE dp=0 iter=17] sample_tokens: EXIT AsyncGPUModelRunnerOutput
+[TRACE dp=0 iter=17] sample_tokens: returning output (async)
+# ... dp=1 also enters and returns from sample_tokens (async)
+# Then: NOTHING. Zero output from any process for iter=18.
+# No iter=18 execute_model: ENTER trace appears.
+```
+
+**Key observations**:
+
+1. **TP=1 in this run**: Only ONE `_run_ar` ENTER/EXIT pair per dp_rank per
+   iteration (vs. TWO in the previous TP=2 run). With TP=1 and DP=2, there is
+   only one DP communicator group across 2 processes. This is a different hardware
+   configuration than the previous TP=2 run.
+
+2. **Fix 3 NOT applied**: `use_async=True` in both dp ranks' sample_tokens traces
+   confirms the async scheduling fix was not active in this run.
+
+3. **No iter=18 ENTER trace**: The very first line of `execute_model` is the ENTER
+   trace (before any collective). Its complete absence means `execute_model` was
+   never called for iter=18. The hang is **in the scheduler**, between the time
+   iter=17's `sample_tokens` returns and the time the scheduler decides to queue
+   iter=18.
+
+4. **Root cause — async copy hang (GPU-side silent hang)**:
+
+   With `use_async=True`, `sample_tokens` returns immediately after kicking off
+   the GPU→CPU output copy on a separate stream. The scheduler then calls into
+   the async output object to retrieve the results — this blocks until the GPU
+   copy completes. If the GPU is stalled at any point AFTER the CPU submitted
+   iter=17's work, the copy never completes, and the scheduler hangs waiting for
+   it. No iter=18 is ever queued.
+
+   **The critical insight**: all CPU-side traces for execute_model appear to
+   complete normally because GPU ops are submitted asynchronously (CPU-side
+   Python returns immediately). The GPU may have hung inside iter=17's model
+   forward (e.g., inside an XCCL MoE dispatch/combine op) without the CPU knowing
+   it. When the async GPU→CPU copy is then queued on the same GPU stream, it
+   waits behind the stuck op and never starts.
+
+5. **Why iter=17 specifically**: Iter=17 corresponds to a particular decode step
+   where the token count, expert assignments, or XCCL communicator state triggers
+   the GPU-side hang. The specific batch pattern at that decode step may activate
+   a code path in MoE dispatch/combine that corrupts or stalls the XCCL state.
+
+---
+
 ### Confirmed Fixed
 - **`num_actual_tokens` mismatch**: fixed by Fix 1
 - **Unequal XCCL tensor sizes** when EP is enabled: fixed by Fix 2
 
-### Remaining Hang — Unknown; occurs at iter=15 or later
+### Remaining Hang — GPU-side silent hang during model forward (visible after async copy stalls)
 
-**Pattern**: iter=1 (prefill) through iter=14 (13th decode step) complete on all
-4 processes. Both DP ranks enter and produce output for iter=14. The hang is at
-some later iteration.
+**Pattern**: Both DP ranks complete all CPU-side traces for iter=17 (including
+returning from sample_tokens with async output). Iter=18 is never scheduled.
+The GPU hangs silently inside iter=17's GPU execution, causing the async
+GPU→CPU output copy to stall. The scheduler waits indefinitely for the copy.
 
-**What the log shows**: The snippet labeled "last two iterations" covers iter=13
-and iter=14. Both dp=0 and dp=1 complete both iterations fully (model forward,
-compute_logits, sample_tokens, ModelRunnerOutput all exit cleanly). No
-`[WARN deadlock-risk]` appears for either iteration, confirming both DP ranks are
-on the same iteration number throughout. The two `_run_ar` ENTER/EXIT pairs per
-dp_rank per iteration (Group A tp=0, Group B tp=1) are expected and normal.
+**Root cause**: An XCCL or MoE operation inside iter=17's GPU-side model forward
+hangs on the GPU. From the CPU's perspective all ops completed (they were
+submitted asynchronously). The GPU copy stream is blocked behind the hung op.
 
-**Root cause of the hang at iter≥15**: Unknown. Needs full log for the hang
-iteration. Candidate causes:
-1. XCCL communicator state corruption from a specific MoE dispatch/combine
-   operation that only triggers under certain batch patterns (token counts, expert
-   assignments, etc.)
-2. async output skew: Fix 3 (disabling async scheduling under EP+DP) is still
-   in place as a safeguard, but has not yet been tested with the new traces.
-3. Scheduler-level DP desync at a later decode step (e.g. when one DP rank's
-   batch empties out and the other still has tokens).
-
-**Next action**: Re-run with Fix 3 applied and collect the full trace log
-including the hang iteration. Look for the last `execute_model: ENTER` and
-`_run_ar: ENTER` / EXIT pair before silence to pinpoint the exact hang point.
+**Next action**: Apply Fix 3 (synchronous output) so the scheduler calls
+`torch.xpu.synchronize()` (or equivalent) before returning from `sample_tokens`.
+This will expose the GPU-side hang inside `sample_tokens` itself instead of
+hiding it in the async copy. The hang iteration's last ENTER trace before
+`sample_tokens` silences will then identify which GPU op is stuck.
 
 ---
 
@@ -264,28 +315,34 @@ including the hang iteration. Look for the last `execute_model: ENTER` and
 
 ## Recommended Next Steps
 
-1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–14 succeed)**:
+1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–17 succeed)**:
    Both Fix 1 and Fix 2 are working. The system now processes iter=1 (prefill)
-   through iter=14 (13th decode step) successfully on all 4 processes.
+   through iter=17 (16th decode step) successfully on both DP ranks.
 
 2. ~~**Confirm iter=3 hang location with new traces**~~ **✓ CONFIRMED (resolved)**:
-   The `dist.all_reduce` in `_run_ar` completes normally for all iterations up
-   to iter=14.
+   The `dist.all_reduce` in `_run_ar` completes normally for all iterations.
 
-3. **Apply Fix 3 and re-run to find the new hang point**:
-   Fix 3 (disabling async scheduling under EP+DP) is already committed in
-   `gpu_model_runner.py`. Re-run with this fix applied. The full trace log must
-   cover the hang iteration — look for the last ENTER trace before silence
-   to pinpoint the exact hang point (which is at iter=15 or later).
+3. **Apply Fix 3 (synchronous output) to expose the GPU-side hang**:
+   In the latest run (iter=17 hang), Fix 3 was NOT applied (`use_async=True`).
+   The GPU hangs silently inside iter=17's model forward; the CPU only discovers
+   this when the async GPU→CPU copy stalls the scheduler.
 
-4. **If Fix 3 does not resolve the hang**: the root cause is likely XCCL
-   communicator corruption triggered by a specific MoE dispatch/combine
-   operation. Next step would be to add ENTER/EXIT traces around the individual
-   xccl calls inside MoE dispatch/combine (already partially traced in
-   `all2all.py` and `xpu_communicator.py`) and look for the last ENTER with no
-   matching EXIT.
+   Apply Fix 3 (already committed in `gpu_model_runner.py`) so that `sample_tokens`
+   blocks until the GPU copy completes synchronously. This will cause the hang to
+   manifest INSIDE `sample_tokens` rather than after it, and the last trace printed
+   before `sample_tokens` silences will identify the exact GPU op that is stuck.
 
-5. **Long-term**: Add a DP barrier at the start of `execute_model` (before
-   `_run_ar`) to ensure all DP ranks are guaranteed to be on the same iteration
-   before issuing any collective. This would turn deadlocks into visible
-   blockages with clear iteration labels.
+4. **After Fix 3 — look for the last trace before `sample_tokens` hangs**:
+   With synchronous output, the hang should appear as `sample_tokens: ENTER _sample`
+   or `sample_tokens: ENTER bookkeeping` with no EXIT. The last trace before
+   silence points directly to the stuck GPU operation.
+
+5. **If Fix 3 does not expose the hang inside sample_tokens**: the GPU op may be
+   stuck inside `execute_model`'s model forward (the MoE dispatch/combine XCCL
+   calls). Check the last ENTER trace from `all2all.py` or `xpu_communicator.py`
+   traces (MoE dispatch/combine ENTER with no matching EXIT) for the hang iter.
+
+6. **Long-term**: Add `torch.xpu.synchronize()` checkpoints around suspected ops
+   (MoE dispatch, all2all, reduce_scatter, all_gather) so the CPU blocks until each
+   GPU op completes. This converts silent GPU hangs into CPU-visible hang points
+   with clear trace labels.
