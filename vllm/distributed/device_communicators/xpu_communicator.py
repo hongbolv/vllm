@@ -216,10 +216,36 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if isinstance(input_, torch.Tensor):
             return _all_gather_single(input_, sizes)
 
-        output_list = []
-        for inp in input_:
-            output_list.append(_all_gather_single(inp, sizes=sizes))
-        return output_list
+        # For list inputs: concatenate all tensors into ONE combined tensor,
+        # perform a SINGLE collective, then split the output back.
+        #
+        # Sequential calls (one per tensor in the list) create multiple XCCL
+        # operations on the same communicator group.  On XPU,
+        # torch.xpu.synchronize() only drains local compute ops and does NOT
+        # wait for cross-device XCCL collectives to globally complete.  So a
+        # faster DP group can finish tensor-1's collective and submit tensor-2's
+        # collective before the slower group has even called tensor-1 — XCCL
+        # call-order mismatch → deadlock.  A single bulk collective eliminates
+        # all such ordering hazards.
+        orig_shapes = [inp.shape for inp in input_]
+        # Flatten each tensor to 2-D [tokens, features] so we can concatenate
+        # along the features dimension regardless of original trailing shape.
+        tensors_2d = [inp.reshape(inp.shape[0], -1) for inp in input_]
+        feature_sizes = [t.shape[1] for t in tensors_2d]
+        combined = torch.cat(tensors_2d, dim=1)  # [tokens, sum_features]
+
+        # ONE collective for the combined tensor.
+        gathered = _all_gather_single(combined, sizes=sizes)
+
+        # Split back along the features dimension and restore original shapes.
+        results = []
+        offset = 0
+        for orig_shape, fsz in zip(orig_shapes, feature_sizes):
+            chunk = gathered[:, offset : offset + fsz]
+            new_shape = (chunk.shape[0],) + orig_shape[1:]
+            results.append(chunk.reshape(new_shape))
+            offset += fsz
+        return results
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
