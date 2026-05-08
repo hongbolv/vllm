@@ -478,6 +478,21 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        # Disable async scheduling when Expert Parallelism + Data Parallelism
+        # is active: AsyncGPUModelRunnerOutput lets one DP rank advance to the
+        # next iteration before the other DP rank finishes the current one.
+        # This skew causes the DP all_reduce in _run_ar to deadlock because one
+        # rank enters iteration N+1's collective while the other is still in N.
+        if (self.use_async_scheduling
+                and self.parallel_config.enable_expert_parallel
+                and self.parallel_config.data_parallel_size > 1):
+            self.use_async_scheduling = False
+            print(
+                f"[INFO dp={self.parallel_config.data_parallel_rank}] "
+                "Disabling async scheduling: EP+DP requires synchronous output "
+                "to prevent cross-iteration DP all_reduce deadlock.",
+                flush=True,
+            )
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
