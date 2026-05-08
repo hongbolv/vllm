@@ -52,7 +52,15 @@ def _run_ar(
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
     tensor[4][dp_rank] = iter_count
+    print(
+        f"[TRACE dp={dp_rank} iter={iter_count}] _run_ar: ENTER dist.all_reduce",
+        flush=True,
+    )
     dist.all_reduce(tensor, group=group)
+    print(
+        f"[TRACE dp={dp_rank} iter={iter_count}] _run_ar: EXIT dist.all_reduce",
+        flush=True,
+    )
     # Deadlock risk check: warn if any DP rank is on a different iteration.
     # A gap of >= 1 iteration means one rank may enter collective N+1 while
     # another is still in collective N, causing a communicator deadlock.

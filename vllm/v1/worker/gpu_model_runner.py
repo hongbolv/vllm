@@ -3839,6 +3839,12 @@ class GPUModelRunner(
 
         # Increment iteration counter for cross-DP deadlock risk tracing.
         self._iter_count += 1
+        _dp = self.parallel_config.data_parallel_rank
+        print(
+            f"[TRACE dp={_dp} iter={self._iter_count}] execute_model: ENTER "
+            f"(before _run_ar / DP all-reduce)",
+            flush=True,
+        )
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
