@@ -106,7 +106,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             self._collective_counter += 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
-                f"reduce_scatterv/variable-size counter={self._collective_counter}",
+                f"reduce_scatterv/variable-size "
+                f"input={list(input_tensor.shape)} ws={world_size} "
+                f"counter={self._collective_counter}",
                 flush=True,
             )
             torch.xpu.synchronize()
@@ -115,14 +117,18 @@ class XpuCommunicator(DeviceCommunicatorBase):
             self._collective_counter -= 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
-                f"reduce_scatterv/variable-size counter={self._collective_counter}",
+                f"reduce_scatterv/variable-size "
+                f"input={list(input_tensor.shape)} ws={world_size} "
+                f"counter={self._collective_counter}",
                 flush=True,
             )
         else:
             self._collective_counter += 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
-                f"reduce_scatterv/uniform counter={self._collective_counter}",
+                f"reduce_scatterv/uniform "
+                f"input={list(input_tensor.shape)} ws={world_size} "
+                f"counter={self._collective_counter}",
                 flush=True,
             )
             torch.xpu.synchronize()
@@ -131,7 +137,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             self._collective_counter -= 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
-                f"reduce_scatterv/uniform counter={self._collective_counter}",
+                f"reduce_scatterv/uniform "
+                f"input={list(input_tensor.shape)} ws={world_size} "
+                f"counter={self._collective_counter}",
                 flush=True,
             )
         # Reshape before returning
@@ -180,7 +188,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self._collective_counter += 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
-                    f"all_gatherv/variable-size counter={self._collective_counter}",
+                    f"all_gatherv/variable-size "
+                    f"input={list(input_.shape)} ws={world_size} "
+                    f"counter={self._collective_counter}",
                     flush=True,
                 )
                 torch.xpu.synchronize()
@@ -189,7 +199,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self._collective_counter -= 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
-                    f"all_gatherv/variable-size counter={self._collective_counter}",
+                    f"all_gatherv/variable-size "
+                    f"input={list(input_.shape)} ws={world_size} "
+                    f"counter={self._collective_counter}",
                     flush=True,
                 )
                 output_tensor = torch.cat(all_gather_list, dim=0)
@@ -197,7 +209,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self._collective_counter += 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
-                    f"all_gatherv/uniform counter={self._collective_counter}",
+                    f"all_gatherv/uniform "
+                    f"input={list(input_.shape)} ws={world_size} "
+                    f"counter={self._collective_counter}",
                     flush=True,
                 )
                 torch.xpu.synchronize()
@@ -208,7 +222,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self._collective_counter -= 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
-                    f"all_gatherv/uniform counter={self._collective_counter}",
+                    f"all_gatherv/uniform "
+                    f"input={list(input_.shape)} ws={world_size} "
+                    f"counter={self._collective_counter}",
                     flush=True,
                 )
             return output_tensor
