@@ -66,11 +66,12 @@ token count, eliminating this class of XCCL corruption/hang.
 ```
 
 `AsyncGPUModelRunnerOutput` starts the GPU→CPU output copy asynchronously and
-returns immediately, allowing dp=0's scheduler to queue iter=N+1 before dp=1
-has even finished iter=N's GPU copy. When dp=0 enters iter=N+1's DP all_reduce,
-dp=1 has not yet entered it → communicator deadlock. Disabling async scheduling
-forces the output copy to complete before the scheduler can advance, making the
-iteration boundary a natural synchronization point across DP ranks.
+returns immediately, potentially allowing dp=0's scheduler to queue iter=N+1
+before dp=1 has finished iter=N's GPU copy. If dp=0 enters iter=N+1's DP
+all_reduce before dp=1 arrives, all 4 processes can deadlock. This fix is a
+preventive measure applied pending confirmation that async output skew is the
+actual remaining hang cause (logs through iter=14 show both DP ranks stay in
+sync, so the actual hang point is at iter≥15 and needs further investigation).
 
 ---
 
@@ -179,7 +180,7 @@ The second iteration reveals DP0 consistently running ahead of DP1:
 - DP0 may enter the third iteration's XCCL collective before DP1 finishes the
   second iteration's collective -> cross-iteration communicator deadlock
 
-### Step 9 - Iter=13/14 hang: confirmed `dist.all_reduce` path, two DP communicator subgroups
+### Step 9 - Both dp=0 and dp=1 complete iter=13 AND iter=14; hang is later
 
 **Log evidence** (from run with ENTER/EXIT traces around `dist.all_reduce`):
 
@@ -194,7 +195,8 @@ The second iteration reveals DP0 consistently running ahead of DP1:
 [TRACE dp=1 iter=13] _run_ar: ENTER dist.all_reduce   ← RANK=3 (dp=1, tp=1) enters Group B
 [TRACE dp=0/1 iter=13] _run_ar: EXIT dist.all_reduce  ← both exit Group B
 # ... iter=13 model forward and sample_tokens complete for all 4 processes
-# Then: NOTHING. Zero output from any process for iter=14.
+# ... iter=14 also completes for both dp=0 AND dp=1 (confirmed by full log)
+# Hang occurs at some later iteration (iter=15 or beyond)
 ```
 
 **Key observation - TWO separate DP communicator subgroups**:
@@ -203,19 +205,13 @@ With TP=2, DP=2, vLLM creates two independent DP communicator groups:
 - **Group A**: `{RANK=0 (dp=0,tp=0), RANK=2 (dp=1,tp=0)}` — tp=0 processes
 - **Group B**: `{RANK=1 (dp=0,tp=1), RANK=3 (dp=1,tp=1)}` — tp=1 processes
 
-All 4 processes call `_run_ar`, but Group A and Group B each do an independent `dist.all_reduce`. Group A finishes first (tp=0 processes slightly faster), then Group B. This is why we see TWO ENTER/EXIT pairs per dp_rank per iteration — one from each group. This behavior is **normal** and both groups succeed for iter=13.
+All 4 processes call `_run_ar`, but Group A and Group B each do an independent `dist.all_reduce`. Group A finishes first (tp=0 processes slightly faster), then Group B. This is why we see TWO ENTER/EXIT pairs per dp_rank per iteration — one from each group. This behavior is **normal** and both groups succeed for iter=13 and iter=14.
 
-**Remaining hang — DP0 outpaces DP1 by one iteration**:
-
-The hang after iter=13 is the classic cross-iteration DP deadlock:
-1. dp=0 finishes iter=13 faster (async output returns immediately)
-2. dp=0 schedules iter=14, both RANK=0 and RANK=1 enter iter=14's `_run_ar`
-3. RANK=2 and RANK=3 (dp=1) are still finishing iter=13's async GPU copy
-4. RANK=0 waits in Group A's all_reduce; RANK=1 waits in Group B's all_reduce
-5. RANK=2 and RANK=3 finally start iter=14, BUT they are already waiting in iter=14's all_reduce for Group A and B respectively — except if they're still stuck in the async copy path they never enter iter=14 at all
-6. All 4 processes deadlock → zero output for iter=14
-
-The root cause is `AsyncGPUModelRunnerOutput`: the async GPU→CPU copy allows dp=0 to signal completion to its scheduler before dp=1's GPU work for the same iteration is finished. The dp=0 scheduler immediately queues iter=14. dp=1 scheduler is one step behind. When dp=0 enters iter=14's DP all_reduce, dp=1 hasn't yet entered it → communicator deadlock.
+**Status**: iter=13 and iter=14 both complete successfully on all 4 processes.
+The hang occurs at a later iteration (likely iter=15 or beyond). The async output
+skew hypothesis (Fix 3) was not confirmed as the specific cause for this run since
+both DP ranks stay synchronized through iter=14. Full logs beyond iter=14 are needed
+to identify the exact hang point.
 
 ---
 
@@ -223,27 +219,32 @@ The root cause is `AsyncGPUModelRunnerOutput`: the async GPU→CPU copy allows d
 - **`num_actual_tokens` mismatch**: fixed by Fix 1
 - **Unequal XCCL tensor sizes** when EP is enabled: fixed by Fix 2
 
-### Remaining Hang — Cross-iteration DP all_reduce deadlock (async output skew)
+### Remaining Hang — Unknown; occurs at iter=15 or later
 
-**Pattern**: iter=1 (prefill) through iter=13 (12th decode step) complete on all
-4 processes. Zero output for iter=14. The two `_run_ar` pairs per dp_rank label
-confirm two independent DP communicator subgroups (Group A: tp=0 pair across DP
-ranks; Group B: tp=1 pair). Both groups succeed every iteration — until the last.
+**Pattern**: iter=1 (prefill) through iter=14 (13th decode step) complete on all
+4 processes. Both DP ranks enter and produce output for iter=14. The hang is at
+some later iteration.
 
-**Root cause**: `AsyncGPUModelRunnerOutput` lets dp=0 signal output to its
-scheduler before dp=1 finishes the async GPU copy. dp=0's scheduler queues
-iter=14 while dp=1's scheduler is still on iter=13. RANK=0 enters iter=14's
-`_run_ar` (Group A) but RANK=2 never arrives — hang. RANK=1 similarly waits in
-Group B, RANK=3 never arrives. All 4 processes deadlock.
+**What the log shows**: The snippet labeled "last two iterations" covers iter=13
+and iter=14. Both dp=0 and dp=1 complete both iterations fully (model forward,
+compute_logits, sample_tokens, ModelRunnerOutput all exit cleanly). No
+`[WARN deadlock-risk]` appears for either iteration, confirming both DP ranks are
+on the same iteration number throughout. The two `_run_ar` ENTER/EXIT pairs per
+dp_rank per iteration (Group A tp=0, Group B tp=1) are expected and normal.
 
-**Root fix**: Disable async output when EP is active so that the GPU→CPU copy
-completes synchronously before the scheduler can queue the next batch. This
-makes iter boundaries a natural synchronization point.
+**Root cause of the hang at iter≥15**: Unknown. Needs full log for the hang
+iteration. Candidate causes:
+1. XCCL communicator state corruption from a specific MoE dispatch/combine
+   operation that only triggers under certain batch patterns (token counts, expert
+   assignments, etc.)
+2. async output skew: Fix 3 (disabling async scheduling under EP+DP) is still
+   in place as a safeguard, but has not yet been tested with the new traces.
+3. Scheduler-level DP desync at a later decode step (e.g. when one DP rank's
+   batch empties out and the other still has tokens).
 
-```python
-# In gpu_model_runner.py or the output consumer
-use_async_output = not self.parallel_config.enable_expert_parallel
-```
+**Next action**: Re-run with Fix 3 applied and collect the full trace log
+including the hang iteration. Look for the last `execute_model: ENTER` and
+`_run_ar: ENTER` / EXIT pair before silence to pinpoint the exact hang point.
 
 ---
 
@@ -263,35 +264,28 @@ use_async_output = not self.parallel_config.enable_expert_parallel
 
 ## Recommended Next Steps
 
-1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–13 succeed)**:
-   Both Fix 1 and Fix 2 are working. The system now processes iter=1 (prefill,
-   30 tokens) through iter=13 (12th decode step) successfully on all 4 processes.
-   The hang moved from iter=1/2 all the way to iter=13/14 — major progress.
+1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–14 succeed)**:
+   Both Fix 1 and Fix 2 are working. The system now processes iter=1 (prefill)
+   through iter=14 (13th decode step) successfully on all 4 processes.
 
 2. ~~**Confirm iter=3 hang location with new traces**~~ **✓ CONFIRMED (resolved)**:
    The `dist.all_reduce` in `_run_ar` completes normally for all iterations up
-   to iter=13. No hang inside `dist.all_reduce` for normal execution.
+   to iter=14.
 
-3. **Fix 3 — Disable async output when EP is active**:
-   The iter=14 hang is caused by `AsyncGPUModelRunnerOutput` letting dp=0 advance
-   one iteration ahead of dp=1. Forcing synchronous output under EP ensures both
-   DP ranks complete their iteration before either can start the next one:
+3. **Apply Fix 3 and re-run to find the new hang point**:
+   Fix 3 (disabling async scheduling under EP+DP) is already committed in
+   `gpu_model_runner.py`. Re-run with this fix applied. The full trace log must
+   cover the hang iteration — look for the last ENTER trace before silence
+   to pinpoint the exact hang point (which is at iter=15 or later).
 
-   ```python
-   # In gpu_model_runner.py sample_tokens():
-   use_async = (self.use_async_output
-                and not self.parallel_config.enable_expert_parallel)
-   ```
+4. **If Fix 3 does not resolve the hang**: the root cause is likely XCCL
+   communicator corruption triggered by a specific MoE dispatch/combine
+   operation. Next step would be to add ENTER/EXIT traces around the individual
+   xccl calls inside MoE dispatch/combine (already partially traced in
+   `all2all.py` and `xpu_communicator.py`) and look for the last ENTER with no
+   matching EXIT.
 
-   Or equivalently: in the engine configuration, set `use_async_output=False`
-   when `enable_expert_parallel=True`.
-
-4. **Alternative Fix 3 — DP barrier at iteration boundary**:
-   Insert an explicit `dist.barrier()` (or another `dist.all_reduce`) at the
-   END of `sample_tokens` (or at the start of `execute_model` before `_run_ar`)
-   using the existing DP group. This ensures no rank can start iter=N+1 until
-   all ranks have finished iter=N's output path.
-
-5. **Long-term**: Make `external_launcher` DP mode guarantee that all DP ranks
-   are within ±1 iteration of each other by adding back-pressure from the
-   executor to the scheduler when any DP rank falls behind.
+5. **Long-term**: Add a DP barrier at the start of `execute_model` (before
+   `_run_ar`) to ensure all DP ranks are guaranteed to be on the same iteration
+   before issuing any collective. This would turn deadlocks into visible
+   blockages with clear iteration labels.
