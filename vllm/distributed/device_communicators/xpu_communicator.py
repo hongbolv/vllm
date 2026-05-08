@@ -111,9 +111,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 f"counter={self._collective_counter}",
                 flush=True,
             )
-            torch.xpu.synchronize()
             dist.reduce_scatter(output, input_splits, group=self.device_group)
-            torch.xpu.synchronize()
             self._collective_counter -= 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
@@ -131,9 +129,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 f"counter={self._collective_counter}",
                 flush=True,
             )
-            torch.xpu.synchronize()
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
-            torch.xpu.synchronize()
             self._collective_counter -= 1
             print(
                 f"[COUNTER] rank={self.rank_in_group} "
@@ -193,9 +189,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     f"counter={self._collective_counter}",
                     flush=True,
                 )
-                torch.xpu.synchronize()
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
-                torch.xpu.synchronize()
                 self._collective_counter -= 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
@@ -214,11 +208,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     f"counter={self._collective_counter}",
                     flush=True,
                 )
-                torch.xpu.synchronize()
                 dist.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group
                 )
-                torch.xpu.synchronize()
                 self._collective_counter -= 1
                 print(
                     f"[COUNTER] rank={self.rank_in_group} "
