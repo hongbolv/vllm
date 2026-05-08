@@ -164,6 +164,10 @@ The second iteration reveals DP0 consistently running ahead of DP1:
 ### Confirmed Fixed
 - **`num_actual_tokens` mismatch**: fixed by Fix 1
 - **Unequal XCCL tensor sizes** when EP is enabled: fixed by Fix 2
+- **Cross-iteration XCCL deadlock**: Fix 2 (forced DP padding) confirmed through
+  logs to resolve the hang. With `should_dp_pad` always True when EP is enabled,
+  all DP ranks process the same token count every iteration, and no
+  `[WARN deadlock-risk]` warnings are emitted in the confirmed-working run.
 
 ### Remaining Hang - Cross-DP / Cross-iteration Synchronization
 
@@ -193,18 +197,21 @@ The `iter=N` labels and `[WARN deadlock-risk]` warnings confirm this.
 
 ## Recommended Next Steps
 
-1. **Confirm Fix 2 resolves the hang**: With `should_dp_pad` always True when
-   EP is enabled, all DP ranks always process the same number of tokens, and
-   XCCL collectives will always have equal-size inputs.
+1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED**: With
+   `should_dp_pad` always True when EP is enabled, all DP ranks process the
+   same number of tokens every iteration. XCCL collectives have equal-size
+   inputs and the hang no longer occurs. Confirmed through run logs.
 
-2. **Confirm no `[WARN deadlock-risk]` warnings** in the logs after Fix 2 is
-   applied. If warnings still fire, executor-level synchronization is needed.
+2. ~~**Confirm no `[WARN deadlock-risk]` warnings**~~ **✓ CONFIRMED**: No
+   `[WARN deadlock-risk]` warnings are emitted after Fix 2 is applied,
+   confirming that DP ranks stay in sync across iterations.
 
-3. **Disable async output path** as a fallback: Set `use_async_output=False`
-   to force synchronous GPU->CPU copies. This slows DP0 down, giving DP1 time
-   to catch up. If this fixes the hang, the async path needs proper barrier
-   synchronization before the next dispatch.
+3. **Disable async output path** as a fallback (no longer needed given Fix 2,
+   but remains an option): Set `use_async_output=False` to force synchronous
+   GPU->CPU copies. This slows DP0 down, giving DP1 time to catch up. If a
+   future regression reintroduces desync, this would be the first thing to try.
 
 4. **Long-term**: Add a barrier in the executor so that all DP ranks must
    complete `sample_tokens` before any rank receives the next `execute_model`
-   dispatch. This would definitively prevent cross-iteration collective mismatches.
+   dispatch. This would definitively prevent cross-iteration collective
+   mismatches even if DP padding is not applied.
