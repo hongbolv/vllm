@@ -232,65 +232,66 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if isinstance(input_, torch.Tensor):
             return _all_gather_single(input_, sizes)
 
-        # For list inputs: collapse sequential collectives into one bulk
-        # collective to eliminate XCCL call-order mismatch.
+        # For list inputs: reduce N sequential XCCL collectives to ONE by
+        # viewing all tensors as int8 (byte representation), concatenating into
+        # a single buffer, gathering once, then splitting back.
         #
-        # Sequential per-tensor calls create N XCCL operations on the same
-        # communicator group.  torch.xpu.synchronize() only drains local GPU
-        # work and does NOT wait for cross-device XCCL collectives to globally
-        # complete.  A faster DP group can therefore finish collective K and
-        # submit collective K+1 before a slower group finishes collective K,
-        # causing an XCCL call-order mismatch → deadlock.
+        # N sequential per-tensor collectives cause XCCL call-order mismatches:
+        # a faster DP group finishes collective K and submits K+1 before a
+        # slower group finishes K → deadlock.
         #
-        # When all tensors share the same dtype we concatenate them along the
-        # feature dimension, do ONE collective for the combined tensor, then
-        # split and reshape the output back.  This reduces N sequential XCCL
-        # ops to one, eliminating the ordering race.
+        # We handle both same-dtype and mixed-dtype lists uniformly using int8.
+        # int8 has element size 1, so view(torch.int8) expands the last dim by
+        # the original element size — exact bit-for-bit round-trip, no padding.
         #
-        # When the list contains mixed dtypes (e.g. float16 hidden_states and
-        # int32 topk_ids in dispatch) torch.cat would fail, so we fall back to
-        # sequential per-tensor collectives with dist.barrier() inserted between
-        # them to ensure all ranks reach the same collective step in lock-step
-        # before proceeding.
-        dtypes = [inp.dtype for inp in input_]
-        if len(set(dtypes)) == 1:
-            # ── Same-dtype path: single combined collective ──────────────────
-            orig_shapes = [inp.shape for inp in input_]
-            # Flatten to 2-D [tokens, features] so we can cat along dim=1.
-            # .contiguous() is required because reshape on non-contiguous
-            # tensors may silently produce wrong strides.
-            tensors_2d = [inp.reshape(inp.shape[0], -1).contiguous()
-                          for inp in input_]
-            feature_sizes = [t.shape[1] for t in tensors_2d]
-            combined = torch.cat(tensors_2d, dim=1)  # [tokens, sum_features]
+        # NOTE: dist.barrier() was previously used in the mixed-dtype fallback.
+        # barrier() is a different XCCL op from all_gather_into_tensor and is
+        # NOT printed in the COUNTER diagnostic log.  A hanging barrier appears
+        # as counter=0 followed by silence, matching the symptom observed after
+        # the previous Fix 5 iteration.  The int8 approach eliminates all
+        # barriers.
+        #
+        # Algorithm:
+        #   1. Contiguous-flatten each tensor to [tokens, flat_features].
+        #   2. view(torch.int8): [tokens, flat_features * elem_bytes].
+        #   3. torch.cat along dim=1 → [tokens, total_bytes] (int8).
+        #   4. ONE _all_gather_single on the combined int8 tensor.
+        #   5. Slice each chunk, view back to original dtype, reshape.
+        orig_shapes = [inp.shape for inp in input_]
+        orig_dtypes = [inp.dtype for inp in input_]
 
-            # ONE collective for the combined tensor.
-            gathered = _all_gather_single(combined, sizes=sizes)
+        int8_views: list[torch.Tensor] = []
+        int8_col_widths: list[int] = []
+        for inp in input_:
+            t = inp.contiguous()
+            n_tokens = t.shape[0]
+            # Flatten feature dims, then view as bytes.
+            t_flat = t.reshape(n_tokens, -1).contiguous()  # [T, F]
+            t_int8 = t_flat.view(torch.int8)               # [T, F * elem_bytes]
+            int8_views.append(t_int8)
+            int8_col_widths.append(t_int8.shape[1])
 
-            # Split back and restore original shapes.
-            # .contiguous() is mandatory: gathered[:, a:b] is a non-contiguous
-            # slice (stride along dim=1 == sum_features, not 1).  Downstream
-            # XPU ops require contiguous tensors; passing a non-contiguous view
-            # causes silent wrong results or explicit errors.
-            results = []
-            offset = 0
-            for orig_shape, fsz in zip(orig_shapes, feature_sizes):
-                chunk = gathered[:, offset : offset + fsz].contiguous()
-                new_shape = (chunk.shape[0],) + orig_shape[1:]
-                results.append(chunk.reshape(new_shape).contiguous())
-                offset += fsz
-            return results
-        else:
-            # ── Mixed-dtype path: sequential collectives + barrier ────────────
-            # torch.cat requires uniform dtype; fall back to individual
-            # collectives.  Insert dist.barrier() between them so that XCCL
-            # sees all ranks call collective K before any rank calls K+1.
-            output_list = []
-            for i, inp in enumerate(input_):
-                if i > 0:
-                    dist.barrier(group=self.device_group)
-                output_list.append(_all_gather_single(inp, sizes=sizes))
-            return output_list
+        # ONE collective on the concatenated int8 buffer.
+        combined_int8 = torch.cat(int8_views, dim=1)       # [T, total_bytes]
+        gathered_int8 = _all_gather_single(combined_int8, sizes=sizes)
+        # gathered_int8: [T * world_size, total_bytes]
+
+        results: list[torch.Tensor] = []
+        offset = 0
+        for orig_shape, orig_dtype, col_width in zip(
+            orig_shapes, orig_dtypes, int8_col_widths
+        ):
+            # Slice the gathered int8 buffer for this tensor.
+            chunk_int8 = gathered_int8[:, offset : offset + col_width].contiguous()
+            # view(orig_dtype): int8 [T*W, F*e] -> orig_dtype [T*W, F]
+            chunk = chunk_int8.view(orig_dtype)
+            # Restore full shape: [T*W, F] -> [T*W] + orig_shape[1:]
+            n_gathered = chunk.shape[0]
+            new_shape = (n_gathered,) + orig_shape[1:]
+            results.append(chunk.reshape(new_shape).contiguous())
+            offset += col_width
+
+        return results
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
