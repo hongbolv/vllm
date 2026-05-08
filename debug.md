@@ -215,74 +215,90 @@ to identify the exact hang point.
 
 ---
 
-### Step 10 — New run (TP=2, Fix 3 NOT applied): hang after iter=17 async copy
+### Step 10 — New run (TP=2, Fix 3 NOT applied): hang after iter=18, iter=19 never starts
 
-**Log evidence** (fresh run, last completed iteration — log is **truncated** at
-`[TRACE dp=1 iter...`; Group B tp=1 process traces are cut off):
+**Log evidence** (fresh run, full log showing iter=17 and iter=18 complete, but
+iter=19 never starts):
 
 ```
+# --- Group A (tp=0) reaches iter=17 first ---
 [TRACE dp=0 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
 [TRACE dp=1 iter=17] execute_model: ENTER (before _run_ar / DP all-reduce)
-[TRACE dp=0 iter=17] _run_ar: ENTER dist.all_reduce     ← Group A (RANK=0, tp=0)
-[TRACE dp=1 iter=17] _run_ar: ENTER dist.all_reduce     ← Group A (RANK=2, tp=0)
-[TRACE dp=0 iter=17] _run_ar: EXIT dist.all_reduce      ← Group A exits
+[TRACE dp=0 iter=17] _run_ar: ENTER dist.all_reduce    ← Group A (RANK=0, tp=0)
+[TRACE dp=1 iter=17] _run_ar: ENTER dist.all_reduce    ← Group A (RANK=2, tp=0)
 [TRACE dp=1 iter=17] _run_ar: EXIT dist.all_reduce
-[TRACE dp=0 iter=17] execute_model: model forward complete ...
-# ... all of execute_model and sample_tokens complete for dp=0 and dp=1
-[TRACE dp=0 iter=17] sample_tokens: ModelRunnerOutput built, use_async=True
-[TRACE dp=0 iter=17] sample_tokens: ENTER AsyncGPUModelRunnerOutput
-[TRACE dp=0 iter=17] sample_tokens: EXIT AsyncGPUModelRunnerOutput
-[TRACE dp=0 iter=17] sample_tokens: returning output (async)
-[TRACE dp=1 iter=17] execute_model: model forward complete ...
-# ... dp=1 execute_model and sample_tokens complete (shown in full log)
-[TRACE dp=1 iter...   ← LOG TRUNCATED HERE (Group B tp=1 traces cut off)
-# Then: NOTHING for iter=18 on any process.
+[TRACE dp=0 iter=17] _run_ar: EXIT dist.all_reduce     ← Group A exits
+
+# --- Group B (tp=1) is still finishing iter=16's CPU postprocessing ---
+# RANK=1 (dp=0,tp=1) and RANK=3 (dp=1,tp=1) lag behind tp=0 in CPU scheduling;
+# they are still running Python postprocessing code for iter=16 while tp=0
+# has already incremented to iter=17 and entered _run_ar.
+[TRACE dp=1 iter=16] execute_model: model forward complete ...
+[TRACE dp=1 iter=16] execute_model: postprocess ENTER ...
+[TRACE dp=0 iter=16] execute_model: model forward complete ...  ← RANK=1 (dp=0,tp=1)
+[TRACE dp=0 iter=16] execute_model: postprocess ENTER ...
+[TRACE dp=1 iter=16] sample_tokens: ENTER
+[TRACE dp=1 iter=16] sample_tokens: ModelRunnerOutput built, use_async=True
+[TRACE dp=1 iter=16] sample_tokens: ENTER AsyncGPUModelRunnerOutput
+[TRACE dp=1 iter=16] sample_tokens: EXIT AsyncGPUModelRunnerOutput
+[TRACE dp=0 iter=16] execute_model: EXIT compute_logits
+[TRACE dp=0 iter=16] execute_model: returning None (success)
+[TRACE dp=1 iter=16] sample_tokens: returning output (async)  ← RANK=3 (dp=1,tp=1)
+[TRACE dp=0 iter=16] sample_tokens: ENTER ...
+# ... dp=0 (RANK=1, tp=1) also completes iter=16's sample_tokens
+
+# --- Group B then runs iter=17's _run_ar (Group B's turn) ---
+# [These traces follow but are not shown in the excerpt.]
+# Both Group A and Group B complete iter=17 and iter=18 fully.
+
+# --- After iter=18: all 4 processes have called sample_tokens (async) ---
+# ... iter=18 execute_model and sample_tokens complete on all 4 processes ...
+[TRACE dp=0 iter=18] sample_tokens: returning output (async)  ← last trace
+[TRACE dp=1 iter=18] sample_tokens: returning output (async)  ← last trace
+# Then: NOTHING. No iter=19 execute_model: ENTER on any process.
 ```
 
 **Key observations**:
 
-1. **TP=2 confirmed (same configuration as previous run)**: The log excerpt shows
-   only ONE `_run_ar` ENTER/EXIT pair in the visible portion, but the log is
-   **truncated** at `[TRACE dp=1 iter...`. With TP=2, DP=2, there are two
-   independent DP communicator groups:
-   - **Group A**: `{RANK=0 (dp=0,tp=0), RANK=2 (dp=1,tp=0)}` — visible in excerpt
-   - **Group B**: `{RANK=1 (dp=0,tp=1), RANK=3 (dp=1,tp=1)}` — in truncated portion
+1. **TP=2, CPU lag between tp=0 and tp=1 processes is normal**: In the iter=17
+   portion of the log we see `dp=0 iter=17` / `dp=1 iter=17` `_run_ar` (Group A,
+   tp=0 processes) followed immediately by `dp=0 iter=16` / `dp=1 iter=16`
+   execute_model traces. This is the **tp=1 processes (RANK=1 and RANK=3)** running
+   one CPU iteration behind the tp=0 processes. Since GPU ops are async, tp=0 can
+   finish CPU postprocessing for iter=16, increment to iter=17, and enter `_run_ar`
+   before tp=1 finishes its Python postprocessing for iter=16. This is expected
+   behavior with TP=2 + async scheduling.
 
-   The earlier step 9 run (TP=2, iter=13) showed TWO `_run_ar` ENTER/EXIT pairs
-   because the log was not truncated and Group B traces appeared after Group A. In
-   the iter=17 log, Group B traces are simply cut off by the truncation.
+2. **Fix 3 NOT applied**: `use_async=True` in sample_tokens traces confirms the
+   async scheduling fix was not active in this run.
 
-   The initial analysis (Step 10 as first written) incorrectly inferred TP=1 from
-   the single visible `_run_ar` pair. The actual configuration is TP=2.
+3. **Both iter=17 and iter=18 complete (CPU-side)**: Unlike the previous
+   understanding, iter=18 also runs and all 4 processes complete through
+   `sample_tokens: returning output (async)` for iter=18. Iter=19 is never started.
 
-2. **Fix 3 NOT applied**: `use_async=True` in both dp ranks' sample_tokens traces
-   confirms the async scheduling fix was not active in this run.
+4. **Root cause — GPU-side silent hang inside iter=18's model forward**:
 
-3. **No iter=18 ENTER trace in the full log**: The complete absence of any
-   `iter=18 execute_model: ENTER` on any of the 4 processes means `execute_model`
-   was never called for iter=18. The hang is **in the scheduler**, waiting for
-   iter=17's async GPU→CPU copy to complete before queuing iter=18.
+   Both iter=17 and iter=18 GPU model forwards are submitted to the GPU asynchronously.
+   The CPU traces all complete normally because Python returns immediately after
+   submitting GPU ops. However, the GPU silently hangs inside iter=18's model
+   forward — likely inside an XCCL MoE dispatch/combine op. When the async GPU→CPU
+   output copy for iter=18 is queued on the GPU stream, it waits behind the stuck
+   op and never starts.
 
-4. **Root cause — async copy hang (GPU-side silent hang)**:
+   The scheduler retrieves iter=18's output by calling into the async output object,
+   which blocks until the GPU copy completes. Since the copy never completes,
+   the scheduler stalls. No iter=19 is ever queued.
 
-   With `use_async=True`, `sample_tokens` returns immediately after kicking off
-   the GPU→CPU output copy on a separate stream. The scheduler then calls into
-   the async output object to retrieve the results — this blocks until the GPU
-   copy completes. If the GPU is stalled at any point AFTER the CPU submitted
-   iter=17's work, the copy never completes, and the scheduler hangs waiting for
-   it. No iter=18 is ever queued.
+   **The CPU sees everything as normal**: all Python code paths for iter=18 execute
+   successfully, `AsyncGPUModelRunnerOutput` is created, and `sample_tokens` returns.
+   The GPU failure is completely invisible at the CPU level until the scheduler tries
+   to consume the output.
 
-   **The critical insight**: all CPU-side traces for execute_model appear to
-   complete normally because GPU ops are submitted asynchronously (CPU-side
-   Python returns immediately). The GPU may have hung inside iter=17's model
-   forward (e.g., inside an XCCL MoE dispatch/combine op) without the CPU knowing
-   it. When the async GPU→CPU copy is then queued on the same GPU stream, it
-   waits behind the stuck op and never starts.
-
-5. **Why iter=17 specifically**: Iter=17 corresponds to a particular decode step
-   where the token count, expert assignments, or XCCL communicator state triggers
-   the GPU-side hang. The specific batch pattern at that decode step may activate
-   a code path in MoE dispatch/combine that corrupts or stalls the XCCL state.
+5. **Why iter=18 specifically (not iter=17)**: The hang point shifts slightly
+   between runs (iter=17 in one run, iter=18 here). This is consistent with a
+   race condition or non-deterministic XCCL state: the exact iteration at which
+   the GPU-side hang triggers depends on the batch composition and communicator
+   state at that decode step.
 
 ---
 
@@ -292,12 +308,15 @@ to identify the exact hang point.
 
 ### Remaining Hang — GPU-side silent hang during model forward (visible after async copy stalls)
 
-**Pattern**: Both DP ranks complete all CPU-side traces for iter=17 (including
-returning from sample_tokens with async output). Iter=18 is never scheduled.
-The GPU hangs silently inside iter=17's GPU execution, causing the async
+**Pattern**: All 4 processes complete all CPU-side traces for iter=18 (including
+returning from sample_tokens with async output). Iter=19 is never scheduled.
+The GPU hangs silently inside iter=18's GPU execution, causing the async
 GPU→CPU output copy to stall. The scheduler waits indefinitely for the copy.
 
-**Root cause**: An XCCL or MoE operation inside iter=17's GPU-side model forward
+The hang point is non-deterministic: in different runs it appears at iter=17 or
+iter=18. This is consistent with a race condition or non-deterministic XCCL state.
+
+**Root cause**: An XCCL or MoE operation inside the GPU-side model forward
 hangs on the GPU. From the CPU's perspective all ops completed (they were
 submitted asynchronously). The GPU copy stream is blocked behind the hung op.
 
@@ -325,17 +344,20 @@ hiding it in the async copy. The hang iteration's last ENTER trace before
 
 ## Recommended Next Steps
 
-1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–17 succeed on TP=2, DP=2)**:
+1. ~~**Confirm Fix 2 resolves the hang**~~ **✓ CONFIRMED (iter=1–18 succeed on TP=2, DP=2)**:
    Both Fix 1 and Fix 2 are working. The system now processes iter=1 (prefill)
-   through iter=17 (16th decode step) successfully on all 4 processes (TP=2 × DP=2).
+   through iter=17 or iter=18 (16th–17th decode steps) successfully on all 4
+   processes (TP=2 × DP=2). The hang point varies between runs (iter=17 in one
+   run, iter=18 in another), consistent with a non-deterministic XCCL/MoE issue.
 
 2. ~~**Confirm iter=3 hang location with new traces**~~ **✓ CONFIRMED (resolved)**:
    The `dist.all_reduce` in `_run_ar` completes normally for all iterations.
 
 3. **Apply Fix 3 (synchronous output) to expose the GPU-side hang**:
-   In the latest run (iter=17 hang), Fix 3 was NOT applied (`use_async=True`).
-   The GPU hangs silently inside iter=17's model forward; the CPU only discovers
-   this when the async GPU→CPU copy stalls the scheduler.
+   In both latest runs (iter=17/18 hang), Fix 3 was NOT applied (`use_async=True`).
+   The GPU hangs silently inside the last iteration's model forward; the CPU only
+   discovers this when the async GPU→CPU copy stalls the scheduler after all
+   CPU-side traces appear to complete normally.
 
    Apply Fix 3 (already committed in `gpu_model_runner.py`) so that `sample_tokens`
    blocks until the GPU copy completes synchronously. This will cause the hang to
