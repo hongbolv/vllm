@@ -220,93 +220,92 @@ the original hang.
 
 ---
 
-### Revised analysis: Fix 5 `int32` type punning — NOT yet tested
+### Fix 5 int8 byte-view — COMPLETELY RULED OUT
 
-The type punning test confirmed `float16 → int8 → float16` round-trips
-correctly on XPU:
+All XPU type punning round-trip tests pass:
+
+```
+# float16 → int8 → float16:  PASSES
+# float32 → int8 → float32:  PASSES
+# int32  → int8 → int32:     PASSES
+```
+
+Fix 5's int8 byte-view correctly preserves bytes for all dtypes used in MoE
+collectives (`hidden_states` float16, `topk_weights` float16/float32,
+`topk_ids` int32). Fix 5 is **not** the source of the "!!!!" output.
+
+---
+
+### New hypothesis: `sizes` mismatch between dp_metadata and padded tensor
+
+The `dispatch` and `combine` functions in `AgRsAll2AllManager` both call
+`dp_metadata.get_chunk_sizes_across_dp_rank()` to get `sizes`. Under MoE
+sequence parallelism (SP), `sizes` is computed via:
 
 ```python
-x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device='xpu')
-x_rt = x.contiguous().view(torch.int8).contiguous().view(torch.float16)
-assert torch.allclose(x, x_rt)  # PASSES
+# forward_context.py — DPMetadata.sp_local_sizes(sp_size)
+sp_tokens = (num_tokens_across_dp_cpu + sp_size - 1) // sp_size
+sp_tokens = sp_tokens.repeat_interleave(sp_size)
 ```
 
-However, Fix 5 also applies the same `view(torch.int8)` transformation to
-**`topk_ids` which is `torch.int32`** (4 bytes per element). This path was
-**never tested**.
-
-Fix 5 `all_gatherv` list path — `dispatch()` sends `[hidden_states, topk_weights, topk_ids]`:
-
-```python
-# xpu_communicator.py — Fix 5
-t_flat = t.reshape(n_tokens, -1).contiguous()  # [T, F]
-t_int8 = t_flat.view(torch.int8)               # [T, F * elem_bytes]
-```
-
-For `topk_ids` (`int32`, K=8 experts): `F * elem_bytes = 8 * 4 = 32` int8 columns.
-
-After gathering and slicing back:
-```python
-chunk_int8 = gathered_int8[:, offset:offset+col_width].contiguous()
-chunk = chunk_int8.view(torch.int32)  # ← THIS was NOT tested for int32 on XPU
-```
-
-**If `view(torch.int32)` on an int8 tensor does not correctly reinterpret
-bytes on XPU** (e.g., due to alignment constraints or an unimplemented kernel),
-all gathered `topk_ids` would be wrong. Wrong `topk_ids` means:
-
-- Every token (real and padding) is routed to wrong experts
-- Wrong expert computation for real tokens 0–3
-- Wrong combined `hidden_states` at positions 0–3
-- Consistently wrong logits for all prompts → same degenerate output "!!!!"
-
-This perfectly explains the **consistency** of "!!!!" across all prompts and
-all DP ranks: the corruption is deterministic (always same wrong expert IDs)
-because the byte-pattern of the real `topk_ids` (small integers like 0–59) maps
-to the same garbage values via a broken `view(int32)`.
-
-### Additional alignment concern in Fix 5
-
-The int8 slice for `topk_ids` starts at byte offset:
+With TP=2 (used as SP=2 for MoE) and `num_tokens_across_dp_cpu = [26, 30]`
+(unpadded, before Fix 1 fully propagates through dp_metadata):
 
 ```
-offset = hidden_states_col_width + topk_weights_col_width
-       = (7168 * 2) + (8 * 2) = 14336 + 16 = 14352
+sizes = [ceil(26/2), ceil(26/2), ceil(30/2), ceil(30/2)] = [13, 13, 15, 15]
 ```
 
-`14352 % 4 = 0` — 4-byte aligned in this case. However, for different model
-configurations (different hidden_dim or topk), this offset may not be divisible
-by 4. A misaligned `view(torch.int32)` could raise a runtime error or silently
-corrupt data.
+This non-uniform sizes would mean the `dispatch` assertion
+`sizes[ep_rank] == hidden_states.shape[0]` compares `13 != 30` and fails.
+
+With `num_tokens_across_dp_cpu = [30, 30]` (padded, Fix 1 fully effective):
+
+```
+sizes = [15, 15, 15, 15]  (uniform → sizes=None in all_gatherv)
+```
+
+**Key question**: Does Fix 1 correctly update `dp_metadata.num_tokens_across_dp_cpu`
+to the padded values before the MoE forward? The [TRACE] logs already emitted
+by the code will answer this directly.
 
 ---
 
 ### Recommended next steps
 
-1. **Test `int32 → int8 → int32` round-trip on XPU**:
-   ```python
-   import torch
-   x = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32, device='xpu')
-   x_rt = x.contiguous().view(torch.int8).contiguous().view(torch.int32)
-   assert torch.equal(x, x_rt), f"int32 round-trip FAILED: {x} vs {x_rt}"
-   print("int32 round-trip PASSED")
+1. **Read the [TRACE] logs** — they are already emitted by the current code:
+
+   ```
+   [TRACE] rank=N dispatch ENTER all_gatherv: sizes=[...], tensor_shapes=[...]
+   [TRACE] rank=N combine ENTER reduce_scatterv: sizes=[...], hidden_states_shape=[...]
    ```
 
-2. **If int32 round-trip fails**: Fix 5 is corrupting `topk_ids`. Replace the
-   single-collective int8 approach for the `dispatch` list path with per-tensor
-   collectives guarded by `dist.barrier()` (Fix 6 barriers already prevent
-   deadlock between rounds; barriers between tensors within one round would
-   eliminate the sequential-collective race for the list path):
-   ```python
-   # Safe fallback: barrier before each per-tensor all_gather_into_tensor
-   for t in input_:
-       dist.barrier(group=self.device_group)
-       dist.all_gather_into_tensor(output_t, t, group=self.device_group)
-   ```
+   - If `sizes` is uniform (e.g., `[30, 30]` for DP=2, SP=1), the collectives
+     use `all_gather_into_tensor` and `reduce_scatter_tensor` (uniform path) ✓
+   - If `sizes` is non-uniform (e.g., `[26, 30]`), an assertion will fire OR
+     the variable-size path is taken with mismatched tensor shapes → data corruption
 
-3. **If int32 round-trip passes**: The `view(int32)` is correct; re-investigate
-   Fix 2's effect on MoE expert capacity limits (whether the 26 garbage tokens
-   overflow expert capacity and cause real-token drops in the combine step).
+2. **Check for SP (sequence parallelism)**: If TP is used as SP for MoE
+   (sp_size > 1), `sizes` will have `dp_size * sp_size` entries (e.g., 4 for
+   TP=2, DP=2). Verify that `sizes[ep_rank] == hidden_states.shape[0]` holds.
+
+3. **If sizes are correct (uniform/matching)**: The "!!!!" must originate from
+   within the model forward itself. Candidates:
+   - Padding tokens (rows 26–29) with garbage query vectors produce large
+     attention weights that corrupt real-token KV cache entries via attention
+     (GDN attention output at positions 0–25 may be affected if the padded
+     queries have extreme values)
+   - Shared experts receiving padded input: if Qwen3-MoE shared experts run
+     on the full padded tensor [30, d], their output for positions 26–29 is
+     garbage. If those positions' shared-expert output is added to the sparse
+     expert output via reduce_scatter, the sum may incorrectly mix garbage
+     with real-token results
+   - Zero out the padding positions before the router to test:
+     ```python
+     # In gpu_model_runner.py, after DP padding is applied:
+     if dp_padding_applied:
+         hidden_states[num_tokens_unpadded:] = 0
+     ```
+     If "!!!!" disappears, padding garbage values are corrupting the MoE router.
 
 ---
 
