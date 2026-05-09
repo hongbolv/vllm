@@ -27,6 +27,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # If the last printed counter is 0, the collective completed normally.
         # A stuck counter (last value > 0) identifies the hanging collective.
         self._collective_counter: int = 0
+        # Global call sequence number: increments each time a collective starts.
+        # Printed in COUNTER logs so the caller can identify the exact Nth call
+        # in the run that hangs, regardless of which collective type it is.
+        self._call_seq: int = 0
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -48,7 +52,22 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         output = input_.clone() if torch.compiler.is_compiling() else input_
+        self._call_seq += 1
+        self._collective_counter += 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} all_reduce "
+            f"input={list(input_.shape)} ws={self.world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
         dist.all_reduce(output, group=self.device_group)
+        self._collective_counter -= 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} all_reduce "
+            f"input={list(input_.shape)} ws={self.world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
         return output
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
@@ -70,7 +89,22 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
 
+        self._call_seq += 1
+        self._collective_counter += 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} reduce_scatter "
+            f"input={list(input_tensor.shape)} ws={world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
         dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+        self._collective_counter -= 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} reduce_scatter "
+            f"input={list(input_tensor.shape)} ws={world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
@@ -103,9 +137,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
             # if inputs shape in different ranks is not the same using reduce_scatter
             input_splits = list(input_tensor.split(sizes, dim=0))
+            self._call_seq += 1
             self._collective_counter += 1
             print(
-                f"[COUNTER] rank={self.rank_in_group} "
+                f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                 f"reduce_scatterv/variable-size "
                 f"input={list(input_tensor.shape)} ws={world_size} "
                 f"counter={self._collective_counter}",
@@ -114,16 +149,17 @@ class XpuCommunicator(DeviceCommunicatorBase):
             dist.reduce_scatter(output, input_splits, group=self.device_group)
             self._collective_counter -= 1
             print(
-                f"[COUNTER] rank={self.rank_in_group} "
+                f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                 f"reduce_scatterv/variable-size "
                 f"input={list(input_tensor.shape)} ws={world_size} "
                 f"counter={self._collective_counter}",
                 flush=True,
             )
         else:
+            self._call_seq += 1
             self._collective_counter += 1
             print(
-                f"[COUNTER] rank={self.rank_in_group} "
+                f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                 f"reduce_scatterv/uniform "
                 f"input={list(input_tensor.shape)} ws={world_size} "
                 f"counter={self._collective_counter}",
@@ -132,7 +168,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
             self._collective_counter -= 1
             print(
-                f"[COUNTER] rank={self.rank_in_group} "
+                f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                 f"reduce_scatterv/uniform "
                 f"input={list(input_tensor.shape)} ws={world_size} "
                 f"counter={self._collective_counter}",
@@ -181,9 +217,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
                             device=input_.device,
                         )
                     )
+                self._call_seq += 1
                 self._collective_counter += 1
                 print(
-                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                     f"all_gatherv/variable-size "
                     f"input={list(input_.shape)} ws={world_size} "
                     f"counter={self._collective_counter}",
@@ -192,7 +229,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
                 self._collective_counter -= 1
                 print(
-                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                     f"all_gatherv/variable-size "
                     f"input={list(input_.shape)} ws={world_size} "
                     f"counter={self._collective_counter}",
@@ -200,9 +237,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 )
                 output_tensor = torch.cat(all_gather_list, dim=0)
             else:
+                self._call_seq += 1
                 self._collective_counter += 1
                 print(
-                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                     f"all_gatherv/uniform "
                     f"input={list(input_.shape)} ws={world_size} "
                     f"counter={self._collective_counter}",
@@ -213,7 +251,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 )
                 self._collective_counter -= 1
                 print(
-                    f"[COUNTER] rank={self.rank_in_group} "
+                    f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} "
                     f"all_gatherv/uniform "
                     f"input={list(input_.shape)} ws={world_size} "
                     f"counter={self._collective_counter}",
@@ -302,7 +340,22 @@ class XpuCommunicator(DeviceCommunicatorBase):
             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
+        self._call_seq += 1
+        self._collective_counter += 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} gather "
+            f"input={list(input_size)} ws={self.world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        self._collective_counter -= 1
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={self._call_seq} gather "
+            f"input={list(input_size)} ws={self.world_size} "
+            f"counter={self._collective_counter}",
+            flush=True,
+        )
         if self.rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)
