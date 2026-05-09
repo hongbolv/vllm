@@ -3987,19 +3987,6 @@ class GPUModelRunner(
             pad_attn = (cudagraph_mode == CUDAGraphMode.FULL
                         or dp_padding_applied)
 
-            # Diagnostic: check if decode stage is doing unnecessary padding
-            # In decode, each request generates 1 token, so if all DP ranks
-            # have the same number of requests, padding should not be needed.
-            if dp_padding_applied and max_num_scheduled_tokens == 1:
-                print(
-                    f"[DP_PAD_DECODE_CHECK] ERROR: Decode stage has unnecessary "
-                    f"DP padding! num_tokens_padded={num_tokens_padded}, "
-                    f"num_tokens_unpadded={num_tokens_unpadded}, "
-                    f"num_reqs={num_reqs}, max_num_scheduled_tokens="
-                    f"{max_num_scheduled_tokens}, num_tokens_across_dp="
-                    f"{num_tokens_across_dp}. Fix 1 forced padding is too "
-                    f"aggressive for decode stage.",
-                    flush=True)
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
