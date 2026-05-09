@@ -189,62 +189,124 @@ All prompts, all DP ranks, all iterations produce the same degenerate output.
 
 ## Wrong Output Analysis
 
-### Ruled out: Fix 5 int8 byte-view (type punning) data corruption
+### Why Fix 2 does NOT directly cause "!!!!" output
 
-Type punning test on XPU confirmed byte-accurate round-trip:
+Fix 2 sets `pad_attn=True` when DP padding increases the token count, aligning
+`num_actual_tokens` with the padded tensor row count (e.g., 30 instead of 26).
+This causes the GDN attention kernel to process all 30 rows — including the 26
+padding positions whose query vectors contain uninitialized (garbage) data.
+
+However, Fix 2 **cannot** be the primary cause of "!!!!" through attention
+corruption because of `logits_indices`:
+
+```python
+# gpu_model_runner.py — sampling step
+sample_hidden_states = hidden_states[logits_indices]
+```
+
+`logits_indices` contains only the real token positions (e.g., `[0, 1, 2, 3]`
+for 4 decode requests). Even if GDN writes garbage attention outputs to
+`hidden_states[4:30]` for the padding rows, the final logit computation uses
+only `hidden_states[0:3]` — the correct positions. Garbage at positions 4–29
+is never read by the sampler.
+
+Similarly, inside the MoE layer, each token's expert output is computed
+independently (no cross-token interactions within a single expert forward).
+Garbage routing for positions 4–29 does not overwrite positions 0–3.
+
+**Fix 2 is necessary and correct.** The `num_actual_tokens` alignment is
+required to prevent the GDN kernel size-check assertion failure that caused
+the original hang.
+
+---
+
+### Revised analysis: Fix 5 `int32` type punning — NOT yet tested
+
+The type punning test confirmed `float16 → int8 → float16` round-trips
+correctly on XPU:
+
 ```python
 x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device='xpu')
 x_rt = x.contiguous().view(torch.int8).contiguous().view(torch.float16)
-assert torch.allclose(x, x_rt)  # PASSES — no corruption
+assert torch.allclose(x, x_rt)  # PASSES
 ```
-Fix 5's int8 byte-view approach correctly preserves tensor data on XPU.
-**Not the cause of "!!!!" output.**
 
-### Most likely suspect: Fix 2 (`pad_attn=True`) corrupts expert outputs
+However, Fix 5 also applies the same `view(torch.int8)` transformation to
+**`topk_ids` which is `torch.int32`** (4 bytes per element). This path was
+**never tested**.
 
-**Root cause hypothesis**: Fix 2 sets `pad_attn=True` when DP padding increases
-the token count. This aligns `num_actual_tokens` with the padded tensor row
-count, which is necessary to prevent the XPU GDN kernel assertion failure.
-However, it also causes the GDN attention kernel to process the *padding tokens*
-as real query rows.
+Fix 5 `all_gatherv` list path — `dispatch()` sends `[hidden_states, topk_weights, topk_ids]`:
 
-The padding tokens' query vectors are **not zeroed** — they contain whatever was
-already in the padded buffer positions. These non-zero padding queries:
-1. Attend to the KV cache and produce non-trivial (garbage) attention outputs.
-2. Flow through the MoE layers as if they were real tokens.
-3. Are dispatched to experts in the MoE `combine` (reduce_scatterv) step.
-4. If the combine step slices expert outputs by the padded count rather than the
-   real count, padding-token expert outputs contaminate the real token outputs.
+```python
+# xpu_communicator.py — Fix 5
+t_flat = t.reshape(n_tokens, -1).contiguous()  # [T, F]
+t_int8 = t_flat.view(torch.int8)               # [T, F * elem_bytes]
+```
 
-**Why "!!!!" specifically**: Corrupted `router_logits` (all-zeros or garbage
-bytes) → softmax produces a near-uniform distribution → topk always selects the
-same expert(s) → the selected expert happens to output the token ID for "!".
-Because all prompts get the same corrupt router state, they all produce the same
-degenerate token.
+For `topk_ids` (`int32`, K=8 experts): `F * elem_bytes = 8 * 4 = 32` int8 columns.
+
+After gathering and slicing back:
+```python
+chunk_int8 = gathered_int8[:, offset:offset+col_width].contiguous()
+chunk = chunk_int8.view(torch.int32)  # ← THIS was NOT tested for int32 on XPU
+```
+
+**If `view(torch.int32)` on an int8 tensor does not correctly reinterpret
+bytes on XPU** (e.g., due to alignment constraints or an unimplemented kernel),
+all gathered `topk_ids` would be wrong. Wrong `topk_ids` means:
+
+- Every token (real and padding) is routed to wrong experts
+- Wrong expert computation for real tokens 0–3
+- Wrong combined `hidden_states` at positions 0–3
+- Consistently wrong logits for all prompts → same degenerate output "!!!!"
+
+This perfectly explains the **consistency** of "!!!!" across all prompts and
+all DP ranks: the corruption is deterministic (always same wrong expert IDs)
+because the byte-pattern of the real `topk_ids` (small integers like 0–59) maps
+to the same garbage values via a broken `view(int32)`.
+
+### Additional alignment concern in Fix 5
+
+The int8 slice for `topk_ids` starts at byte offset:
+
+```
+offset = hidden_states_col_width + topk_weights_col_width
+       = (7168 * 2) + (8 * 2) = 14336 + 16 = 14352
+```
+
+`14352 % 4 = 0` — 4-byte aligned in this case. However, for different model
+configurations (different hidden_dim or topk), this offset may not be divisible
+by 4. A misaligned `view(torch.int32)` could raise a runtime error or silently
+corrupt data.
+
+---
 
 ### Recommended next steps
 
-1. **Verify Fix 2 is the corruption source**: temporarily revert Fix 2 (set
-   `pad_attn = cudagraph_mode == CUDAGraphMode.FULL` only, without the
-   `dp_padding_applied` branch). Run with Fix 6 (barriers) still active.
-   - If "!!!!" disappears and hang returns: Fix 2 is the corruption source;
-     need an alternative approach (see below).
-   - If "!!!!" disappears and inference succeeds: Fix 2 + Fix 6 interact badly.
-   - If "!!!!" persists without Fix 2: the corruption comes from elsewhere.
+1. **Test `int32 → int8 → int32` round-trip on XPU**:
+   ```python
+   import torch
+   x = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32, device='xpu')
+   x_rt = x.contiguous().view(torch.int8).contiguous().view(torch.int32)
+   assert torch.equal(x, x_rt), f"int32 round-trip FAILED: {x} vs {x_rt}"
+   print("int32 round-trip PASSED")
+   ```
 
-2. **Alternative to Fix 2 — zero padding token query vectors**: Instead of
-   setting `pad_attn=True` (which expands `num_actual_tokens` to include
-   padding), explicitly zero the query, key, and value vectors for the padding
-   token positions *before* the GDN kernel is called. This keeps
-   `num_actual_tokens` at the real count while giving the kernel zero-initialized
-   padding rows that produce zero attention output and do not contaminate the
-   combine step.
+2. **If int32 round-trip fails**: Fix 5 is corrupting `topk_ids`. Replace the
+   single-collective int8 approach for the `dispatch` list path with per-tensor
+   collectives guarded by `dist.barrier()` (Fix 6 barriers already prevent
+   deadlock between rounds; barriers between tensors within one round would
+   eliminate the sequential-collective race for the list path):
+   ```python
+   # Safe fallback: barrier before each per-tensor all_gather_into_tensor
+   for t in input_:
+       dist.barrier(group=self.device_group)
+       dist.all_gather_into_tensor(output_t, t, group=self.device_group)
+   ```
 
-3. **Check GDN kernel `num_actual_tokens` semantics**: Verify whether the XPU
-   GDN kernel uses `num_actual_tokens` as an *iteration bound* (iterates over
-   `0..num_actual_tokens-1` queries) or merely as an assertion. If the former,
-   passing the padded count may cause the kernel to access out-of-bounds
-   `query_start_loc` entries for the extra padding rows.
+3. **If int32 round-trip passes**: The `view(int32)` is correct; re-investigate
+   Fix 2's effect on MoE expert capacity limits (whether the 26 garbage tokens
+   overflow expert capacity and cause real-token drops in the combine step).
 
 ---
 
