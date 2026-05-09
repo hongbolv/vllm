@@ -1,0 +1,13 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -480,6 +480,10 @@
+         # Async scheduling
+         self.use_async_scheduling = self.scheduler_config.async_scheduling
+ 
++        if (self.use_async_scheduling
++                and self.parallel_config.enable_expert_parallel
++                and self.parallel_config.data_parallel_size > 1):
++            self.use_async_scheduling = False
++
+         # Sampler
+         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)

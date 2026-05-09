@@ -11,31 +11,6 @@ DP=2 with DP padding enabled.
 
 ---
 
-## MoE Layer Collective Sequence (confirmed from logs)
-
-Each MoE layer forward issues exactly these XCCL collectives (confirmed by
-layer=11 full-cycle log, all 4 ranks completing each round):
-
-```
-all_gatherv  round 1  ←  dispatch_router_logits (hidden_states + router_logits)
-all_gatherv  round 2  ←  dispatch/prepare (hidden_states + topk_weights + topk_ids)
-all_gatherv  round 3  ←  (third call; source under investigation — shared expert or second dispatch)
-reduce_scatterv round 1  ←  combine (expert outputs)
-```
-
-Layer 11 log evidence (all 4 ranks complete each round, full cycle confirmed):
-```
-[COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 1)
-[COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 2)
-[COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 3)
-[COUNTER] rank={0,1,2,3} reduce_scatterv/uniform counter=1  → 0  (round 1)
-```
-
-The layer=11 MoE cycle completes fully — all 3 all_gatherv rounds and the
-reduce_scatterv round all reach counter=0 for all 4 ranks.
-
----
-
 ## Confirmed Fixes
 
 ### Fix 1 — Force DP padding when Expert Parallelism is enabled
@@ -122,6 +97,23 @@ waiting for the missing output slots.
 +        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
 ```
 
+**Risk assessment**: This change is **low risk and safe** for the current issue.
+
+- `dist.all_gather(tensor_list, input_)` expects `tensor_list` to be a list of
+  `world_size` pre-allocated tensors. The original code passes `[output_tensor]`
+  (1 element). When `world_size > 1`, this is an API misuse that causes a
+  deadlock — ranks wait forever for output slots that don't exist.
+- `dist.all_gather_into_tensor(output_tensor, input_)` is the correct API for
+  gathering into a single contiguous tensor. It expects `output_tensor` to have
+  `world_size * input_size[0]` rows, which matches how `output_tensor` is
+  allocated at line 131: `output_size = (input_size[0] * world_size,) + input_size[1:]`.
+- The same API (`all_gather_into_tensor`) is already used in the `gather()`
+  method of the same file (line 178) and in `base_device_communicator.py`
+  (line 198), confirming this is the standard pattern in vLLM.
+- This fix only affects the **uniform path** (all ranks have equal tensor sizes,
+  i.e., `sizes is None`), which is the path used when DP padding is active
+  (Fix 1). The variable-size path (line 147) remains unchanged.
+
 ### Fix 5 — Eliminate sequential all_gatherv calls in list path
 
 **Status**: ✅ APPLIED. This is a **production correctness fix**, not merely a
@@ -158,6 +150,25 @@ group only. `dist.barrier(group=dist_group.device_group)` issues an XCCL
 barrier that drains any in-flight GPU kernels (routing softmax/topk) before
 the collective is submitted, ensuring all ranks reach the collective
 call-site together.
+
+---
+
+## Patch Files
+
+All fix patches are available in the `patches/` directory:
+
+| Patch | Description |
+|-------|-------------|
+| `patches/fix1_dp_padding_for_ep.patch` | Force DP padding when EP is enabled |
+| `patches/fix2_pad_attn_for_dp_padding.patch` | Align `num_actual_tokens` with padded count |
+| `patches/fix3_disable_async_sched_ep_dp.patch` | Disable async scheduling for EP+DP |
+| `patches/fix4_all_gatherv_uniform_path.patch` | Use `all_gather_into_tensor` for uniform path |
+| `patches/fix6_barrier_before_collectives.patch` | Add XCCL barrier before MoE collectives |
+
+Apply all patches:
+```bash
+git apply patches/fix*.patch
+```
 
 ---
 
