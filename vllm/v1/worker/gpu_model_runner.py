@@ -3863,6 +3863,13 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.debug(
+            "[TRACE] ENTER execute_model dp=%d num_tokens=%d",
+            self.parallel_config.data_parallel_rank
+            if self.parallel_config.data_parallel_size > 1
+            else 0,
+            num_scheduled_tokens,
+        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4172,6 +4179,13 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        logger.debug(
+            "[TRACE] EXIT execute_model dp=%d",
+            self.parallel_config.data_parallel_rank
+            if self.parallel_config.data_parallel_size > 1
+            else 0,
+        )
+
         return None
 
     @torch.inference_mode
@@ -4211,6 +4225,13 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        logger.debug(
+            "[TRACE] ENTER sample_tokens dp=%d",
+            self.parallel_config.data_parallel_rank
+            if self.parallel_config.data_parallel_size > 1
+            else 0,
+        )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4388,6 +4409,12 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            logger.debug(
+                "[TRACE] EXIT sample_tokens dp=%d",
+                self.parallel_config.data_parallel_rank
+                if self.parallel_config.data_parallel_size > 1
+                else 0,
+            )
             return output
 
         with record_function_or_nullcontext(
@@ -4411,6 +4438,12 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        logger.debug(
+            "[TRACE] EXIT sample_tokens (async) dp=%d",
+            self.parallel_config.data_parallel_rank
+            if self.parallel_config.data_parallel_size > 1
+            else 0,
+        )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

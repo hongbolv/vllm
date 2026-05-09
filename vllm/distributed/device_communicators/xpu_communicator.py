@@ -14,6 +14,9 @@ logger = init_logger(__name__)
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
+
+    _seq_counter = 0
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -74,6 +77,16 @@ class XpuCommunicator(DeviceCommunicatorBase):
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
         world_size = self.world_size
+        XpuCommunicator._seq_counter += 1
+        seq = XpuCommunicator._seq_counter
+        path = ("uniform"
+                if (sizes is None
+                    or sizes.count(sizes[0]) == len(sizes))
+                else "variable-size")
+        logger.debug(
+            "[COUNTER] rank=%d seq=%d reduce_scatterv/%s counter=1",
+            self.rank_in_group, seq, path,
+        )
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -101,6 +114,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
             dist.reduce_scatter(output, input_splits, group=self.device_group)
         else:
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+        logger.debug(
+            "[COUNTER] rank=%d seq=%d reduce_scatterv/%s counter=0",
+            self.rank_in_group, seq, path,
+        )
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
@@ -118,6 +135,14 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
+
+        XpuCommunicator._seq_counter += 1
+        seq = XpuCommunicator._seq_counter
+        path = "uniform" if sizes is None else "variable-size"
+        logger.debug(
+            "[COUNTER] rank=%d seq=%d all_gatherv/%s counter=1",
+            self.rank_in_group, seq, path,
+        )
 
         def _all_gather_single(input_: torch.Tensor, sizes: list[int] | None = None):
             input_size = input_.size()
@@ -151,12 +176,17 @@ class XpuCommunicator(DeviceCommunicatorBase):
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
-            return _all_gather_single(input_, sizes)
+            result = _all_gather_single(input_, sizes)
+        else:
+            result = []
+            for inp in input_:
+                result.append(_all_gather_single(inp, sizes=sizes))
 
-        output_list = []
-        for inp in input_:
-            output_list.append(_all_gather_single(inp, sizes=sizes))
-        return output_list
+        logger.debug(
+            "[COUNTER] rank=%d seq=%d all_gatherv/%s counter=0",
+            self.rank_in_group, seq, path,
+        )
+        return result
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

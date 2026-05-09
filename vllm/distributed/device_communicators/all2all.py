@@ -66,6 +66,15 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
+        logger.debug(
+            "[TRACE] rank=%d dispatch_router_logits ENTER all_gatherv: "
+            "sizes=%s, tensor_shapes=[%s, %s]",
+            dist_group.rank_in_group,
+            sizes,
+            list(hidden_states.shape),
+            list(router_logits.shape),
+        )
+
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
@@ -74,6 +83,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             tensors_to_gather,
             dim=0,
             sizes=sizes,
+        )
+
+        logger.debug(
+            "[TRACE] rank=%d dispatch_router_logits EXIT all_gatherv",
+            dist_group.rank_in_group,
         )
 
         if extra_tensors is not None:
@@ -101,6 +115,16 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
+        logger.debug(
+            "[TRACE] rank=%d dispatch ENTER all_gatherv: "
+            "sizes=%s, tensor_shapes=[%s, %s, %s]",
+            dist_group.rank_in_group,
+            sizes,
+            list(hidden_states.shape),
+            list(topk_weights.shape),
+            list(topk_ids.shape),
+        )
+
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
@@ -109,6 +133,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             tensors_to_gather,
             dim=0,
             sizes=sizes,
+        )
+
+        logger.debug(
+            "[TRACE] rank=%d dispatch EXIT all_gatherv",
+            dist_group.rank_in_group,
         )
 
         hidden_states = gathered_tensors[0]
@@ -132,7 +161,22 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+
+        logger.debug(
+            "[TRACE] rank=%d combine ENTER reduce_scatterv: "
+            "sizes=%s, hidden_states_shape=%s",
+            dist_group.rank_in_group,
+            sizes,
+            list(hidden_states.shape),
+        )
+
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+
+        logger.debug(
+            "[TRACE] rank=%d combine EXIT reduce_scatterv",
+            dist_group.rank_in_group,
+        )
+
         return hidden_states
 
     def destroy(self):

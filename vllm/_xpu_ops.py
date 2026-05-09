@@ -114,6 +114,16 @@ def _gdn_attention_core_xpu_impl(
     attn_metadata = attn_metadata_raw[self.prefix]
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+    num_actual_tokens = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+    match = core_attn_out.size(0) == num_actual_tokens
+    logger.debug(
+        "[TRACE] _gdn_attention_core_xpu_impl: "
+        "core_attn_out.size(0)=%d, num_actual_tokens=%d, match=%s",
+        core_attn_out.size(0),
+        num_actual_tokens,
+        match,
+    )
+
     # TODO: xpu does not support speculative decoding yet
     assert attn_metadata.spec_sequence_masks is None  # type: ignore[attr-defined]
 
@@ -121,6 +131,7 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    logger.debug("[TRACE] ENTER gdn_attention kernel layer=%s", layer_name)
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
@@ -142,10 +153,11 @@ def _gdn_attention_core_xpu_impl(
         has_initial_state=attn_metadata.has_initial_state,  # type: ignore[attr-defined]
         non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,  # type: ignore[attr-defined]
         non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,  # type: ignore[attr-defined]
-        num_actual_tokens=attn_metadata.num_actual_tokens,  # type: ignore[attr-defined]
+        num_actual_tokens=num_actual_tokens,
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
+    logger.debug("[TRACE] EXIT gdn_attention kernel layer=%s", layer_name)
 
 
 def _gdn_attention_core_xpu_fake(
