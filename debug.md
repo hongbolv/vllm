@@ -230,9 +230,12 @@ All XPU type punning round-trip tests pass:
 # int32  → int8 → int32:     PASSES
 ```
 
-Fix 5's int8 byte-view correctly preserves bytes for all dtypes used in MoE
-collectives (`hidden_states` float16, `topk_weights` float16/float32,
-`topk_ids` int32). Fix 5 is **not** the source of the "!!!!" output.
+Fix 5 (in `xpu_communicator.py`) reduces N sequential XCCL collectives to ONE
+by converting all tensors to int8 byte-view, concatenating, gathering once,
+then splitting back. The round-trip tests confirm it correctly preserves bytes
+for all dtypes used in MoE collectives (`hidden_states` float16,
+`topk_weights` float16/float32, `topk_ids` int32). Fix 5 is **not** the
+source of the "!!!!" output.
 
 ---
 
@@ -249,14 +252,17 @@ sp_tokens = sp_tokens.repeat_interleave(sp_size)
 ```
 
 With TP=2 (used as SP=2 for MoE) and `num_tokens_across_dp_cpu = [26, 30]`
-(unpadded, before Fix 1 fully propagates through dp_metadata):
+(unpadded, if Fix 1 has not propagated to dp_metadata):
 
 ```
 sizes = [ceil(26/2), ceil(26/2), ceil(30/2), ceil(30/2)] = [13, 13, 15, 15]
 ```
 
-This non-uniform sizes would mean the `dispatch` assertion
-`sizes[ep_rank] == hidden_states.shape[0]` compares `13 != 30` and fails.
+After Fix 2 (DP padding), hidden_states on dp_rank 0 has 30 rows. After SP
+split (÷2), `hidden_states.shape[0] = 15`. But `sizes[ep_rank=0] = 13`.
+The `dispatch` assertion `sizes[ep_rank] == hidden_states.shape[0]` compares
+`13 != 15` → **AssertionError**, or if the assertion is absent, the
+variable-size path is used with wrong slice boundaries → data corruption.
 
 With `num_tokens_across_dp_cpu = [30, 30]` (padded, Fix 1 fully effective):
 
