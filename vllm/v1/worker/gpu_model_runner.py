@@ -4028,6 +4028,22 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            # Diagnostic: verify padding tokens have PAD_SLOT_ID (-1)
+            if dp_padding_applied and slot_mappings:
+                for layer_name, sm in slot_mappings.items():
+                    pad_slots = sm[num_tokens_unpadded:num_tokens_padded]
+                    bad_mask = pad_slots != -1
+                    if bad_mask.any():
+                        bad_vals = pad_slots[bad_mask]
+                        logger.error(
+                            "DP padding slot_mapping ERROR: layer=%s, "
+                            "padding positions [%d:%d] contain non-PAD_SLOT_ID "
+                            "values: %s (expected all -1). This will pollute "
+                            "KV cache and corrupt attention in decode stage.",
+                            layer_name, num_tokens_unpadded,
+                            num_tokens_padded, bad_vals.tolist()[:10])
+                    break  # all groups share same padding logic
+
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
