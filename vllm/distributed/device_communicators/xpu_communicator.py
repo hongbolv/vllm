@@ -151,68 +151,13 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
             return output_tensor
 
-        # Hongbo Fix 5
         if isinstance(input_, torch.Tensor):
             return _all_gather_single(input_, sizes)
-        # For list inputs: collapse sequential collectives into one bulk
-        # collective to eliminate XCCL call-order mismatch.
-        #
-        # Sequential per-tensor calls create N XCCL operations on the same
-        # communicator group.  torch.xpu.synchronize() only drains local GPU
-        # work and does NOT wait for cross-device XCCL collectives to globally
-        # complete.  A faster DP group can therefore finish collective K and
-        # submit collective K+1 before a slower group finishes collective K,
-        # causing an XCCL call-order mismatch → deadlock.
-        #
-        # When all tensors share the same dtype we concatenate them along the
-        # feature dimension, do ONE collective for the combined tensor, then
-        # split and reshape the output back.  This reduces N sequential XCCL
-        # ops to one, eliminating the ordering race.
-        #
-        # When the list contains mixed dtypes (e.g. float16 hidden_states and
-        # int32 topk_ids in dispatch) torch.cat would fail, so we fall back to
-        # sequential per-tensor collectives with dist.barrier() inserted between
-        # them to ensure all ranks reach the same collective step in lock-step
-        # before proceeding.
-        dtypes = [inp.dtype for inp in input_]
-        if len(set(dtypes)) == 1:
-            # ── Same-dtype path: single combined collective ──────────────────
-            orig_shapes = [inp.shape for inp in input_]
-            # Flatten to 2-D [tokens, features] so we can cat along dim=1.
-            # .contiguous() is required because reshape on non-contiguous
-            # tensors may silently produce wrong strides.
-            tensors_2d = [inp.reshape(inp.shape[0], -1).contiguous()
-                          for inp in input_]
-            feature_sizes = [t.shape[1] for t in tensors_2d]
-            combined = torch.cat(tensors_2d, dim=1)  # [tokens, sum_features]
 
-            # ONE collective for the combined tensor.
-            gathered = _all_gather_single(combined, sizes=sizes)
-
-            # Split back and restore original shapes.
-            # .contiguous() is mandatory: gathered[:, a:b] is a non-contiguous
-            # slice (stride along dim=1 == sum_features, not 1).  Downstream
-            # XPU ops require contiguous tensors; passing a non-contiguous view
-            # causes silent wrong results or explicit errors.
-            results = []
-            offset = 0
-            for orig_shape, fsz in zip(orig_shapes, feature_sizes):
-                chunk = gathered[:, offset : offset + fsz].contiguous()
-                new_shape = (chunk.shape[0],) + orig_shape[1:]
-                results.append(chunk.reshape(new_shape).contiguous())
-                offset += fsz
-            return results
-        else:
-            # ── Mixed-dtype path: sequential collectives + barrier ────────────
-            # torch.cat requires uniform dtype; fall back to individual
-            # collectives.  Insert dist.barrier() between them so that XCCL
-            # sees all ranks call collective K before any rank calls K+1.
-            output_list = []
-            for i, inp in enumerate(input_):
-                if i > 0:
-                    dist.barrier(group=self.device_group)
-                output_list.append(_all_gather_single(inp, sizes=sizes))
-            return output_list
+        output_list = []
+        for inp in input_:
+            output_list.append(_all_gather_single(inp, sizes=sizes))
+        return output_list
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
