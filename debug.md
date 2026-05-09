@@ -38,7 +38,26 @@ reduce_scatterv round all reach counter=0 for all 4 ranks.
 
 ## Confirmed Fixes
 
-### Fix 1 — `num_actual_tokens` mismatch when DP padding is active
+### Fix 1 — Force DP padding when Expert Parallelism is enabled
+
+**Status**: ✅ CONFIRMED NEEDED and applied. All COUNTER logs show
+`all_gatherv/uniform` (uniform = equal-size tensors across ranks), confirming
+DP padding is in effect.
+
+**File**: `vllm/v1/worker/dp_utils.py`
+
+**Root cause**: Without DP padding, each DP rank processes a different number
+of tokens. XCCL MoE dispatch/combine collectives require equal-size tensors.
+Forcing DP padding when EP is active ensures all ranks always have the same
+token count.
+
+```diff
+-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
++    should_dp_pad = (synced_cudagraph_mode != 0 or should_ubatch
++                     or parallel_config.enable_expert_parallel)
+```
+
+### Fix 2 — `num_actual_tokens` mismatch when DP padding is active
 
 **Status**: ✅ CONFIRMED FIXED by log evidence.
 
@@ -62,25 +81,6 @@ slot mappings, and attention metadata with the padded count.
 -            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 +            dp_padding_applied = num_tokens_padded > num_tokens_unpadded
 +            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
-```
-
-### Fix 2 — Force DP padding when Expert Parallelism is enabled
-
-**Status**: ✅ CONFIRMED NEEDED and applied. All COUNTER logs show
-`all_gatherv/uniform` (uniform = equal-size tensors across ranks), confirming
-DP padding is in effect.
-
-**File**: `vllm/v1/worker/dp_utils.py`
-
-**Root cause**: Without DP padding, each DP rank processes a different number
-of tokens. XCCL MoE dispatch/combine collectives require equal-size tensors.
-Forcing DP padding when EP is active ensures all ranks always have the same
-token count.
-
-```diff
--    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
-+    should_dp_pad = (synced_cudagraph_mode != 0 or should_ubatch
-+                     or parallel_config.enable_expert_parallel)
 ```
 
 ### Fix 3 — Disable async scheduling when EP + DP is active
@@ -133,6 +133,31 @@ skew within a MoE layer forward can cause a collective-type mismatch deadlock
 on the list-path (non-uniform) all_gatherv.
 
 **File**: `vllm/distributed/device_communicators/xpu_communicator.py`
+
+### Fix 6 — Add `dist.barrier` before each collective in `all2all.py`
+
+**Status**: ✅ APPLIED. Adds an XCCL barrier before each `all_gatherv` and
+`reduce_scatterv` call in `AgRsAll2AllManager` to force all EP ranks to
+rendezvous before submitting the collective. This eliminates the round 2
+deadlock caused by rank 2 being slower than ranks 0,1,3 at the GPU-side
+routing computation (softmax/topk) between rounds 1→2.
+
+**File**: `vllm/distributed/device_communicators/all2all.py`
+
+```diff
++        dist.barrier(group=dist_group.device_group)
+         gathered_tensors = dist_group.all_gatherv(   # dispatch_router_logits
++        dist.barrier(group=dist_group.device_group)
+         gathered_tensors = dist_group.all_gatherv(   # dispatch
++        dist.barrier(group=dist_group.device_group)
+         hidden_states = dist_group.reduce_scatterv(  # combine
+```
+
+**Why `dist_group.device_group`**: `GroupCoordinator.barrier()` uses a CPU-level
+group only. `dist.barrier(group=dist_group.device_group)` issues an XCCL
+barrier that drains any in-flight GPU kernels (routing softmax/topk) before
+the collective is submitted, ensuring all ranks reach the collective
+call-site together.
 
 ---
 
@@ -199,10 +224,9 @@ ordering guarantee breaks → deadlock on round 2 with no counter output.
    - Check whether `num_actual_tokens` or input shapes differ between ranks in
      a way that causes unequal GPU work despite Fix 1 and Fix 2 being applied.
 
-4. **Add `dist.barrier(group=ep_group)` before round 2** (i.e., before the
-   `dispatch` call in `all2all.py`) to force all EP ranks to synchronize before
-   entering the collective. If this eliminates the hang, it confirms the root
-   cause is a GPU-side timing skew between rounds 1→2 on rank 2.
+4. **Add `dist.barrier(group=ep_group)` before round 2** (Fix 6, already applied):
+   before each `all_gatherv` and `reduce_scatterv` call in `all2all.py` to force
+   all EP ranks to synchronize before entering the collective.
 
 ---
 
@@ -213,12 +237,10 @@ ordering guarantee breaks → deadlock on round 2 with no counter output.
 | File | Changes |
 |------|---------|
 | `vllm/_xpu_ops.py` | ENTER/EXIT around `gdn_attention` kernel; match check for `core_attn_out.size(0)` vs `num_actual_tokens` |
-| `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | `hidden_states.shape` / `num_tokens` at `forward_xpu` entry |
-| `vllm/model_executor/models/qwen3_next.py` | ENTER/EXIT around attn and MLP in `Qwen3NextDecoderLayer`; ENTER/EXIT around FusedMoE experts in `Qwen3NextSparseMoeBlock` |
-| `vllm/v1/worker/gpu_model_runner.py` | `execute_model` and `sample_tokens` traces with `dp=` and `iter=`; **Fix 1**; **Fix 3** |
-| `vllm/v1/worker/dp_utils.py` | **Fix 2**; `_run_ar` deadlock risk checker (iter count mismatch warning); ENTER/EXIT around `dist.all_reduce` |
+| `vllm/v1/worker/gpu_model_runner.py` | `execute_model` and `sample_tokens` traces with `dp=` and `iter=`; **Fix 2**; **Fix 3** |
+| `vllm/v1/worker/dp_utils.py` | **Fix 1**; `_run_ar` deadlock risk checker (iter count mismatch warning); ENTER/EXIT around `dist.all_reduce` |
 | `vllm/distributed/device_communicators/xpu_communicator.py` | **Fix 4**; **Fix 5**; COUNTER probes around `reduce_scatterv` and `all_gatherv` with seq number |
-| `vllm/distributed/device_communicators/all2all.py` | ENTER/EXIT around MoE `dispatch_router_logits`, `dispatch`, and `combine` |
+| `vllm/distributed/device_communicators/all2all.py` | **Fix 6**; ENTER/EXIT around MoE `dispatch_router_logits`, `dispatch`, and `combine` |
 
 ### How to read COUNTER logs
 

@@ -71,6 +71,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        dist.barrier(group=dist_group.device_group)
         print(
             f"[TRACE] rank={dist_group.rank_in_group} "
             f"dispatch_router_logits ENTER all_gatherv: "
@@ -119,6 +120,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        dist.barrier(group=dist_group.device_group)
         print(
             f"[TRACE] rank={dist_group.rank_in_group} dispatch ENTER "
             f"all_gatherv: sizes={sizes}, "
@@ -159,6 +161,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        dist.barrier(group=dist_group.device_group)
         print(
             f"[TRACE] rank={dist_group.rank_in_group} combine ENTER "
             f"reduce_scatterv: sizes={sizes}, "
