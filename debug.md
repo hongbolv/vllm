@@ -134,18 +134,6 @@ on the list-path (non-uniform) all_gatherv.
 
 **File**: `vllm/distributed/device_communicators/xpu_communicator.py`
 
-### Fix 6 — Remove `torch.xpu.synchronize()` from around XCCL collectives
-
-**Status**: ✅ CONFIRMED NEEDED and APPLIED. Local-only GPU drains caused
-faster ranks to immediately submit the next collective before slower ranks
-finished the current one on the GPU side, producing XCCL call-order mismatch
-deadlocks. After applying this fix the log shows the pattern described in
-"Remaining Hang" below — with xpu.synchronize removed, rank skew within a
-single decode step is eliminated, and the hang reduces to the round 2 timing
-issue described in the next section.
-
-**File**: `vllm/distributed/device_communicators/xpu_communicator.py`
-
 ---
 
 ## Remaining Hang
@@ -156,7 +144,7 @@ All 4 ranks enter `layer=12` MoE block (ENTER mlp → ENTER experts), all 4
 complete all_gatherv **round 1** (dispatch_router_logits), then hang inside
 round 2 (dispatch). None of the 4 ranks exits `layer=12` MoE.
 
-Observed log (after Fix 6 applied):
+Observed log (current state):
 ```
 # ranks 0,1,3 print ENTER mlp/experts first (rank 2 is slower)
 [TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4  (×3 ranks)
@@ -229,7 +217,7 @@ ordering guarantee breaks → deadlock on round 2 with no counter output.
 | `vllm/model_executor/models/qwen3_next.py` | ENTER/EXIT around attn and MLP in `Qwen3NextDecoderLayer`; ENTER/EXIT around FusedMoE experts in `Qwen3NextSparseMoeBlock` |
 | `vllm/v1/worker/gpu_model_runner.py` | `execute_model` and `sample_tokens` traces with `dp=` and `iter=`; **Fix 1**; **Fix 3** |
 | `vllm/v1/worker/dp_utils.py` | **Fix 2**; `_run_ar` deadlock risk checker (iter count mismatch warning); ENTER/EXIT around `dist.all_reduce` |
-| `vllm/distributed/device_communicators/xpu_communicator.py` | **Fix 4**; **Fix 5**; **Fix 6**; COUNTER probes around `reduce_scatterv` and `all_gatherv` with seq number |
+| `vllm/distributed/device_communicators/xpu_communicator.py` | **Fix 4**; **Fix 5**; COUNTER probes around `reduce_scatterv` and `all_gatherv` with seq number |
 | `vllm/distributed/device_communicators/all2all.py` | ENTER/EXIT around MoE `dispatch_router_logits`, `dispatch`, and `combine` |
 
 ### How to read COUNTER logs
