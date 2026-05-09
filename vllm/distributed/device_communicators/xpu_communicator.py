@@ -15,8 +15,6 @@ logger = init_logger(__name__)
 
 class XpuCommunicator(DeviceCommunicatorBase):
 
-    _seq_counter = 0
-
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -77,16 +75,6 @@ class XpuCommunicator(DeviceCommunicatorBase):
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
         world_size = self.world_size
-        XpuCommunicator._seq_counter += 1
-        seq = XpuCommunicator._seq_counter
-        is_uniform = (sizes is None
-                      or sizes.count(sizes[0]) == len(sizes))
-        path = "uniform" if is_uniform else "variable-size"
-        print(
-            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
-            f"reduce_scatterv/{path} counter=1",
-            flush=True,
-        )
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -114,11 +102,6 @@ class XpuCommunicator(DeviceCommunicatorBase):
             dist.reduce_scatter(output, input_splits, group=self.device_group)
         else:
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
-        print(
-            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
-            f"reduce_scatterv/{path} counter=0",
-            flush=True,
-        )
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
@@ -136,15 +119,6 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
-
-        XpuCommunicator._seq_counter += 1
-        seq = XpuCommunicator._seq_counter
-        path = "uniform" if sizes is None else "variable-size"
-        print(
-            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
-            f"all_gatherv/{path} counter=1",
-            flush=True,
-        )
 
         def _all_gather_single(input_: torch.Tensor, sizes: list[int] | None = None):
             input_size = input_.size()
