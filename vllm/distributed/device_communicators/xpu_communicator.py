@@ -201,12 +201,21 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 new_shape = (chunk.shape[0],) + orig_shape[1:]
                 results.append(chunk.reshape(new_shape).contiguous())
                 offset += fsz
-            # [TRACE] Verify Fix 5 same-dtype path restores original shapes
-            print(f"[TRACE] Fix5 same-dtype: orig_shapes={[tuple(s) for s in orig_shapes]} "
-                  f"result_shapes={[tuple(r.shape) for r in results]} "
-                  f"feature_sizes={feature_sizes} "
-                  f"combined={tuple(combined.shape)} gathered={tuple(gathered.shape)}",
-                  flush=True)
+            # [TRACE] Check Fix 5 same-dtype path: only print on anomaly
+            for idx, (orig_shape, res) in enumerate(zip(orig_shapes, results)):
+                expected_tail = orig_shape[1:]
+                actual_tail = res.shape[1:]
+                if actual_tail != expected_tail:
+                    print(f"[TRACE] Fix5 SHAPE MISMATCH idx={idx}: "
+                          f"orig_shape={tuple(orig_shape)} "
+                          f"result_shape={tuple(res.shape)} "
+                          f"expected_tail={expected_tail} "
+                          f"actual_tail={actual_tail}",
+                          flush=True)
+                if not res.is_contiguous():
+                    print(f"[TRACE] Fix5 NOT CONTIGUOUS idx={idx}: "
+                          f"shape={tuple(res.shape)} stride={res.stride()}",
+                          flush=True)
             return results
         else:
             # ── Mixed-dtype path: sequential collectives + barrier ────────────
