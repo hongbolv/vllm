@@ -148,7 +148,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 dist.all_gather(all_gather_list, input_, group=self.device_group)
                 output_tensor = torch.cat(all_gather_list, dim=0)
             else:
-                dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+                dist.all_gather([output_tensor], input_, group=self.device_group)
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
