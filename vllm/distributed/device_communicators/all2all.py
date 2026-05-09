@@ -172,7 +172,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
             # bias terms produced non-zero output for zero-padded input,
             # which may corrupt real token hidden states through
             # reduce_scatter.
-            if nonzero_rows > 0 and nonzero_rows == output_rows:
+            if nonzero_rows == output_rows:
                 print(
                     f"[REDUCE_SCATTER_CHECK] ERROR: dp_rank={dp_rank} "
                     f"ALL {output_rows} output rows are non-zero "
