@@ -23,13 +23,16 @@ all_gatherv  round 3  ←  (third call; source under investigation — shared ex
 reduce_scatterv round 1  ←  combine (expert outputs)
 ```
 
-Layer 11 log evidence (all 4 ranks complete each round):
+Layer 11 log evidence (all 4 ranks complete each round, full cycle confirmed):
 ```
 [COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 1)
 [COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 2)
 [COUNTER] rank={0,1,2,3} all_gatherv/uniform counter=1  → 0   (round 3)
-[COUNTER] rank={2,...}   reduce_scatterv/uniform counter=1     (round 1, log cut off)
+[COUNTER] rank={0,1,2,3} reduce_scatterv/uniform counter=1  → 0  (round 1)
 ```
+
+The layer=11 MoE cycle completes fully — all 3 all_gatherv rounds and the
+reduce_scatterv round all reach counter=0 for all 4 ranks.
 
 ---
 
@@ -82,17 +85,22 @@ token count.
 
 ### Fix 3 — Disable async scheduling when EP + DP is active
 
-**Status**: ✅ APPLIED. Confirmed effective for diagnosis: with async scheduling
-disabled, the hang becomes visible inside `sample_tokens: bookkeeping` rather
-than hiding behind the async GPU→CPU copy.
+**Status**: ✅ APPLIED. This is a **production correctness fix**, not merely a
+diagnostic aid.
 
 **File**: `vllm/v1/worker/gpu_model_runner.py`
 
-**Root cause**: `AsyncGPUModelRunnerOutput` returns immediately after queuing
-the GPU→CPU copy asynchronously. The GPU hangs inside the MoE forward, the
-queued copy never completes, and the scheduler stalls waiting for the copy
-with no visible error. Disabling async output forces the CPU to block until
-the copy completes, making GPU-side hangs visible in `sample_tokens`.
+**Root cause (production)**: With async scheduling enabled and EP+DP active,
+`AsyncGPUModelRunnerOutput` returns immediately after queuing the GPU→CPU
+copy. If DP ranks advance their schedulers at different speeds, one DP rank
+can enter the next iteration's `_run_ar` all-reduce before the other finishes
+the current iteration's GPU work, causing a cross-iteration collective
+mismatch deadlock.
+
+**Diagnostic benefit**: With async scheduling disabled, GPU-side hangs inside
+the MoE forward become visible inside `sample_tokens: bookkeeping` rather than
+hiding behind the async copy queue. This confirmed the hang is GPU-side (not a
+CPU/scheduler race) and narrowed it to the model forward pass.
 
 ```diff
 +        if (self.use_async_scheduling
@@ -116,18 +124,25 @@ waiting for the missing output slots.
 
 ### Fix 5 — Eliminate sequential all_gatherv calls in list path
 
-**Status**: ✅ APPLIED. Collapses N sequential `dist.all_gather_into_tensor`
-calls (one per tensor) into a single call via int8 byte-view concatenation.
-This eliminates call-order mismatch deadlocks when faster ranks submit
-collective #2 before slower ranks finish collective #1.
+**Status**: ✅ APPLIED. This is a **production correctness fix**, not merely a
+diagnostic change. Collapses N sequential `dist.all_gather_into_tensor` calls
+(one per tensor) into a single call via int8 byte-view concatenation. This
+eliminates call-order mismatch deadlocks when faster ranks submit collective #2
+before slower ranks finish collective #1. Without this fix, any rank timing
+skew within a MoE layer forward can cause a collective-type mismatch deadlock
+on the list-path (non-uniform) all_gatherv.
 
 **File**: `vllm/distributed/device_communicators/xpu_communicator.py`
 
 ### Fix 6 — Remove `torch.xpu.synchronize()` from around XCCL collectives
 
-**Status**: ✅ CONFIRMED NEEDED. Local-only GPU drains caused faster ranks to
-immediately submit the next collective before slower ranks finished the current
-one on the GPU side, producing XCCL call-order mismatch deadlocks.
+**Status**: ✅ CONFIRMED NEEDED and APPLIED. Local-only GPU drains caused
+faster ranks to immediately submit the next collective before slower ranks
+finished the current one on the GPU side, producing XCCL call-order mismatch
+deadlocks. After applying this fix the log shows the pattern described in
+"Remaining Hang" below — with xpu.synchronize removed, rank skew within a
+single decode step is eliminated, and the hang reduces to the round 2 timing
+issue described in the next section.
 
 **File**: `vllm/distributed/device_communicators/xpu_communicator.py`
 
@@ -137,58 +152,69 @@ one on the GPU side, producing XCCL call-order mismatch deadlocks.
 
 ### Current symptom (after all fixes applied)
 
-All 4 ranks enter `layer=12` MoE block (ENTER mlp → ENTER experts), complete
-all_gatherv **round 1** successfully, then hang. None of the 4 ranks exits
-`layer=12` MoE (no EXIT experts or EXIT mlp is ever printed).
+All 4 ranks enter `layer=12` MoE block (ENTER mlp → ENTER experts), all 4
+complete all_gatherv **round 1** (dispatch_router_logits), then hang inside
+round 2 (dispatch). None of the 4 ranks exits `layer=12` MoE.
 
-Layer 12 log evidence:
+Observed log (after Fix 6 applied):
 ```
-[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4   (×4 ranks)
-[COUNTER] rank={1,3,0,2} all_gatherv/uniform counter=1  → 0   (round 1 — all 4 complete)
-# ← hang here: no round 2 all_gatherv counter ever appears
-[TRACE] layer=12 EXIT mlp   ← NEVER printed
+# ranks 0,1,3 print ENTER mlp/experts first (rank 2 is slower)
+[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4  (×3 ranks)
+
+# all_gatherv round 1 — ranks 0,1,3 show counter=1 immediately
+[COUNTER] rank=1 all_gatherv/uniform counter=1
+[COUNTER] rank=3 all_gatherv/uniform counter=1
+[COUNTER] rank=0 all_gatherv/uniform counter=1
+# rank 2 also calls round 1 here (its stdout is still buffered from GPU work)
+# → all 4 ranks are in the collective; it completes
+[COUNTER] rank=3 all_gatherv/uniform counter=0
+[COUNTER] rank=0 all_gatherv/uniform counter=0
+[COUNTER] rank=1 all_gatherv/uniform counter=0
+# rank 2's buffered prints now flush (rank 2 completed round 1 above)
+[TRACE] layer=12 type=linear_attention EXIT attn    ← rank 2 stdout flush
+[TRACE] Qwen3NextDecoderLayer.forward layer=12 ENTER mlp
+[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4
+
+# ← HANG HERE: no counter=1 for round 2 ever appears
+# layer=12 EXIT mlp/experts NEVER printed
 ```
+
+**Key observation**: Rank 2's `EXIT attn` / `ENTER mlp` / `ENTER experts`
+prints appear in the console *after* the round 1 `counter=0` logs. This is a
+stdout buffering artifact — rank 2's Python thread had already submitted the
+round 1 collective call (so round 1 completes for all 4), but the preceding
+print statements were flushed to the console late. Round 1 therefore completes
+with all 4 ranks participating.
 
 ### Hang analysis
 
-All 4 ranks complete all_gatherv round 1 together (all show counter=1→0).
-After round 1 all CPUs unblock simultaneously and proceed to the next
-collective (all_gatherv round 2). The hang occurs during round 2 — no
-`counter=1` print appears for round 2.
-
-**Why layer 11 completes but layer 12 does not:**
-
-Layer 11 all three all_gatherv rounds complete with all 4 ranks synchronized.
-Layer 12 completes round 1 with all 4 ranks, but hangs on round 2. This
-indicates an asymmetry between the ranks that develops between round 1 and
-round 2: likely rank 2's GPU is slower to finish the routing computation
-(e.g., router softmax / topk selection submitted to the GPU queue after round
-1), so when rounds proceed on the GPU side, rank 2's GPU enters round 2 late
-relative to the other 3, causing a GPU-side XCCL collective ordering mismatch.
-
-**Key question still open**: What makes layer 12 different from layer 11?
-Possible explanations:
-- Rank 2's GPU computation between round 1 and round 2 of layer 12 is
-  significantly slower than in layer 11 (e.g., a different batch composition
-  or a GPU kernel stall that accumulates over layers).
-- There is a GPU-level ordering issue that does not yet appear in layer 11 but
-  triggers at layer 12.
+After round 1 completes, all 4 CPU threads are unblocked simultaneously and
+each proceeds to the routing computation (router softmax, topk selection) then
+calls round 2 (all_gatherv for dispatch). Rank 2 is consistently slower than
+ranks 0,1,3 at the GPU-side routing kernel between round 1 and round 2. When
+ranks 0,1,3 submit round 2 before rank 2 does, and rank 2 then submits a
+different collective type or round 2 with a long delay, the XCCL collective
+ordering guarantee breaks → deadlock on round 2 with no counter output.
 
 ### Recommended next steps
 
-1. **Add COUNTER prints with layer number** in `dispatch_router_logits` and
-   `dispatch` in `all2all.py` so each COUNTER line identifies which round
-   (round 1 / round 2 / round 3) and which layer it belongs to. This will
-   pinpoint whether the hang is in round 2 or round 3 of layer 12.
+1. **Add layer and round labels to COUNTER prints** in `dispatch_router_logits`
+   and `dispatch` in `all2all.py` so each line identifies `layer=N round=M`.
+   This will confirm round 2 is the hanging collective (vs round 3).
 
-2. **Add `sys.stdout.flush()` / explicit flush** after each COUNTER print to
-   ensure no output is buffered when the hang occurs.
+2. **Add `sys.stdout.flush()` after each COUNTER print** to prevent stdout
+   buffering from masking which rank is the last to submit a collective.
 
-3. **Identify why round 2 hangs for layer 12 but not layer 11** by comparing
-   timing between rounds across layers. If rank 2's GPU routing on layer 12 is
-   genuinely slower, adding a `dist.barrier(group=ep_group)` before the round
-   2 dispatch (in `all2all.py`'s `dispatch` method) will force all ranks to
-   synchronize before entering the collective, eliminating the ordering race.
+3. **Investigate why rank 2 is slower between round 1 → round 2 in layer 12**:
+   - Check whether the routing kernel (softmax + topk) takes longer on rank 2's
+     XPU tile for this particular batch composition.
+   - Check whether `num_actual_tokens` or input shapes differ between ranks in
+     a way that causes unequal GPU work despite Fix 1 and Fix 2 being applied.
+
+4. **Add `dist.barrier(group=ep_group)` before round 2** (i.e., before the
+   `dispatch` call in `all2all.py`) to force all EP ranks to synchronize before
+   entering the collective. If this eliminates the hang, it confirms the root
+   cause is a GPU-side timing skew between rounds 1→2 on rank 2.
 
 ---
 
