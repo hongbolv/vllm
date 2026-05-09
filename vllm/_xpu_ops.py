@@ -116,12 +116,11 @@ def _gdn_attention_core_xpu_impl(
 
     num_actual_tokens = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
     match = core_attn_out.size(0) == num_actual_tokens
-    logger.debug(
-        "[TRACE] _gdn_attention_core_xpu_impl: "
-        "core_attn_out.size(0)=%d, num_actual_tokens=%d, match=%s",
-        core_attn_out.size(0),
-        num_actual_tokens,
-        match,
+    print(
+        f"[TRACE] _gdn_attention_core_xpu_impl: "
+        f"core_attn_out.size(0)={core_attn_out.size(0)}, "
+        f"num_actual_tokens={num_actual_tokens}, match={match}",
+        flush=True,
     )
 
     # TODO: xpu does not support speculative decoding yet
@@ -131,7 +130,7 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
-    logger.debug("[TRACE] ENTER gdn_attention kernel layer=%s", layer_name)
+    print(f"[TRACE] ENTER gdn_attention kernel layer={layer_name}", flush=True)
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
@@ -157,7 +156,7 @@ def _gdn_attention_core_xpu_impl(
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
-    logger.debug("[TRACE] EXIT gdn_attention kernel layer=%s", layer_name)
+    print(f"[TRACE] EXIT gdn_attention kernel layer={layer_name}", flush=True)
 
 
 def _gdn_attention_core_xpu_fake(

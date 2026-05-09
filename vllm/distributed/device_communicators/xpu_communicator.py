@@ -82,9 +82,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         is_uniform = (sizes is None
                       or sizes.count(sizes[0]) == len(sizes))
         path = "uniform" if is_uniform else "variable-size"
-        logger.debug(
-            "[COUNTER] rank=%d seq=%d reduce_scatterv/%s counter=1",
-            self.rank_in_group, seq, path,
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
+            f"reduce_scatterv/{path} counter=1",
+            flush=True,
         )
 
         if dim < 0:
@@ -113,9 +114,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
             dist.reduce_scatter(output, input_splits, group=self.device_group)
         else:
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
-        logger.debug(
-            "[COUNTER] rank=%d seq=%d reduce_scatterv/%s counter=0",
-            self.rank_in_group, seq, path,
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
+            f"reduce_scatterv/{path} counter=0",
+            flush=True,
         )
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
@@ -138,9 +140,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         XpuCommunicator._seq_counter += 1
         seq = XpuCommunicator._seq_counter
         path = "uniform" if sizes is None else "variable-size"
-        logger.debug(
-            "[COUNTER] rank=%d seq=%d all_gatherv/%s counter=1",
-            self.rank_in_group, seq, path,
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
+            f"all_gatherv/{path} counter=1",
+            flush=True,
         )
 
         def _all_gather_single(input_: torch.Tensor, sizes: list[int] | None = None):
@@ -181,9 +184,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
             for inp in input_:
                 result.append(_all_gather_single(inp, sizes=sizes))
 
-        logger.debug(
-            "[COUNTER] rank=%d seq=%d all_gatherv/%s counter=0",
-            self.rank_in_group, seq, path,
+        print(
+            f"[COUNTER] rank={self.rank_in_group} seq={seq} "
+            f"all_gatherv/{path} counter=0",
+            flush=True,
         )
         return result
 
