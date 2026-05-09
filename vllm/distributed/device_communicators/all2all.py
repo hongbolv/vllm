@@ -135,7 +135,38 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         dist.barrier(group=dist_group.device_group)
+        input_shape_before = hidden_states.shape
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+
+        # --- Diagnostic: check padding positions after reduce_scatterv ---
+        dp_rank = get_dp_group().rank_in_group
+        all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
+        if all_sizes_equal and sizes[dp_rank] > 0:
+            output_rows = hidden_states.shape[0]
+            # Print output stats for all rows and per-row norms for last
+            # few rows (potential padding region)
+            row_norms = hidden_states.float().norm(dim=-1)
+            nonzero_rows = int((row_norms > 0).sum().item())
+            last_n = min(4, output_rows)
+            last_row_norms = [
+                f"{row_norms[output_rows - last_n + i].item():.6f}"
+                for i in range(last_n)
+            ]
+            print(
+                f"[REDUCE_SCATTER_CHECK] dp_rank={dp_rank} "
+                f"sizes={sizes} "
+                f"input_shape={list(input_shape_before)} "
+                f"output_shape={list(hidden_states.shape)} "
+                f"output_rows={output_rows} "
+                f"nonzero_rows={nonzero_rows} "
+                f"output_norm={hidden_states.float().norm().item():.6f} "
+                f"output_min={hidden_states.min().item():.6f} "
+                f"output_max={hidden_states.max().item():.6f} "
+                f"last_{last_n}_row_norms=[{', '.join(last_row_norms)}]",
+                flush=True,
+            )
+        # --- End diagnostic ---
+
         return hidden_states
 
     def destroy(self):
