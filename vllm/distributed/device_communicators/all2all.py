@@ -66,14 +66,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"dispatch_router_logits ENTER all_gatherv: "
-            f"sizes={sizes}, tensor_shapes="
-            f"[{list(hidden_states.shape)}, {list(router_logits.shape)}]",
-            flush=True,
-        )
-
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
@@ -82,12 +74,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
             tensors_to_gather,
             dim=0,
             sizes=sizes,
-        )
-
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"dispatch_router_logits EXIT all_gatherv",
-            flush=True,
         )
 
         if extra_tensors is not None:
@@ -115,15 +101,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"dispatch ENTER all_gatherv: "
-            f"sizes={sizes}, tensor_shapes="
-            f"[{list(hidden_states.shape)}, {list(topk_weights.shape)}, "
-            f"{list(topk_ids.shape)}]",
-            flush=True,
-        )
-
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
@@ -132,12 +109,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
             tensors_to_gather,
             dim=0,
             sizes=sizes,
-        )
-
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"dispatch EXIT all_gatherv",
-            flush=True,
         )
 
         hidden_states = gathered_tensors[0]
@@ -161,22 +132,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"combine ENTER reduce_scatterv: "
-            f"sizes={sizes}, hidden_states_shape={list(hidden_states.shape)}",
-            flush=True,
-        )
-
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-
-        print(
-            f"[TRACE] rank={dist_group.rank_in_group} "
-            f"combine EXIT reduce_scatterv",
-            flush=True,
-        )
-
         return hidden_states
 
     def destroy(self):

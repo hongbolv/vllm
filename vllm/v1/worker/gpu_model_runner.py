@@ -3863,14 +3863,6 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        dp = (self.parallel_config.data_parallel_rank
-              if self.parallel_config.data_parallel_size > 1
-              else 0)
-        print(
-            f"[TRACE] ENTER execute_model "
-            f"dp={dp} num_tokens={num_scheduled_tokens}",
-            flush=True,
-        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4180,14 +4172,6 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        dp = (self.parallel_config.data_parallel_rank
-              if self.parallel_config.data_parallel_size > 1
-              else 0)
-        print(
-            f"[TRACE] EXIT execute_model dp={dp}",
-            flush=True,
-        )
-
         return None
 
     @torch.inference_mode
@@ -4227,14 +4211,6 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-
-        dp = (self.parallel_config.data_parallel_rank
-              if self.parallel_config.data_parallel_size > 1
-              else 0)
-        print(
-            f"[TRACE] ENTER sample_tokens dp={dp}",
-            flush=True,
-        )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4412,13 +4388,6 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
-            dp = (self.parallel_config.data_parallel_rank
-                  if self.parallel_config.data_parallel_size > 1
-                  else 0)
-            print(
-                f"[TRACE] EXIT sample_tokens dp={dp}",
-                flush=True,
-            )
             return output
 
         with record_function_or_nullcontext(
@@ -4442,13 +4411,6 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
-        dp = (self.parallel_config.data_parallel_rank
-              if self.parallel_config.data_parallel_size > 1
-              else 0)
-        print(
-            f"[TRACE] EXIT sample_tokens (async) dp={dp}",
-            flush=True,
-        )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

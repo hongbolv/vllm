@@ -48,18 +48,7 @@ def _run_ar(
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
-    print(
-        f"[TRACE] ENTER _run_ar dist.all_reduce dp_rank={dp_rank} "
-        f"orig={orig_num_tokens_per_ubatch} padded={padded_num_tokens_per_ubatch} "
-        f"ubatch={should_ubatch} cgmode={cudagraph_mode}",
-        flush=True,
-    )
     dist.all_reduce(tensor, group=group)
-    print(
-        f"[TRACE] EXIT _run_ar dist.all_reduce dp_rank={dp_rank} "
-        f"tensor={tensor.tolist()}",
-        flush=True,
-    )
     return tensor
 
 
