@@ -14,7 +14,6 @@ logger = init_logger(__name__)
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
-
     def __init__(
         self,
         cpu_group: ProcessGroup,
