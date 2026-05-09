@@ -79,10 +79,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
         world_size = self.world_size
         XpuCommunicator._seq_counter += 1
         seq = XpuCommunicator._seq_counter
-        path = ("uniform"
-                if (sizes is None
-                    or sizes.count(sizes[0]) == len(sizes))
-                else "variable-size")
+        is_uniform = (sizes is None
+                      or sizes.count(sizes[0]) == len(sizes))
+        path = "uniform" if is_uniform else "variable-size"
         logger.debug(
             "[COUNTER] rank=%d seq=%d reduce_scatterv/%s counter=1",
             self.rank_in_group, seq, path,
