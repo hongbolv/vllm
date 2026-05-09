@@ -4035,13 +4035,13 @@ class GPUModelRunner(
                     bad_mask = pad_slots != -1
                     if bad_mask.any():
                         bad_vals = pad_slots[bad_mask]
-                        logger.error(
-                            "DP padding slot_mapping ERROR: layer=%s, "
-                            "padding positions [%d:%d] contain non-PAD_SLOT_ID "
-                            "values: %s (expected all -1). This will pollute "
-                            "KV cache and corrupt attention in decode stage.",
-                            layer_name, num_tokens_unpadded,
-                            num_tokens_padded, bad_vals.tolist()[:10])
+                        print(
+                            f"DP padding slot_mapping ERROR: layer={layer_name}, "
+                            f"padding positions [{num_tokens_unpadded}:{num_tokens_padded}] "
+                            f"contain non-PAD_SLOT_ID values: {bad_vals.tolist()[:10]} "
+                            f"(expected all -1). This will pollute KV cache and "
+                            f"corrupt attention in decode stage.",
+                            flush=True)
                     break  # all groups share same padding logic
 
             attn_metadata, spec_decode_common_attn_metadata = (
