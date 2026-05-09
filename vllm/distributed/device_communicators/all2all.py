@@ -143,8 +143,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
         if all_sizes_equal and sizes[dp_rank] > 0:
             output_rows = hidden_states.shape[0]
-            # Print output stats for all rows and per-row norms for last
-            # few rows (potential padding region)
+            # Compute per-row norms to detect padding positions with
+            # non-zero values (indicating expert bias producing non-zero
+            # output for zero-padded input)
             row_norms = hidden_states.float().norm(dim=-1)
             nonzero_rows = int((row_norms > 0).sum().item())
             last_n = min(4, output_rows)
@@ -165,6 +166,23 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 f"last_{last_n}_row_norms=[{', '.join(last_row_norms)}]",
                 flush=True,
             )
+            # Error check: if nonzero_rows equals output_rows when DP
+            # padding is active, it means ALL rows (including padding
+            # positions) have non-zero values. This indicates expert
+            # bias terms produced non-zero output for zero-padded input,
+            # which may corrupt real token hidden states through
+            # reduce_scatter.
+            if nonzero_rows > 0 and nonzero_rows == output_rows:
+                print(
+                    f"[REDUCE_SCATTER_CHECK] ERROR: dp_rank={dp_rank} "
+                    f"ALL {output_rows} output rows are non-zero "
+                    f"(nonzero_rows={nonzero_rows}). "
+                    f"Padding positions likely have non-zero values "
+                    f"after expert computation (expert bias on zero "
+                    f"input). This may corrupt real token hidden states "
+                    f"through reduce_scatter cut boundary shift.",
+                    flush=True,
+                )
         # --- End diagnostic ---
 
         return hidden_states
