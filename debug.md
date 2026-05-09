@@ -338,6 +338,70 @@ by the code will answer this directly.
 | `vllm/distributed/device_communicators/xpu_communicator.py` | **Fix 4**; **Fix 5**; COUNTER probes around `reduce_scatterv` and `all_gatherv` with seq number |
 | `vllm/distributed/device_communicators/all2all.py` | **Fix 6**; ENTER/EXIT around MoE `dispatch_router_logits`, `dispatch`, and `combine` |
 
+---
+
+## Current Status — "!!!!" Output Analysis
+
+### Observation
+
+With Fixes 1-3 and Fix 6 applied (Fix 4 and Fix 5 removed), the model no
+longer hangs but produces partially correct output:
+
+```
+Prompt: 'The capital of France is'  → ' known as!!!!!!...'
+Prompt: 'The president of the US is' → ' elected by!!!!!!...'
+Prompt: 'Explain quantum computing'  → '\n\n1!!!!!!...'
+```
+
+**Key pattern**: The first 1-3 tokens are **correct**, then all subsequent
+tokens degrade to "!" (token id 0 or a fixed id). This is consistent across
+both DP ranks.
+
+### Analysis
+
+1. **Prefill stage works correctly** — the first token output is valid, proving
+   model weights, embedding, attention, and MoE forward are functioning.
+
+2. **Problem occurs in decode (autoregressive) stage** — starting from the
+   2nd-3rd token, all logits collapse to the same token id.
+
+### Possible Root Causes
+
+1. **KV cache pollution from DP padding tokens** — Fix 1 forces DP padding,
+   which adds padding tokens. These tokens participate in the full forward
+   pass including attention. If their KV entries are written to valid KV cache
+   slots, subsequent decode steps will attend to these garbage KV entries,
+   corrupting real token attention scores. MoE is per-token independent so
+   padding is safe there, but **attention is NOT per-token independent** —
+   padding KV entries affect all tokens in the same sequence.
+
+2. **`pad_attn` not synchronized in cudagraph capture path** — Fix 2 sets
+   `pad_attn = dp_padding_applied` in the main `execute_model` path
+   (line 3987-3988), but the cudagraph capture path (line 5500) still uses
+   `pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL` without the
+   `dp_padding_applied` condition.
+
+3. **`all_gather` API usage in uniform path** — After removing Fix 4,
+   `dist.all_gather([output_tensor], input_, group=...)` passes a single-
+   element list. `all_gather` expects `world_size` tensors in the list.
+   Fix 1 forces all ranks to have equal sizes → always takes uniform path
+   → always hits this potentially incorrect API call.
+
+4. **Barrier insufficient for XCCL synchronization** — Fix 6's
+   `dist.barrier()` may not guarantee that XCCL compute kernels have
+   finished writing results. A `torch.xpu.synchronize()` call before
+   the barrier may be needed.
+
+### Recommended Next Steps
+
+- Add trace in decode `execute_model` to print `num_tokens_padded` vs
+  `num_tokens_unpadded` and `pad_attn` value
+- Check if padding tokens' `slot_mapping` points to valid KV cache positions
+- Try adding `torch.xpu.synchronize()` before Fix 6 barriers
+- Verify `all_gather([output_tensor], ...)` behavior with world_size > 2
+
+---
+
 ### How to read COUNTER logs
 
 ```
