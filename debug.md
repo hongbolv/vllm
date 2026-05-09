@@ -161,72 +161,90 @@ call-site together.
 
 ---
 
-## Remaining Hang
+## Current Status (after all 6 fixes)
 
-### Current symptom (after all fixes applied)
+### Hang resolved — inference now completes
 
-All 4 ranks enter `layer=12` MoE block (ENTER mlp → ENTER experts), all 4
-complete all_gatherv **round 1** (dispatch_router_logits), then hang inside
-round 2 (dispatch). None of the 4 ranks exits `layer=12` MoE.
+After applying all 6 fixes, the silent deadlock is eliminated. All 4 ranks
+complete all MoE layers and the inference loop finishes. The `dist.barrier`
+calls in Fix 6 prevent the rank-skew collective ordering deadlock that was the
+last hang symptom.
 
-Observed log (current state):
+### New symptom — incorrect output ("!!!!")
+
+With all 6 fixes applied, inference completes but generates wrong output: every
+prompt produces a long sequence of `"!"` characters regardless of input.
+
+Example output:
 ```
-# ranks 0,1,3 print ENTER mlp/experts first (rank 2 is slower)
-[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4  (×3 ranks)
-
-# all_gatherv round 1 — ranks 0,1,3 show counter=1 immediately
-[COUNTER] rank=1 all_gatherv/uniform counter=1
-[COUNTER] rank=3 all_gatherv/uniform counter=1
-[COUNTER] rank=0 all_gatherv/uniform counter=1
-# rank 2 also calls round 1 here (its stdout is still buffered from GPU work)
-# → all 4 ranks are in the collective; it completes
-[COUNTER] rank=3 all_gatherv/uniform counter=0
-[COUNTER] rank=0 all_gatherv/uniform counter=0
-[COUNTER] rank=1 all_gatherv/uniform counter=0
-# rank 2's buffered prints now flush (rank 2 completed round 1 above)
-[TRACE] layer=12 type=linear_attention EXIT attn    ← rank 2 stdout flush
-[TRACE] Qwen3NextDecoderLayer.forward layer=12 ENTER mlp
-[TRACE] Qwen3NextSparseMoeBlock.forward ENTER experts num_tokens=4
-
-# ← HANG HERE: no counter=1 for round 2 ever appears
-# layer=12 EXIT mlp/experts NEVER printed
+[ARC B60] DP rank 0, Prompt: 'Hello, my name is'
+Generated: '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+[ARC B60] DP rank 0, Prompt: 'The capital of France is'
+Generated: '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
 ```
 
-**Key observation**: Rank 2's `EXIT attn` / `ENTER mlp` / `ENTER experts`
-prints appear in the console *after* the round 1 `counter=0` logs. This is a
-stdout buffering artifact — rank 2's Python thread had already submitted the
-round 1 collective call (so round 1 completes for all 4), but the preceding
-print statements were flushed to the console late. Round 1 therefore completes
-with all 4 ranks participating.
+All prompts, all DP ranks, all iterations produce the same degenerate output.
 
-### Hang analysis
+---
 
-After round 1 completes, all 4 CPU threads are unblocked simultaneously and
-each proceeds to the routing computation (router softmax, topk selection) then
-calls round 2 (all_gatherv for dispatch). Rank 2 is consistently slower than
-ranks 0,1,3 at the GPU-side routing kernel between round 1 and round 2. When
-ranks 0,1,3 submit round 2 before rank 2 does, and rank 2 then submits a
-different collective type or round 2 with a long delay, the XCCL collective
-ordering guarantee breaks → deadlock on round 2 with no counter output.
+## Wrong Output Analysis
+
+### Ruled out: Fix 5 int8 byte-view (type punning) data corruption
+
+Type punning test on XPU confirmed byte-accurate round-trip:
+```python
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device='xpu')
+x_rt = x.contiguous().view(torch.int8).contiguous().view(torch.float16)
+assert torch.allclose(x, x_rt)  # PASSES — no corruption
+```
+Fix 5's int8 byte-view approach correctly preserves tensor data on XPU.
+**Not the cause of "!!!!" output.**
+
+### Most likely suspect: Fix 2 (`pad_attn=True`) corrupts expert outputs
+
+**Root cause hypothesis**: Fix 2 sets `pad_attn=True` when DP padding increases
+the token count. This aligns `num_actual_tokens` with the padded tensor row
+count, which is necessary to prevent the XPU GDN kernel assertion failure.
+However, it also causes the GDN attention kernel to process the *padding tokens*
+as real query rows.
+
+The padding tokens' query vectors are **not zeroed** — they contain whatever was
+already in the padded buffer positions. These non-zero padding queries:
+1. Attend to the KV cache and produce non-trivial (garbage) attention outputs.
+2. Flow through the MoE layers as if they were real tokens.
+3. Are dispatched to experts in the MoE `combine` (reduce_scatterv) step.
+4. If the combine step slices expert outputs by the padded count rather than the
+   real count, padding-token expert outputs contaminate the real token outputs.
+
+**Why "!!!!" specifically**: Corrupted `router_logits` (all-zeros or garbage
+bytes) → softmax produces a near-uniform distribution → topk always selects the
+same expert(s) → the selected expert happens to output the token ID for "!".
+Because all prompts get the same corrupt router state, they all produce the same
+degenerate token.
 
 ### Recommended next steps
 
-1. **Add layer and round labels to COUNTER prints** in `dispatch_router_logits`
-   and `dispatch` in `all2all.py` so each line identifies `layer=N round=M`.
-   This will confirm round 2 is the hanging collective (vs round 3).
+1. **Verify Fix 2 is the corruption source**: temporarily revert Fix 2 (set
+   `pad_attn = cudagraph_mode == CUDAGraphMode.FULL` only, without the
+   `dp_padding_applied` branch). Run with Fix 6 (barriers) still active.
+   - If "!!!!" disappears and hang returns: Fix 2 is the corruption source;
+     need an alternative approach (see below).
+   - If "!!!!" disappears and inference succeeds: Fix 2 + Fix 6 interact badly.
+   - If "!!!!" persists without Fix 2: the corruption comes from elsewhere.
 
-2. **Add `sys.stdout.flush()` after each COUNTER print** to prevent stdout
-   buffering from masking which rank is the last to submit a collective.
+2. **Alternative to Fix 2 — zero padding token query vectors**: Instead of
+   setting `pad_attn=True` (which expands `num_actual_tokens` to include
+   padding), explicitly zero the query, key, and value vectors for the padding
+   token positions *before* the GDN kernel is called. This keeps
+   `num_actual_tokens` at the real count while giving the kernel zero-initialized
+   padding rows that produce zero attention output and do not contaminate the
+   combine step.
 
-3. **Investigate why rank 2 is slower between round 1 → round 2 in layer 12**:
-   - Check whether the routing kernel (softmax + topk) takes longer on rank 2's
-     XPU tile for this particular batch composition.
-   - Check whether `num_actual_tokens` or input shapes differ between ranks in
-     a way that causes unequal GPU work despite Fix 1 and Fix 2 being applied.
-
-4. **Add `dist.barrier(group=ep_group)` before round 2** (Fix 6, already applied):
-   before each `all_gatherv` and `reduce_scatterv` call in `all2all.py` to force
-   all EP ranks to synchronize before entering the collective.
+3. **Check GDN kernel `num_actual_tokens` semantics**: Verify whether the XPU
+   GDN kernel uses `num_actual_tokens` as an *iteration bound* (iterates over
+   `0..num_actual_tokens-1` queries) or merely as an assertion. If the former,
+   passing the padded count may cause the kernel to access out-of-bounds
+   `query_start_loc` entries for the extra padding rows.
 
 ---
 
