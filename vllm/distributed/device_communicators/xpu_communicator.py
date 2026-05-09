@@ -201,6 +201,12 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 new_shape = (chunk.shape[0],) + orig_shape[1:]
                 results.append(chunk.reshape(new_shape).contiguous())
                 offset += fsz
+            # [TRACE] Verify Fix 5 same-dtype path restores original shapes
+            print(f"[TRACE] Fix5 same-dtype: orig_shapes={[tuple(s) for s in orig_shapes]} "
+                  f"result_shapes={[tuple(r.shape) for r in results]} "
+                  f"feature_sizes={feature_sizes} "
+                  f"combined={tuple(combined.shape)} gathered={tuple(gathered.shape)}",
+                  flush=True)
             return results
         else:
             # ── Mixed-dtype path: sequential collectives + barrier ────────────
