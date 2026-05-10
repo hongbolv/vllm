@@ -144,8 +144,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         _nan_check_call_counter += 1
         call_id = _nan_check_call_counter
         dp_rank = get_dp_group().rank_in_group
-        a1q_has_nan = bool(torch.isnan(a1q).any().item())
-        a1q_has_inf = bool(torch.isinf(a1q).any().item())
+        _can_check = a1q.is_floating_point()
+        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check else False
+        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check else False
         if a1q_has_nan or a1q_has_inf:
             _nan_total_pre += 1
             if _nan_first_pre_call is None:
@@ -198,8 +199,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
         # --- NaN detection AFTER dispatch (Modular path) ---
-        a1q_has_nan = bool(torch.isnan(a1q).any().item())
-        a1q_has_inf = bool(torch.isinf(a1q).any().item())
+        _can_check = a1q.is_floating_point()
+        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check else False
+        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check else False
         if a1q_has_nan or a1q_has_inf:
             _nan_total_post += 1
             if _nan_first_post_call is None:
@@ -302,10 +304,12 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         _nan_check_call_counter += 1
         call_id = _nan_check_call_counter
         dp_rank = get_dp_group().rank_in_group
-        a1q_has_nan = bool(torch.isnan(a1q).any().item())
-        a1q_has_inf = bool(torch.isinf(a1q).any().item())
-        rl_has_nan = bool(torch.isnan(router_logits).any().item())
-        rl_has_inf = bool(torch.isinf(router_logits).any().item())
+        _can_check_a1q = a1q.is_floating_point()
+        _can_check_rl = router_logits.is_floating_point()
+        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check_a1q else False
+        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check_a1q else False
+        rl_has_nan = bool(torch.isnan(router_logits).any().item()) if _can_check_rl else False
+        rl_has_inf = bool(torch.isinf(router_logits).any().item()) if _can_check_rl else False
         if a1q_has_nan or a1q_has_inf or rl_has_nan or rl_has_inf:
             _nan_total_pre += 1
             if _nan_first_pre_call is None:
@@ -355,8 +359,9 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
             a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
         # --- NaN detection AFTER dispatch (Monolithic path) ---
-        a1q_has_nan = bool(torch.isnan(a1q).any().item())
-        a1q_has_inf = bool(torch.isinf(a1q).any().item())
+        _can_check_a1q = a1q.is_floating_point()
+        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check_a1q else False
+        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check_a1q else False
         if a1q_has_nan or a1q_has_inf:
             _nan_total_post += 1
             if _nan_first_post_call is None:
