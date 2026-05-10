@@ -135,45 +135,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         dist.barrier(group=dist_group.device_group)
-        input_shape_before = hidden_states.shape
-
-        # --- Force-zero padding positions before reduce_scatterv ---
-        # When DP padding is active (all sizes equal), padding tokens have
-        # zero input but produce non-zero expert output due to bias terms.
-        # These non-zero values can corrupt real token hidden states through
-        # the reduce_scatter operation. Zero them out before scattering.
-        all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
-        if all_sizes_equal:
-            num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu
-            dp_size = len(num_tokens_across_dp)
-            num_chunks = len(sizes)
-            # sizes may have more entries than dp_size when sequence
-            # parallelism is enabled (dp_size * sp_size entries).
-            # Map each chunk back to its DP rank to get real token count.
-            sp_size = num_chunks // dp_size if dp_size > 0 else 1
-            offset = 0
-            for i, chunk_size in enumerate(sizes):
-                dp_rank_idx = i // sp_size if sp_size > 0 else i
-                if dp_rank_idx < dp_size:
-                    real_count = int(
-                        num_tokens_across_dp[dp_rank_idx].item())
-                    # For SP chunks, real_count is the full DP rank count;
-                    # each SP chunk gets ceil(real_count / sp_size) tokens.
-                    if sp_size > 1:
-                        sp_chunk_idx = i % sp_size
-                        # Distribute real tokens across SP chunks
-                        per_sp = (real_count + sp_size - 1) // sp_size
-                        sp_real = min(per_sp,
-                                      max(0, real_count - sp_chunk_idx
-                                           * per_sp))
-                    else:
-                        sp_real = real_count
-                    if sp_real < chunk_size:
-                        pad_start = offset + sp_real
-                        pad_end = offset + chunk_size
-                        hidden_states[pad_start:pad_end, :] = 0
-                offset += chunk_size
-        # --- End force-zero ---
 
         # --- NaN detection BEFORE reduce_scatterv ---
         dp_rank = get_dp_group().rank_in_group
@@ -227,52 +188,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 flush=True,
             )
         # --- End NaN detection AFTER ---
-
-        # --- Diagnostic: check padding positions after reduce_scatterv ---
-        all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
-        if all_sizes_equal and sizes[dp_rank] > 0:
-            output_rows = hidden_states.shape[0]
-            # Compute per-row norms to detect padding positions with
-            # non-zero values (indicating expert bias producing non-zero
-            # output for zero-padded input)
-            row_norms = hidden_states.float().norm(dim=-1)
-            nonzero_rows = int((row_norms > 0).sum().item())
-            last_n = min(4, output_rows)
-            last_row_norms = [
-                f"{row_norms[output_rows - last_n + i].item():.6f}"
-                for i in range(last_n)
-            ]
-            print(
-                f"[REDUCE_SCATTER_CHECK] dp_rank={dp_rank} "
-                f"sizes={sizes} "
-                f"input_shape={list(input_shape_before)} "
-                f"output_shape={list(hidden_states.shape)} "
-                f"output_rows={output_rows} "
-                f"nonzero_rows={nonzero_rows} "
-                f"output_norm={hidden_states.float().norm().item():.6f} "
-                f"output_min={hidden_states.min().item():.6f} "
-                f"output_max={hidden_states.max().item():.6f} "
-                f"last_{last_n}_row_norms=[{', '.join(last_row_norms)}]",
-                flush=True,
-            )
-            # Error check: if nonzero_rows equals output_rows when DP
-            # padding is active, it means ALL rows (including padding
-            # positions) have non-zero values. This indicates expert
-            # bias terms produced non-zero output for zero-padded input,
-            # which may corrupt real token hidden states through
-            # reduce_scatter.
-            if nonzero_rows == output_rows:
-                print(
-                    f"[REDUCE_SCATTER_CHECK] ERROR: dp_rank={dp_rank} "
-                    f"ALL {output_rows} output rows are non-zero "
-                    f"(nonzero_rows={nonzero_rows}). "
-                    f"Padding positions likely have non-zero values "
-                    f"after expert computation (expert bias on zero "
-                    f"input). This may corrupt real token hidden states "
-                    f"through reduce_scatter cut boundary shift.",
-                    flush=True,
-                )
-        # --- End diagnostic ---
 
         return hidden_states
 
