@@ -130,7 +130,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
             else:
                 output_size = (input_size[0] * world_size,) + input_size[1:]
             # Allocate output tensor.
-            output_tensor = torch.empty(
+            # Use zeros instead of empty to prevent uninitialized memory
+            # from appearing as NaN if all_gather doesn't fully write
+            # all positions in the output buffer.
+            output_tensor = torch.zeros(
                 output_size, dtype=input_.dtype, device=input_.device
             )
 
