@@ -136,58 +136,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         dist.barrier(group=dist_group.device_group)
 
-        # --- NaN detection BEFORE reduce_scatterv ---
-        dp_rank = get_dp_group().rank_in_group
-        has_nan_before = bool(torch.isnan(hidden_states).any().item())
-        has_inf_before = bool(torch.isinf(hidden_states).any().item())
-        if has_nan_before or has_inf_before:
-            nan_count = int(torch.isnan(hidden_states).sum().item())
-            inf_count = int(torch.isinf(hidden_states).sum().item())
-            # Find which rows contain NaN
-            nan_rows = torch.isnan(hidden_states).any(dim=-1)
-            nan_row_indices = torch.where(nan_rows)[0].tolist()
-            print(
-                f"[NAN_CHECK] dp_rank={dp_rank} "
-                f"NaN/Inf detected BEFORE reduce_scatterv! "
-                f"nan_count={nan_count} inf_count={inf_count} "
-                f"input_shape={list(hidden_states.shape)} "
-                f"nan_row_indices={nan_row_indices[:10]}"
-                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
-                f"total_nan_rows={len(nan_row_indices)}",
-                flush=True,
-            )
-        else:
-            print(
-                f"[NAN_CHECK] dp_rank={dp_rank} "
-                f"No NaN/Inf BEFORE reduce_scatterv. "
-                f"input_shape={list(hidden_states.shape)} "
-                f"input_norm={hidden_states.float().norm().item():.6f}",
-                flush=True,
-            )
-        # --- End NaN detection BEFORE ---
-
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-
-        # --- NaN detection AFTER reduce_scatterv ---
-        has_nan_after = bool(torch.isnan(hidden_states).any().item())
-        has_inf_after = bool(torch.isinf(hidden_states).any().item())
-        if has_nan_after or has_inf_after:
-            nan_count = int(torch.isnan(hidden_states).sum().item())
-            inf_count = int(torch.isinf(hidden_states).sum().item())
-            nan_rows = torch.isnan(hidden_states).any(dim=-1)
-            nan_row_indices = torch.where(nan_rows)[0].tolist()
-            print(
-                f"[NAN_CHECK] dp_rank={dp_rank} "
-                f"NaN/Inf detected AFTER reduce_scatterv! "
-                f"nan_count={nan_count} inf_count={inf_count} "
-                f"output_shape={list(hidden_states.shape)} "
-                f"nan_row_indices={nan_row_indices[:10]}"
-                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
-                f"total_nan_rows={len(nan_row_indices)} "
-                f"had_nan_before={has_nan_before}",
-                flush=True,
-            )
-        # --- End NaN detection AFTER ---
 
         return hidden_states
 
