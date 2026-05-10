@@ -136,6 +136,25 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         dist.barrier(group=dist_group.device_group)
         input_shape_before = hidden_states.shape
+
+        # --- Force-zero padding positions before reduce_scatterv ---
+        # When DP padding is active (all sizes equal), padding tokens have
+        # zero input but produce non-zero expert output due to bias terms.
+        # These non-zero values can corrupt real token hidden states through
+        # the reduce_scatter operation. Zero them out before scattering.
+        all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
+        if all_sizes_equal:
+            num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu
+            offset = 0
+            for i, chunk_size in enumerate(sizes):
+                real_count = int(num_tokens_across_dp[i].item())
+                if real_count < chunk_size:
+                    pad_start = offset + real_count
+                    pad_end = offset + chunk_size
+                    hidden_states[pad_start:pad_end, :] = 0
+                offset += chunk_size
+        # --- End force-zero ---
+
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
 
         # --- Diagnostic: check padding positions after reduce_scatterv ---
