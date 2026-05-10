@@ -117,6 +117,49 @@ class AgRsAll2AllManager(All2AllManagerBase):
         topk_weights = gathered_tensors[1]
         topk_ids = gathered_tensors[2]
 
+        # --- NaN detection AFTER all_gatherv (before expert computation) ---
+        dp_rank = get_dp_group().rank_in_group
+        has_nan = bool(torch.isnan(hidden_states).any().item())
+        has_inf = bool(torch.isinf(hidden_states).any().item())
+        if has_nan or has_inf:
+            nan_count = int(torch.isnan(hidden_states).sum().item())
+            inf_count = int(torch.isinf(hidden_states).sum().item())
+            nan_rows = torch.isnan(hidden_states).any(dim=-1)
+            nan_row_indices = torch.where(nan_rows)[0].tolist()
+            # Per-chunk breakdown to identify which DP rank's data has NaN
+            chunk_info = []
+            offset = 0
+            for i, s in enumerate(sizes):
+                chunk = hidden_states[offset:offset + s]
+                c_nan = int(torch.isnan(chunk).sum().item())
+                c_inf = int(torch.isinf(chunk).sum().item())
+                if c_nan > 0 or c_inf > 0:
+                    chunk_info.append(
+                        f"chunk[{i}](dp_rank={i},rows={s}): "
+                        f"nan={c_nan} inf={c_inf}"
+                    )
+                offset += s
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"NaN/Inf detected AFTER all_gatherv (before expert "
+                f"computation)! nan_count={nan_count} inf_count={inf_count} "
+                f"gathered_shape={list(hidden_states.shape)} "
+                f"nan_row_indices={nan_row_indices[:10]}"
+                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                f"total_nan_rows={len(nan_row_indices)} "
+                f"per_chunk=[{', '.join(chunk_info)}]",
+                flush=True,
+            )
+        else:
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"No NaN/Inf AFTER all_gatherv. "
+                f"gathered_shape={list(hidden_states.shape)} "
+                f"gathered_norm={hidden_states.float().norm().item():.6f}",
+                flush=True,
+            )
+        # --- End NaN detection AFTER all_gatherv ---
+
         if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
 
