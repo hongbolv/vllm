@@ -138,47 +138,50 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         a1q, scales = _quantize_and_setup_dispatch(a1, quant_config, defer_input_quant)
 
         # --- NaN detection BEFORE dispatch (Modular path) ---
-        global _nan_detail_count, _nan_check_call_counter
-        global _nan_total_pre, _nan_total_post
-        global _nan_first_pre_call, _nan_first_post_call
-        _nan_check_call_counter += 1
-        call_id = _nan_check_call_counter
-        dp_rank = get_dp_group().rank_in_group
-        _can_check = a1q.is_floating_point()
-        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check else False
-        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check else False
-        if a1q_has_nan or a1q_has_inf:
-            _nan_total_pre += 1
-            if _nan_first_pre_call is None:
-                _nan_first_pre_call = call_id
-            if _nan_detail_count < _NAN_DETAIL_LIMIT:
-                nan_count = int(torch.isnan(a1q).sum().item())
-                inf_count = int(torch.isinf(a1q).sum().item())
-                nan_rows = torch.isnan(a1q).any(dim=-1)
-                nan_row_indices = torch.where(nan_rows)[0].tolist()
+        try:
+            global _nan_detail_count, _nan_check_call_counter
+            global _nan_total_pre, _nan_total_post
+            global _nan_first_pre_call, _nan_first_post_call
+            _nan_check_call_counter += 1
+            call_id = _nan_check_call_counter
+            dp_rank = get_dp_group().rank_in_group
+            if a1q.is_floating_point() and a1q.ndim >= 2:
+                a1q_has_nan = bool(torch.isnan(a1q).any().item())
+                a1q_has_inf = bool(torch.isinf(a1q).any().item())
+                if a1q_has_nan or a1q_has_inf:
+                    _nan_total_pre += 1
+                    if _nan_first_pre_call is None:
+                        _nan_first_pre_call = call_id
+                    if _nan_detail_count < _NAN_DETAIL_LIMIT:
+                        nan_count = int(torch.isnan(a1q).sum().item())
+                        inf_count = int(torch.isinf(a1q).sum().item())
+                        nan_rows = torch.isnan(a1q).any(dim=-1)
+                        nan_row_indices = torch.where(nan_rows)[0].tolist()
+                        print(
+                            f"[NAN_CHECK_PRE_DISPATCH] call={call_id} "
+                            f"dp_rank={dp_rank} "
+                            f"NaN/Inf in hidden_states BEFORE dispatch "
+                            f"(Modular path)! "
+                            f"nan_count={nan_count} inf_count={inf_count} "
+                            f"shape={list(a1q.shape)} "
+                            f"nan_row_indices={nan_row_indices[:10]}"
+                            f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                            f"total_nan_rows={len(nan_row_indices)}",
+                            flush=True,
+                        )
+                        _nan_detail_count += 1
+            # Print summary every _NAN_SUMMARY_INTERVAL calls
+            if call_id % _NAN_SUMMARY_INTERVAL == 0:
                 print(
-                    f"[NAN_CHECK_PRE_DISPATCH] call={call_id} "
-                    f"dp_rank={dp_rank} "
-                    f"NaN/Inf in hidden_states BEFORE dispatch "
-                    f"(Modular path)! "
-                    f"nan_count={nan_count} inf_count={inf_count} "
-                    f"shape={list(a1q.shape)} "
-                    f"nan_row_indices={nan_row_indices[:10]}"
-                    f"{'... ' if len(nan_row_indices) > 10 else ' '}"
-                    f"total_nan_rows={len(nan_row_indices)}",
+                    f"[NAN_SUMMARY] call={call_id} dp_rank={dp_rank} "
+                    f"pre_nan_total={_nan_total_pre} "
+                    f"post_nan_total={_nan_total_post} "
+                    f"first_pre_nan_call={_nan_first_pre_call} "
+                    f"first_post_nan_call={_nan_first_post_call}",
                     flush=True,
                 )
-                _nan_detail_count += 1
-        # Print summary every _NAN_SUMMARY_INTERVAL calls
-        if call_id % _NAN_SUMMARY_INTERVAL == 0:
-            print(
-                f"[NAN_SUMMARY] call={call_id} dp_rank={dp_rank} "
-                f"pre_nan_total={_nan_total_pre} "
-                f"post_nan_total={_nan_total_post} "
-                f"first_pre_nan_call={_nan_first_pre_call} "
-                f"first_post_nan_call={_nan_first_post_call}",
-                flush=True,
-            )
+        except Exception:
+            pass  # Never let diagnostics crash inference
         # --- End NaN detection BEFORE dispatch ---
 
         res = get_ep_group().dispatch(
@@ -199,31 +202,34 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
         # --- NaN detection AFTER dispatch (Modular path) ---
-        _can_check = a1q.is_floating_point()
-        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check else False
-        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check else False
-        if a1q_has_nan or a1q_has_inf:
-            _nan_total_post += 1
-            if _nan_first_post_call is None:
-                _nan_first_post_call = call_id
-            if _nan_detail_count < _NAN_DETAIL_LIMIT:
-                nan_count = int(torch.isnan(a1q).sum().item())
-                inf_count = int(torch.isinf(a1q).sum().item())
-                nan_rows = torch.isnan(a1q).any(dim=-1)
-                nan_row_indices = torch.where(nan_rows)[0].tolist()
-                print(
-                    f"[NAN_CHECK_DISPATCH] call={call_id} "
-                    f"dp_rank={dp_rank} "
-                    f"NaN/Inf detected AFTER dispatch "
-                    f"(Modular path)! "
-                    f"nan_count={nan_count} inf_count={inf_count} "
-                    f"shape={list(a1q.shape)} "
-                    f"nan_row_indices={nan_row_indices[:10]}"
-                    f"{'... ' if len(nan_row_indices) > 10 else ' '}"
-                    f"total_nan_rows={len(nan_row_indices)}",
-                    flush=True,
-                )
-                _nan_detail_count += 1
+        try:
+            if a1q.is_floating_point() and a1q.ndim >= 2:
+                a1q_has_nan = bool(torch.isnan(a1q).any().item())
+                a1q_has_inf = bool(torch.isinf(a1q).any().item())
+                if a1q_has_nan or a1q_has_inf:
+                    _nan_total_post += 1
+                    if _nan_first_post_call is None:
+                        _nan_first_post_call = call_id
+                    if _nan_detail_count < _NAN_DETAIL_LIMIT:
+                        nan_count = int(torch.isnan(a1q).sum().item())
+                        inf_count = int(torch.isinf(a1q).sum().item())
+                        nan_rows = torch.isnan(a1q).any(dim=-1)
+                        nan_row_indices = torch.where(nan_rows)[0].tolist()
+                        print(
+                            f"[NAN_CHECK_DISPATCH] call={call_id} "
+                            f"dp_rank={dp_rank} "
+                            f"NaN/Inf detected AFTER dispatch "
+                            f"(Modular path)! "
+                            f"nan_count={nan_count} inf_count={inf_count} "
+                            f"shape={list(a1q.shape)} "
+                            f"nan_row_indices={nan_row_indices[:10]}"
+                            f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                            f"total_nan_rows={len(nan_row_indices)}",
+                            flush=True,
+                        )
+                        _nan_detail_count += 1
+        except Exception:
+            pass  # Never let diagnostics crash inference
         # --- End NaN detection AFTER dispatch ---
 
         return a1q, a1q_scale, None, topk_ids, topk_weights
@@ -298,48 +304,51 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         a1q, scales = _quantize_and_setup_dispatch(a1, quant_config, defer_input_quant)
 
         # --- NaN detection BEFORE dispatch (Monolithic path) ---
-        global _nan_detail_count, _nan_check_call_counter
-        global _nan_total_pre, _nan_total_post
-        global _nan_first_pre_call, _nan_first_post_call
-        _nan_check_call_counter += 1
-        call_id = _nan_check_call_counter
-        dp_rank = get_dp_group().rank_in_group
-        _can_check_a1q = a1q.is_floating_point()
-        _can_check_rl = router_logits.is_floating_point()
-        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check_a1q else False
-        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check_a1q else False
-        rl_has_nan = bool(torch.isnan(router_logits).any().item()) if _can_check_rl else False
-        rl_has_inf = bool(torch.isinf(router_logits).any().item()) if _can_check_rl else False
-        if a1q_has_nan or a1q_has_inf or rl_has_nan or rl_has_inf:
-            _nan_total_pre += 1
-            if _nan_first_pre_call is None:
-                _nan_first_pre_call = call_id
-            if _nan_detail_count < _NAN_DETAIL_LIMIT:
-                hs_nan = int(torch.isnan(a1q).sum().item())
-                hs_inf = int(torch.isinf(a1q).sum().item())
-                rl_nan = int(torch.isnan(router_logits).sum().item())
-                rl_inf = int(torch.isinf(router_logits).sum().item())
+        try:
+            global _nan_detail_count, _nan_check_call_counter
+            global _nan_total_pre, _nan_total_post
+            global _nan_first_pre_call, _nan_first_post_call
+            _nan_check_call_counter += 1
+            call_id = _nan_check_call_counter
+            dp_rank = get_dp_group().rank_in_group
+            _can_check_a1q = a1q.is_floating_point() and a1q.ndim >= 2
+            _can_check_rl = router_logits.is_floating_point() and router_logits.ndim >= 2
+            a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check_a1q else False
+            a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check_a1q else False
+            rl_has_nan = bool(torch.isnan(router_logits).any().item()) if _can_check_rl else False
+            rl_has_inf = bool(torch.isinf(router_logits).any().item()) if _can_check_rl else False
+            if a1q_has_nan or a1q_has_inf or rl_has_nan or rl_has_inf:
+                _nan_total_pre += 1
+                if _nan_first_pre_call is None:
+                    _nan_first_pre_call = call_id
+                if _nan_detail_count < _NAN_DETAIL_LIMIT:
+                    hs_nan = int(torch.isnan(a1q).sum().item()) if _can_check_a1q else 0
+                    hs_inf = int(torch.isinf(a1q).sum().item()) if _can_check_a1q else 0
+                    rl_nan = int(torch.isnan(router_logits).sum().item()) if _can_check_rl else 0
+                    rl_inf = int(torch.isinf(router_logits).sum().item()) if _can_check_rl else 0
+                    print(
+                        f"[NAN_CHECK_PRE_DISPATCH] call={call_id} "
+                        f"dp_rank={dp_rank} "
+                        f"NaN/Inf BEFORE dispatch (Monolithic path)! "
+                        f"hidden_states: nan={hs_nan} inf={hs_inf} "
+                        f"shape={list(a1q.shape)} | "
+                        f"router_logits: nan={rl_nan} inf={rl_inf} "
+                        f"shape={list(router_logits.shape)}",
+                        flush=True,
+                    )
+                    _nan_detail_count += 1
+            # Print summary every _NAN_SUMMARY_INTERVAL calls
+            if call_id % _NAN_SUMMARY_INTERVAL == 0:
                 print(
-                    f"[NAN_CHECK_PRE_DISPATCH] call={call_id} "
-                    f"dp_rank={dp_rank} "
-                    f"NaN/Inf BEFORE dispatch (Monolithic path)! "
-                    f"hidden_states: nan={hs_nan} inf={hs_inf} "
-                    f"shape={list(a1q.shape)} | "
-                    f"router_logits: nan={rl_nan} inf={rl_inf} "
-                    f"shape={list(router_logits.shape)}",
+                    f"[NAN_SUMMARY] call={call_id} dp_rank={dp_rank} "
+                    f"pre_nan_total={_nan_total_pre} "
+                    f"post_nan_total={_nan_total_post} "
+                    f"first_pre_nan_call={_nan_first_pre_call} "
+                    f"first_post_nan_call={_nan_first_post_call}",
                     flush=True,
                 )
-                _nan_detail_count += 1
-        # Print summary every _NAN_SUMMARY_INTERVAL calls
-        if call_id % _NAN_SUMMARY_INTERVAL == 0:
-            print(
-                f"[NAN_SUMMARY] call={call_id} dp_rank={dp_rank} "
-                f"pre_nan_total={_nan_total_pre} "
-                f"post_nan_total={_nan_total_post} "
-                f"first_pre_nan_call={_nan_first_pre_call} "
-                f"first_post_nan_call={_nan_first_post_call}",
-                flush=True,
-            )
+        except Exception:
+            pass  # Never let diagnostics crash inference
         # --- End NaN detection BEFORE dispatch ---
 
         res = get_ep_group().dispatch_router_logits(
@@ -359,31 +368,34 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
             a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
         # --- NaN detection AFTER dispatch (Monolithic path) ---
-        _can_check_a1q = a1q.is_floating_point()
-        a1q_has_nan = bool(torch.isnan(a1q).any().item()) if _can_check_a1q else False
-        a1q_has_inf = bool(torch.isinf(a1q).any().item()) if _can_check_a1q else False
-        if a1q_has_nan or a1q_has_inf:
-            _nan_total_post += 1
-            if _nan_first_post_call is None:
-                _nan_first_post_call = call_id
-            if _nan_detail_count < _NAN_DETAIL_LIMIT:
-                nan_count = int(torch.isnan(a1q).sum().item())
-                inf_count = int(torch.isinf(a1q).sum().item())
-                nan_rows = torch.isnan(a1q).any(dim=-1)
-                nan_row_indices = torch.where(nan_rows)[0].tolist()
-                print(
-                    f"[NAN_CHECK_DISPATCH] call={call_id} "
-                    f"dp_rank={dp_rank} "
-                    f"NaN/Inf detected AFTER dispatch "
-                    f"(Monolithic path)! "
-                    f"nan_count={nan_count} inf_count={inf_count} "
-                    f"shape={list(a1q.shape)} "
-                    f"nan_row_indices={nan_row_indices[:10]}"
-                    f"{'... ' if len(nan_row_indices) > 10 else ' '}"
-                    f"total_nan_rows={len(nan_row_indices)}",
-                    flush=True,
-                )
-                _nan_detail_count += 1
+        try:
+            if a1q.is_floating_point() and a1q.ndim >= 2:
+                a1q_has_nan = bool(torch.isnan(a1q).any().item())
+                a1q_has_inf = bool(torch.isinf(a1q).any().item())
+                if a1q_has_nan or a1q_has_inf:
+                    _nan_total_post += 1
+                    if _nan_first_post_call is None:
+                        _nan_first_post_call = call_id
+                    if _nan_detail_count < _NAN_DETAIL_LIMIT:
+                        nan_count = int(torch.isnan(a1q).sum().item())
+                        inf_count = int(torch.isinf(a1q).sum().item())
+                        nan_rows = torch.isnan(a1q).any(dim=-1)
+                        nan_row_indices = torch.where(nan_rows)[0].tolist()
+                        print(
+                            f"[NAN_CHECK_DISPATCH] call={call_id} "
+                            f"dp_rank={dp_rank} "
+                            f"NaN/Inf detected AFTER dispatch "
+                            f"(Monolithic path)! "
+                            f"nan_count={nan_count} inf_count={inf_count} "
+                            f"shape={list(a1q.shape)} "
+                            f"nan_row_indices={nan_row_indices[:10]}"
+                            f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                            f"total_nan_rows={len(nan_row_indices)}",
+                            flush=True,
+                        )
+                        _nan_detail_count += 1
+        except Exception:
+            pass  # Never let diagnostics crash inference
         # --- End NaN detection AFTER dispatch ---
 
         return a1q, a1q_scale, router_logits
