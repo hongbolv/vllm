@@ -145,13 +145,33 @@ class AgRsAll2AllManager(All2AllManagerBase):
         all_sizes_equal = (len(set(sizes)) == 1) if sizes else False
         if all_sizes_equal:
             num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu
+            dp_size = len(num_tokens_across_dp)
+            num_chunks = len(sizes)
+            # sizes may have more entries than dp_size when sequence
+            # parallelism is enabled (dp_size * sp_size entries).
+            # Map each chunk back to its DP rank to get real token count.
+            sp_size = num_chunks // dp_size if dp_size > 0 else 1
             offset = 0
             for i, chunk_size in enumerate(sizes):
-                real_count = int(num_tokens_across_dp[i].item())
-                if real_count < chunk_size:
-                    pad_start = offset + real_count
-                    pad_end = offset + chunk_size
-                    hidden_states[pad_start:pad_end, :] = 0
+                dp_rank_idx = i // sp_size if sp_size > 0 else i
+                if dp_rank_idx < dp_size:
+                    real_count = int(
+                        num_tokens_across_dp[dp_rank_idx].item())
+                    # For SP chunks, real_count is the full DP rank count;
+                    # each SP chunk gets ceil(real_count / sp_size) tokens.
+                    if sp_size > 1:
+                        sp_chunk_idx = i % sp_size
+                        # Distribute real tokens across SP chunks
+                        per_sp = (real_count + sp_size - 1) // sp_size
+                        sp_real = min(per_sp,
+                                      max(0, real_count - sp_chunk_idx
+                                           * per_sp))
+                    else:
+                        sp_real = real_count
+                    if sp_real < chunk_size:
+                        pad_start = offset + sp_real
+                        pad_end = offset + chunk_size
+                        hidden_states[pad_start:pad_end, :] = 0
                 offset += chunk_size
         # --- End force-zero ---
 
