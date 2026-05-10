@@ -3,7 +3,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_dp_group, get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -132,6 +132,36 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             extra_tensors=scales,
         )
 
+        # --- NaN detection AFTER dispatch (before expert computation) ---
+        dp_rank = get_dp_group().rank_in_group
+        dispatched_hs = res[0]
+        has_nan = bool(torch.isnan(dispatched_hs).any().item())
+        has_inf = bool(torch.isinf(dispatched_hs).any().item())
+        if has_nan or has_inf:
+            nan_count = int(torch.isnan(dispatched_hs).sum().item())
+            inf_count = int(torch.isinf(dispatched_hs).sum().item())
+            nan_rows = torch.isnan(dispatched_hs).any(dim=-1)
+            nan_row_indices = torch.where(nan_rows)[0].tolist()
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"NaN/Inf detected AFTER dispatch (Modular path)! "
+                f"nan_count={nan_count} inf_count={inf_count} "
+                f"shape={list(dispatched_hs.shape)} "
+                f"nan_row_indices={nan_row_indices[:10]}"
+                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                f"total_nan_rows={len(nan_row_indices)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"No NaN/Inf AFTER dispatch (Modular path). "
+                f"shape={list(dispatched_hs.shape)} "
+                f"norm={dispatched_hs.float().norm().item():.6f}",
+                flush=True,
+            )
+        # --- End NaN detection ---
+
         if scales is None:
             assert len(res) == 3
             a1q, topk_weights, topk_ids = res
@@ -218,6 +248,38 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
             is_sequence_parallel=self.is_sequence_parallel,
             extra_tensors=scales,
         )
+
+        # --- NaN detection AFTER dispatch_router_logits (before expert) ---
+        dp_rank = get_dp_group().rank_in_group
+        dispatched_hs = res[0]
+        has_nan = bool(torch.isnan(dispatched_hs).any().item())
+        has_inf = bool(torch.isinf(dispatched_hs).any().item())
+        if has_nan or has_inf:
+            nan_count = int(torch.isnan(dispatched_hs).sum().item())
+            inf_count = int(torch.isinf(dispatched_hs).sum().item())
+            nan_rows = torch.isnan(dispatched_hs).any(dim=-1)
+            nan_row_indices = torch.where(nan_rows)[0].tolist()
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"NaN/Inf detected AFTER dispatch_router_logits "
+                f"(Monolithic path)! "
+                f"nan_count={nan_count} inf_count={inf_count} "
+                f"shape={list(dispatched_hs.shape)} "
+                f"nan_row_indices={nan_row_indices[:10]}"
+                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
+                f"total_nan_rows={len(nan_row_indices)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[NAN_CHECK_DISPATCH] dp_rank={dp_rank} "
+                f"No NaN/Inf AFTER dispatch_router_logits "
+                f"(Monolithic path). "
+                f"shape={list(dispatched_hs.shape)} "
+                f"norm={dispatched_hs.float().norm().item():.6f}",
+                flush=True,
+            )
+        # --- End NaN detection ---
 
         if scales is None:
             assert len(res) == 2
