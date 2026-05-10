@@ -344,61 +344,92 @@ by the code will answer this directly.
 
 ### Observation
 
-With Fixes 1-3 and Fix 6 applied (Fix 4 and Fix 5 removed), the model no
-longer hangs but produces partially correct output:
+With Fixes 1-3 and Fix 6 applied (Fix 4 and Fix 5 removed), plus the
+`torch.zeros` buffer initialization fix in `xpu_communicator.py`, the model
+no longer hangs and produces partially correct output:
 
 ```
-Prompt: 'The capital of France is'  → ' known as!!!!!!...'
-Prompt: 'The president of the US is' → ' elected by!!!!!!...'
-Prompt: 'Explain quantum computing'  → '\n\n1!!!!!!...'
+Prompt: 'The capital of France is'  → ' known!!!!!!...'
+Prompt: 'The president of the US is' → ' elected!!!!!!...'
+Prompt: 'The future of AI is'        → ' here!!!!!!...'
+Prompt: 'Hello, my name is'          → '!!!!!!...'
 ```
 
-**Key pattern**: The first 1-3 tokens are **correct**, then all subsequent
-tokens degrade to "!" (token id 0 or a fixed id). This is consistent across
-both DP ranks.
+**Key pattern**: Some prompts generate a correct first token, then all
+subsequent tokens degrade to "!". This is consistent across both DP ranks.
 
-### Analysis
+### Root Cause Analysis — Two Independent NaN Sources
 
-1. **Prefill stage works correctly** — the first token output is valid, proving
-   model weights, embedding, attention, and MoE forward are functioning.
+NaN/Inf tracing identified **two independent NaN sources**:
 
-2. **Problem occurs in decode (autoregressive) stage** — starting from the
-   2nd-3rd token, all logits collapse to the same token id.
+#### NaN Source 1 — Prefill Stage (FIXED)
 
-### Possible Root Causes
+**Root cause**: `all_gatherv()` in `xpu_communicator.py` used `torch.empty()`
+to allocate the output buffer for the uniform-size path. After DP padding
+ensures uniform token counts, the uniform path is always taken. If XCCL's
+`all_gather` does not fully write all data to the output buffer, uninitialized
+regions contain NaN.
 
-1. **KV cache pollution from DP padding tokens** — Fix 1 forces DP padding,
-   which adds padding tokens. These tokens participate in the full forward
-   pass including attention. If their KV entries are written to valid KV cache
-   slots, subsequent decode steps will attend to these garbage KV entries,
-   corrupting real token attention scores. MoE is per-token independent so
-   padding is safe there, but **attention is NOT per-token independent** —
-   padding KV entries affect all tokens in the same sequence.
+**Evidence**:
+- `[NAN_CHECK_PRE_DISPATCH]` confirmed the first MoE layer's input
+  `hidden_states` are **clean** (no NaN) during prefill
+- `[NAN_CHECK_DISPATCH]` confirmed dispatch returns all-NaN data
+  (`nan_count=33554432, total_nan_rows=16384`)
+- Changing `torch.empty` to `torch.zeros` resolved prefill-stage NaN
 
-2. **`pad_attn` not synchronized in cudagraph capture path** — Fix 2 sets
-   `pad_attn = dp_padding_applied` in the main `execute_model` path
-   (line 3987-3988), but the cudagraph capture path (line 5500) still uses
-   `pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL` without the
-   `dp_padding_applied` condition.
+**Fix**: Changed `torch.empty` → `torch.zeros` in `xpu_communicator.py`
+line 133 (uniform-size path of `all_gatherv()`).
 
-3. **`all_gather` API usage in uniform path** — After removing Fix 4,
-   `dist.all_gather([output_tensor], input_, group=...)` passes a single-
-   element list. `all_gather` expects `world_size` tensors in the list.
-   Fix 1 forces all ranks to have equal sizes → always takes uniform path
-   → always hits this potentially incorrect API call.
+#### NaN Source 2 — Decode Stage (UNDER INVESTIGATION)
 
-4. **Barrier insufficient for XCCL synchronization** — Fix 6's
-   `dist.barrier()` may not guarantee that XCCL compute kernels have
-   finished writing results. A `torch.xpu.synchronize()` call before
-   the barrier may be needed.
+**Root cause**: After the `torch.zeros` fix, decode-stage
+`[NAN_CHECK_PRE_DISPATCH]` shows NaN in `hidden_states` **before** dispatch
+(`shape=[2, 2048], total_nan_rows=2`). This means decode-stage NaN
+originates **upstream** of MoE — in attention, layernorm, or residual
+connection layers — not in the all_gatherv operation.
+
+**Evidence**:
+- Decode-stage `[NAN_CHECK_PRE_DISPATCH]` detects NaN before dispatch
+  on both dp_rank=0 and dp_rank=1
+- Shape `[2, 2048]` is decode-stage (2 tokens per rank = 1 real + 1 padding)
+- Some prompts generate a correct first token ("elected", "here", "known"),
+  confirming prefill output is now valid
+- NaN appears starting from the decode stage, breaking all subsequent tokens
+
+**Possible causes**:
+1. **DP padding tokens polluting KV cache** — padding tokens participate in
+   attention during prefill and their KV entries may be stored in the KV cache.
+   During decode, real tokens attend to these garbage KV entries, causing NaN
+   in attention scores (softmax of very large/small values)
+2. **Attention computation with padding** — decode-stage attention may not
+   properly mask out padding token positions, causing NaN from attending to
+   invalid positions
+3. **Residual connection accumulating errors** — `hidden_states = hidden_states
+   + moe_output` during decode may accumulate numerical errors from the
+   first (now-fixed) prefill NaN propagation through KV cache
+
+### What is NaN?
+
+NaN (Not a Number) is a special IEEE 754 floating-point value that represents
+undefined or unrepresentable results. Key properties:
+
+- **Infectious**: Any arithmetic with NaN produces NaN (`NaN + 1 = NaN`,
+  `NaN × 0.5 = NaN`, `relu(NaN) = NaN`)
+- **Comparison anomaly**: `NaN != NaN` is True; `NaN > 0` and `NaN < 0` are
+  both False
+- **Impact on model**: Once NaN enters any layer's output, it propagates
+  through all subsequent computations (attention, layernorm, MoE, residual
+  connections), ultimately corrupting all logits and producing random/repeated
+  token outputs ("!!!!")
 
 ### Recommended Next Steps
 
-- Add trace in decode `execute_model` to print `num_tokens_padded` vs
-  `num_tokens_unpadded` and `pad_attn` value
-- Check if padding tokens' `slot_mapping` points to valid KV cache positions
-- Try adding `torch.xpu.synchronize()` before Fix 6 barriers
-- Verify `all_gather([output_tensor], ...)` behavior with world_size > 2
+- Add NaN detection in attention layer output to determine if decode-stage
+  NaN originates from attention computation or layernorm/residual
+- Check if DP padding tokens' KV cache entries are properly masked during
+  decode-stage attention
+- Investigate whether `slot_mapping=-1` for padding tokens correctly
+  prevents KV cache writes on XPU (PAD_SLOT_ID behavior)
 
 ---
 
