@@ -191,7 +191,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 f"nan_count={nan_count} inf_count={inf_count} "
                 f"input_shape={list(hidden_states.shape)} "
                 f"nan_row_indices={nan_row_indices[:10]}"
-                f"{'...' if len(nan_row_indices) > 10 else ''} "
+                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
                 f"total_nan_rows={len(nan_row_indices)}",
                 flush=True,
             )
@@ -221,7 +221,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 f"nan_count={nan_count} inf_count={inf_count} "
                 f"output_shape={list(hidden_states.shape)} "
                 f"nan_row_indices={nan_row_indices[:10]}"
-                f"{'...' if len(nan_row_indices) > 10 else ''} "
+                f"{'... ' if len(nan_row_indices) > 10 else ' '}"
                 f"total_nan_rows={len(nan_row_indices)} "
                 f"had_nan_before={has_nan_before}",
                 flush=True,
