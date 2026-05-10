@@ -61,7 +61,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output = torch.empty(
+        # Use zeros instead of empty to prevent uninitialized memory
+        # from appearing as NaN if reduce_scatter_tensor doesn't fully
+        # write all positions in the output buffer.
+        output = torch.zeros(
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
 
@@ -92,7 +95,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output = torch.empty(
+        # Use zeros instead of empty to prevent uninitialized memory
+        # from appearing as NaN if reduce_scatter doesn't fully write
+        # all positions in the output buffer.
+        output = torch.zeros(
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
@@ -141,7 +147,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 all_gather_list = []
                 for size in sizes:
                     all_gather_list.append(
-                        torch.empty(
+                        torch.zeros(
                             (size,) + input_.shape[1:],
                             dtype=input_.dtype,
                             device=input_.device,
@@ -174,7 +180,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # cluster so we use all_gather instead for now.
         input_size = input_.size()
         # Allocate output tensor.
-        output_tensor = torch.empty(
+        # Use zeros instead of empty to prevent uninitialized memory
+        # from appearing as NaN if all_gather_into_tensor doesn't fully
+        # write all positions in the output buffer.
+        output_tensor = torch.zeros(
             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.

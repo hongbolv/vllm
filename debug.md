@@ -380,23 +380,39 @@ regions contain NaN.
 **Fix**: Changed `torch.empty` → `torch.zeros` in `xpu_communicator.py`
 line 133 (uniform-size path of `all_gatherv()`).
 
-#### NaN Source 2 — Decode Stage (UNDER INVESTIGATION)
+#### NaN Source 2 — Decode Stage (INVESTIGATING: uninitialized buffer hypothesis)
 
-**Root cause**: After the `torch.zeros` fix, decode-stage
-`[NAN_CHECK_PRE_DISPATCH]` shows NaN in `hidden_states` **before** dispatch
-(`shape=[2, 2048], total_nan_rows=2`). This means decode-stage NaN
-originates **upstream** of MoE — in attention, layernorm, or residual
-connection layers — not in the all_gatherv operation.
+**Initial analysis**: After applying `torch.zeros` only to `all_gatherv()`'s
+uniform-size path, decode-stage `[NAN_CHECK_PRE_DISPATCH]` showed NaN in
+`hidden_states` **before** dispatch (`shape=[2, 2048], total_nan_rows=2`).
+This was initially interpreted as NaN originating upstream of MoE.
 
-**Evidence**:
-- Decode-stage `[NAN_CHECK_PRE_DISPATCH]` detects NaN before dispatch
-  on both dp_rank=0 and dp_rank=1
-- Shape `[2, 2048]` is decode-stage (2 tokens per rank = 1 real + 1 padding)
-- Some prompts generate a correct first token ("elected", "here", "known"),
-  confirming prefill output is now valid
-- NaN appears starting from the decode stage, breaking all subsequent tokens
+**Revised analysis**: However, the previous logs were **partial** (only
+showing output before inference results completed). The decode-stage NaN
+may also be caused by **other uninitialized buffers** in `xpu_communicator.py`:
 
-**Possible causes**:
+- `reduce_scatter` (line 64): `torch.empty` for uniform-size output buffer
+- `reduce_scatterv` (line 95): `torch.empty` for variable-size output buffer
+- `all_gatherv` variable-size path (line 144): `torch.empty` for gather list
+- `gather` (line 177): `torch.empty` for all_gather_into_tensor output
+
+If XCCL's `reduce_scatter_tensor` has the same incomplete write issue as
+`all_gather`, then the **combine phase** (reduce_scatter) would produce NaN
+in its output buffer. This NaN would propagate through the residual connection
+(`hidden_states = hidden_states + moe_output`) and appear as NaN in the
+**next layer's input**, explaining why `[NAN_CHECK_PRE_DISPATCH]` detects
+NaN before dispatch during decode.
+
+**Fix**: Changed **all** `torch.empty` → `torch.zeros` in
+`xpu_communicator.py` (lines 64, 95, 144, 177) to comprehensively test the
+uninitialized buffer hypothesis across all XCCL collective operations.
+
+**If NaN disappears after this comprehensive fix**: confirms that multiple
+XCCL operations (not just `all_gather`) have the incomplete write issue,
+and zero-initialization is needed for all output buffers.
+
+**If NaN persists**: the decode-stage NaN truly originates upstream of MoE,
+and the cause is one of:
 1. **DP padding tokens polluting KV cache** — padding tokens participate in
    attention during prefill and their KV entries may be stored in the KV cache.
    During decode, real tokens attend to these garbage KV entries, causing NaN
