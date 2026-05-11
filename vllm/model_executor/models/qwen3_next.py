@@ -279,7 +279,29 @@ class Qwen3NextAttention(nn.Module):
         output: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
+        # --- NaN detection: check input hidden_states ---
+        if hidden_states.is_floating_point():
+            _hs_nan = bool(torch.isnan(hidden_states).any().item())
+            if _hs_nan:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp = get_dp_group().rank_in_group
+                _nc = int(torch.isnan(hidden_states).sum().item())
+                _nr = int(torch.isnan(hidden_states).any(dim=-1).sum().item())
+                print(f"[NAN_TRACE] dp_rank={_dp} STAGE=input_hidden "
+                      f"nan_count={_nc} shape={list(hidden_states.shape)} "
+                      f"nan_rows={_nr}", flush=True)
+
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # --- NaN detection: check after QKV projection ---
+        if qkv.is_floating_point():
+            _qkv_nan = bool(torch.isnan(qkv).any().item())
+            if _qkv_nan:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp = get_dp_group().rank_in_group
+                _nc = int(torch.isnan(qkv).sum().item())
+                print(f"[NAN_TRACE] dp_rank={_dp} STAGE=after_qkv_proj "
+                      f"nan_count={_nc} shape={list(qkv.shape)}", flush=True)
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -304,11 +326,35 @@ class Qwen3NextAttention(nn.Module):
 
         attn_output = self.attn(q, k, v)
 
+        # --- NaN detection: check after attention backend ---
+        if attn_output.is_floating_point():
+            _ao_nan = bool(torch.isnan(attn_output).any().item())
+            if _ao_nan:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp = get_dp_group().rank_in_group
+                _nc = int(torch.isnan(attn_output).sum().item())
+                _nr = int(torch.isnan(attn_output).any(dim=-1).sum().item())
+                print(f"[NAN_TRACE] dp_rank={_dp} STAGE=after_attn_backend "
+                      f"nan_count={_nc} shape={list(attn_output.shape)} "
+                      f"nan_rows={_nr}", flush=True)
+
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
         output[:], _ = self.o_proj(attn_output)
+
+        # --- NaN detection: check after o_proj ---
+        if output.is_floating_point():
+            _op_nan = bool(torch.isnan(output).any().item())
+            if _op_nan:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp = get_dp_group().rank_in_group
+                _nc = int(torch.isnan(output).sum().item())
+                _nr = int(torch.isnan(output).any(dim=-1).sum().item())
+                print(f"[NAN_TRACE] dp_rank={_dp} STAGE=after_o_proj "
+                      f"nan_count={_nc} shape={list(output.shape)} "
+                      f"nan_rows={_nr}", flush=True)
 
 
 class Qwen3NextDecoderLayer(nn.Module):
