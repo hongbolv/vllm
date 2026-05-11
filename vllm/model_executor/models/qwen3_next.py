@@ -445,16 +445,31 @@ class Qwen3NextDecoderLayer(nn.Module):
                 num_actual = getattr(attn_meta, 'num_actual_tokens', None)
                 sl = getattr(attn_meta, 'seq_lens', None)
                 qsl = getattr(attn_meta, 'query_start_loc', None)
-                sl_list = sl.tolist() if sl is not None else None
-                qsl_list = qsl.tolist() if qsl is not None else None
-                has_zero = (any(v == 0 for v in sl_list)
-                            if sl_list is not None else None)
+                sl_len = sl.shape[0] if sl is not None else None
+                sl_list = (sl.tolist() if sl is not None and
+                           sl.numel() <= 64 else
+                           sl[:64].tolist() if sl is not None else
+                           None)
+                qsl_len = qsl.shape[0] if qsl is not None else None
+                qsl_list = (qsl.tolist() if qsl is not None and
+                            qsl.numel() <= 64 else
+                            qsl[:64].tolist() if qsl is not None
+                            else None)
+                has_zero = (bool((sl == 0).any().item())
+                            if sl is not None else None)
+                sl_min = (int(sl.min().item())
+                          if sl is not None and sl.numel() > 0
+                          else None)
+                sl_max = (int(sl.max().item())
+                          if sl is not None and sl.numel() > 0
+                          else None)
                 print(
                     f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
                     f"layer_idx={self.layer_idx} "
                     f"num_actual_tokens={num_actual} "
-                    f"seq_lens={sl_list} "
-                    f"query_start_loc={qsl_list} "
+                    f"seq_lens(len={sl_len} min={sl_min} "
+                    f"max={sl_max})={sl_list} "
+                    f"query_start_loc(len={qsl_len})={qsl_list} "
                     f"has_zero_seq_len={has_zero}",
                     flush=True,
                 )
