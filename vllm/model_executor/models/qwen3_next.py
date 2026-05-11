@@ -440,7 +440,24 @@ class Qwen3NextDecoderLayer(nn.Module):
             from vllm.forward_context import get_forward_context
             dp_rank = get_dp_group().rank_in_group
             fwd_ctx = get_forward_context()
-            attn_meta = getattr(fwd_ctx, 'attn_metadata', None)
+            # attn_metadata is a dict[str, AttentionMetadata] keyed by
+            # attention layer name; resolve to the actual metadata object.
+            attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
+            attn_meta = None
+            if attn_meta_raw is not None:
+                if self.layer_type == "full_attention":
+                    layer_name = self.self_attn.attn.layer_name
+                elif self.layer_type == "linear_attention":
+                    layer_name = None
+                else:
+                    layer_name = None
+                if layer_name is not None:
+                    if isinstance(attn_meta_raw, dict):
+                        attn_meta = attn_meta_raw.get(layer_name)
+                    elif isinstance(attn_meta_raw, list):
+                        attn_meta = attn_meta_raw[0].get(layer_name)
+                    else:
+                        attn_meta = attn_meta_raw
             if attn_meta is not None:
                 num_actual = getattr(attn_meta, 'num_actual_tokens', None)
                 sl = getattr(attn_meta, 'seq_lens', None)
@@ -457,6 +474,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                             else None)
                 has_zero = (bool((sl == 0).any().item())
                             if sl is not None else None)
+                zero_count = (int((sl == 0).sum().item())
+                              if sl is not None else None)
                 sl_min = (int(sl.min().item())
                           if sl is not None and sl.numel() > 0
                           else None)
@@ -470,14 +489,18 @@ class Qwen3NextDecoderLayer(nn.Module):
                     f"seq_lens(len={sl_len} min={sl_min} "
                     f"max={sl_max})={sl_list} "
                     f"query_start_loc(len={qsl_len})={qsl_list} "
-                    f"has_zero_seq_len={has_zero}",
+                    f"has_zero_seq_len={has_zero} "
+                    f"zero_count={zero_count}",
                     flush=True,
                 )
             else:
+                raw_type = type(attn_meta_raw).__name__
                 print(
                     f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
                     f"layer_idx={self.layer_idx} "
-                    f"attn_metadata=None",
+                    f"attn_metadata=None "
+                    f"(raw_type={raw_type}, "
+                    f"layer_type={self.layer_type})",
                     flush=True,
                 )
 
@@ -525,7 +548,22 @@ class Qwen3NextDecoderLayer(nn.Module):
                     # Distinguish actual token rows vs padding rows
                     num_rows = hidden_states.shape[0]
                     fwd_ctx = get_forward_context()
-                    attn_meta = getattr(fwd_ctx, 'attn_metadata', None)
+                    # attn_metadata is dict[str, AttentionMetadata];
+                    # resolve using attention layer name.
+                    attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
+                    attn_meta = None
+                    if attn_meta_raw is not None:
+                        layer_name = None
+                        if self.layer_type == "full_attention":
+                            layer_name = self.self_attn.attn.layer_name
+                        if layer_name is not None:
+                            if isinstance(attn_meta_raw, dict):
+                                attn_meta = attn_meta_raw.get(layer_name)
+                            elif isinstance(attn_meta_raw, list):
+                                attn_meta = attn_meta_raw[0].get(
+                                    layer_name)
+                            else:
+                                attn_meta = attn_meta_raw
                     num_actual = (getattr(attn_meta, 'num_actual_tokens',
                                          num_rows)
                                  if attn_meta is not None else num_rows)
