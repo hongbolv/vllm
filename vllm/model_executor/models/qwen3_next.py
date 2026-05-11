@@ -403,8 +403,14 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # --- NaN detection BEFORE attention ---
-        if hidden_states.is_floating_point():
+        # --- NaN detection BEFORE attention (non-warmup only) ---
+        # Skip during warmup/profiling: attn_metadata is None before the
+        # attention backend is fully initialized.
+        from vllm.forward_context import get_forward_context
+        _fwd_ctx = get_forward_context()
+        _attn_meta_raw = getattr(_fwd_ctx, 'attn_metadata', None)
+        _is_real_inference = _attn_meta_raw is not None
+        if _is_real_inference and hidden_states.is_floating_point():
             has_nan = bool(torch.isnan(hidden_states).any().item())
             has_inf = bool(torch.isinf(hidden_states).any().item())
             if has_nan or has_inf:
@@ -432,29 +438,28 @@ class Qwen3NextDecoderLayer(nn.Module):
                         flush=True,
                     )
 
-        # --- Print seq_lens/query_start_loc before attention (first call only) ---
+        # --- Print seq_lens/query_start_loc before attention (first call,
+        #     non-warmup only) ---
         # Only check attention mask for full_attention layers (which use
         # softmax — seq_lens=0 causes NaN via 0/0). Linear attention (GDN)
         # layers don't use softmax and their metadata (GDNAttentionMetadata)
         # doesn't carry seq_lens/query_start_loc.
-        if (self.layer_type == "full_attention"
+        if (_is_real_inference
+                and self.layer_type == "full_attention"
                 and not getattr(Qwen3NextDecoderLayer,
                                 '_attn_mask_reported', False)):
             from vllm.distributed.parallel_state import get_dp_group
-            from vllm.forward_context import get_forward_context
             dp_rank = get_dp_group().rank_in_group
-            fwd_ctx = get_forward_context()
-            attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
             attn_meta = None
-            if attn_meta_raw is not None:
+            if _attn_meta_raw is not None:
                 layer_name = self.self_attn.attn.layer_name
-                if isinstance(attn_meta_raw, dict):
-                    attn_meta = attn_meta_raw.get(layer_name)
-                elif (isinstance(attn_meta_raw, list)
-                      and len(attn_meta_raw) > 0):
-                    attn_meta = attn_meta_raw[0].get(layer_name)
+                if isinstance(_attn_meta_raw, dict):
+                    attn_meta = _attn_meta_raw.get(layer_name)
+                elif (isinstance(_attn_meta_raw, list)
+                      and len(_attn_meta_raw) > 0):
+                    attn_meta = _attn_meta_raw[0].get(layer_name)
                 else:
-                    attn_meta = attn_meta_raw
+                    attn_meta = _attn_meta_raw
             if attn_meta is not None:
                 Qwen3NextDecoderLayer._attn_mask_reported = True
                 num_actual = getattr(attn_meta, 'num_actual_tokens', None)
@@ -516,8 +521,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
-        # --- NaN detection AFTER attention ---
-        if hidden_states.is_floating_point():
+        # --- NaN detection AFTER attention (non-warmup only) ---
+        if _is_real_inference and hidden_states.is_floating_point():
             has_nan = bool(torch.isnan(hidden_states).any().item())
             has_inf = bool(torch.isinf(hidden_states).any().item())
             if has_nan or has_inf:
@@ -525,7 +530,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                                '_nan_post_attn_reported', False):
                     Qwen3NextDecoderLayer._nan_post_attn_reported = True
                     from vllm.distributed.parallel_state import get_dp_group
-                    from vllm.forward_context import get_forward_context
                     dp_rank = get_dp_group().rank_in_group
                     nan_mask = torch.isnan(hidden_states)
                     inf_mask = torch.isinf(hidden_states)
@@ -537,26 +541,23 @@ class Qwen3NextDecoderLayer(nn.Module):
                         torch.where(nan_rows)[0].tolist()[:10])
                     # Distinguish actual token rows vs padding rows
                     num_rows = hidden_states.shape[0]
-                    fwd_ctx = get_forward_context()
-                    # attn_metadata is dict[str, AttentionMetadata];
-                    # resolve using attention layer name.
-                    attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
+                    # Reuse _attn_meta_raw from pre-attention check
                     attn_meta = None
-                    if attn_meta_raw is not None:
+                    if _attn_meta_raw is not None:
                         layer_name = None
                         if self.layer_type == "full_attention":
                             layer_name = self.self_attn.attn.layer_name
                         elif self.layer_type == "linear_attention":
                             layer_name = self.linear_attn.prefix
                         if layer_name is not None:
-                            if isinstance(attn_meta_raw, dict):
-                                attn_meta = attn_meta_raw.get(layer_name)
-                            elif (isinstance(attn_meta_raw, list)
-                                  and len(attn_meta_raw) > 0):
-                                attn_meta = attn_meta_raw[0].get(
+                            if isinstance(_attn_meta_raw, dict):
+                                attn_meta = _attn_meta_raw.get(layer_name)
+                            elif (isinstance(_attn_meta_raw, list)
+                                  and len(_attn_meta_raw) > 0):
+                                attn_meta = _attn_meta_raw[0].get(
                                     layer_name)
                             else:
-                                attn_meta = attn_meta_raw
+                                attn_meta = _attn_meta_raw
                     num_actual = (getattr(attn_meta, 'num_actual_tokens',
                                          num_rows)
                                  if attn_meta is not None else num_rows)
