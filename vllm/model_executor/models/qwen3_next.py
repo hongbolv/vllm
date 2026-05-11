@@ -463,21 +463,42 @@ class Qwen3NextDecoderLayer(nn.Module):
                                '_nan_post_attn_reported', False):
                     Qwen3NextDecoderLayer._nan_post_attn_reported = True
                     from vllm.distributed.parallel_state import get_dp_group
+                    from vllm.forward_context import get_forward_context
                     dp_rank = get_dp_group().rank_in_group
-                    nan_count = int(
-                        torch.isnan(hidden_states).sum().item())
-                    inf_count = int(
-                        torch.isinf(hidden_states).sum().item())
-                    nan_rows = torch.isnan(hidden_states).any(dim=-1)
+                    nan_mask = torch.isnan(hidden_states)
+                    inf_mask = torch.isinf(hidden_states)
+                    nan_count = int(nan_mask.sum().item())
+                    inf_count = int(inf_mask.sum().item())
+                    nan_rows = nan_mask.any(dim=-1)
                     total_nan_rows = int(nan_rows.sum().item())
                     nan_row_indices = (
                         torch.where(nan_rows)[0].tolist()[:10])
+                    # Distinguish actual token rows vs padding rows
+                    num_rows = hidden_states.shape[0]
+                    fwd_ctx = get_forward_context()
+                    attn_meta = getattr(fwd_ctx, 'attn_metadata', None)
+                    num_actual = (getattr(attn_meta, 'num_actual_tokens',
+                                         num_rows)
+                                 if attn_meta is not None else num_rows)
+                    actual_nan_rows = int(
+                        nan_rows[:num_actual].sum().item())
+                    padding_nan_rows = int(
+                        nan_rows[num_actual:].sum().item())
+                    actual_nan_elems = int(
+                        nan_mask[:num_actual].sum().item())
+                    padding_nan_elems = int(
+                        nan_mask[num_actual:].sum().item())
                     print(
                         f"[NAN_CHECK_POST_ATTN] ERROR dp_rank={dp_rank} "
                         f"layer_idx={self.layer_idx} "
                         f"NaN/Inf detected AFTER attention! "
                         f"nan_count={nan_count} inf_count={inf_count} "
                         f"shape={list(hidden_states.shape)} "
+                        f"num_actual_tokens={num_actual} "
+                        f"actual_nan_rows={actual_nan_rows} "
+                        f"actual_nan_elems={actual_nan_elems} "
+                        f"padding_nan_rows={padding_nan_rows} "
+                        f"padding_nan_elems={padding_nan_elems} "
                         f"nan_row_indices={nan_row_indices}... "
                         f"total_nan_rows={total_nan_rows}",
                         flush=True,
