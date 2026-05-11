@@ -421,15 +421,15 @@ class Qwen3NextDecoderLayer(nn.Module):
                     total_nan_rows = int(nan_rows.sum().item())
                     nan_row_indices = (
                         torch.where(nan_rows)[0].tolist()[:10])
-                    import logging
-                    logging.getLogger(__name__).error(
-                        "[NAN_CHECK_PRE_ATTN] dp_rank=%s layer_idx=%s "
-                        "NaN/Inf detected BEFORE attention! "
-                        "nan_count=%s inf_count=%s shape=%s "
-                        "nan_row_indices=%s... total_nan_rows=%s",
-                        dp_rank, self.layer_idx, nan_count, inf_count,
-                        list(hidden_states.shape), nan_row_indices,
-                        total_nan_rows,
+                    print(
+                        f"[NAN_CHECK_PRE_ATTN] ERROR dp_rank={dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"NaN/Inf detected BEFORE attention! "
+                        f"nan_count={nan_count} inf_count={inf_count} "
+                        f"shape={list(hidden_states.shape)} "
+                        f"nan_row_indices={nan_row_indices}... "
+                        f"total_nan_rows={total_nan_rows}",
+                        flush=True,
                     )
 
         # Use zeros_like instead of empty_like: with DP padding,
@@ -472,15 +472,15 @@ class Qwen3NextDecoderLayer(nn.Module):
                     total_nan_rows = int(nan_rows.sum().item())
                     nan_row_indices = (
                         torch.where(nan_rows)[0].tolist()[:10])
-                    import logging
-                    logging.getLogger(__name__).error(
-                        "[NAN_CHECK_POST_ATTN] dp_rank=%s layer_idx=%s "
-                        "NaN/Inf detected AFTER attention! "
-                        "nan_count=%s inf_count=%s shape=%s "
-                        "nan_row_indices=%s... total_nan_rows=%s",
-                        dp_rank, self.layer_idx, nan_count, inf_count,
-                        list(hidden_states.shape), nan_row_indices,
-                        total_nan_rows,
+                    print(
+                        f"[NAN_CHECK_POST_ATTN] ERROR dp_rank={dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"NaN/Inf detected AFTER attention! "
+                        f"nan_count={nan_count} inf_count={inf_count} "
+                        f"shape={list(hidden_states.shape)} "
+                        f"nan_row_indices={nan_row_indices}... "
+                        f"total_nan_rows={total_nan_rows}",
+                        flush=True,
                     )
 
         if self.layer_scale:
