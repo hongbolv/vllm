@@ -447,7 +447,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # 3D [num_tokens, heads, head_dim] query
             num_tokens = query.shape[0]
             output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
-        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+        # Use zeros instead of empty: with DP padding, query.shape[0]
+        # exceeds attn_metadata.num_actual_tokens, and the attention
+        # backend only writes output[:num_actual_tokens]. The trailing
+        # padding rows would otherwise retain uninitialized memory,
+        # which on XPU (BMG) frequently contains NaN bit patterns and
+        # then propagates through residual-add into subsequent layers.
+        output = torch.zeros(output_shape, dtype=output_dtype, device=query.device)
         hidden_size = output_shape[-1]
         # Reshape the query, key, and value tensors.
         # NOTE(woosuk): We do this outside the custom op to minimize the
