@@ -432,6 +432,40 @@ class Qwen3NextDecoderLayer(nn.Module):
                         flush=True,
                     )
 
+        # --- Print seq_lens/query_start_loc before attention (first call only) ---
+        if not getattr(Qwen3NextDecoderLayer,
+                       '_attn_mask_reported', False):
+            Qwen3NextDecoderLayer._attn_mask_reported = True
+            from vllm.distributed.parallel_state import get_dp_group
+            from vllm.forward_context import get_forward_context
+            dp_rank = get_dp_group().rank_in_group
+            fwd_ctx = get_forward_context()
+            attn_meta = getattr(fwd_ctx, 'attn_metadata', None)
+            if attn_meta is not None:
+                num_actual = getattr(attn_meta, 'num_actual_tokens', None)
+                sl = getattr(attn_meta, 'seq_lens', None)
+                qsl = getattr(attn_meta, 'query_start_loc', None)
+                sl_list = sl.tolist() if sl is not None else None
+                qsl_list = qsl.tolist() if qsl is not None else None
+                has_zero = (any(v == 0 for v in sl_list)
+                            if sl_list is not None else None)
+                print(
+                    f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
+                    f"layer_idx={self.layer_idx} "
+                    f"num_actual_tokens={num_actual} "
+                    f"seq_lens={sl_list} "
+                    f"query_start_loc={qsl_list} "
+                    f"has_zero_seq_len={has_zero}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
+                    f"layer_idx={self.layer_idx} "
+                    f"attn_metadata=None",
+                    flush=True,
+                )
+
         # Use zeros_like instead of empty_like: with DP padding,
         # hidden_states includes padding rows. The attention backend only
         # computes output[:num_actual_tokens], and o_proj then writes all
