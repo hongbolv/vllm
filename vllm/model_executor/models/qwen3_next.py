@@ -419,6 +419,29 @@ class Qwen3NextDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
+        # --- NaN detection after attention output ---
+        if hidden_states.is_floating_point():
+            has_nan = bool(torch.isnan(hidden_states).any().item())
+            has_inf = bool(torch.isinf(hidden_states).any().item())
+            if has_nan or has_inf:
+                from vllm.distributed.parallel_state import get_dp_group
+                dp_rank = get_dp_group().rank_in_group
+                nan_count = int(torch.isnan(hidden_states).sum().item())
+                inf_count = int(torch.isinf(hidden_states).sum().item())
+                nan_rows = torch.isnan(hidden_states).any(dim=-1)
+                total_nan_rows = int(nan_rows.sum().item())
+                nan_row_indices = torch.where(nan_rows)[0].tolist()[:10]
+                print(
+                    f"[NAN_CHECK_ATTN] dp_rank={dp_rank} "
+                    f"layer_idx={self.layer_idx} "
+                    f"NaN/Inf detected AFTER attention! "
+                    f"nan_count={nan_count} inf_count={inf_count} "
+                    f"shape={list(hidden_states.shape)} "
+                    f"nan_row_indices={nan_row_indices}... "
+                    f"total_nan_rows={total_nan_rows}",
+                    flush=True,
+                )
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
