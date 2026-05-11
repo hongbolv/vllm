@@ -78,7 +78,6 @@ def _check_gdn_nan(tensor: torch.Tensor, stage: str, layer_idx: int,
     ``stage`` (e.g. "input_proj", "core_attn_out") so each diagnostic
     fires at most once across all layers and iterations.
     """
-    global _gdn_nan_reported_stages
     if stage in _gdn_nan_reported_stages:
         return
     if not tensor.is_floating_point():
