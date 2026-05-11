@@ -391,6 +391,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -429,6 +430,29 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+
+        # --- NaN detection after attention output ---
+        if hidden_states.is_floating_point():
+            has_nan = bool(torch.isnan(hidden_states).any().item())
+            has_inf = bool(torch.isinf(hidden_states).any().item())
+            if has_nan or has_inf:
+                from vllm.distributed.parallel_state import get_dp_group
+                dp_rank = get_dp_group().rank_in_group
+                nan_count = int(torch.isnan(hidden_states).sum().item())
+                inf_count = int(torch.isinf(hidden_states).sum().item())
+                nan_rows = torch.isnan(hidden_states).any(dim=-1)
+                total_nan_rows = int(nan_rows.sum().item())
+                nan_row_indices = torch.where(nan_rows)[0].tolist()[:10]
+                print(
+                    f"[NAN_CHECK_ATTN] dp_rank={dp_rank} "
+                    f"layer_idx={self.layer_idx} "
+                    f"NaN/Inf detected AFTER attention! "
+                    f"nan_count={nan_count} inf_count={inf_count} "
+                    f"shape={list(hidden_states.shape)} "
+                    f"nan_row_indices={nan_row_indices}... "
+                    f"total_nan_rows={total_nan_rows}",
+                    flush=True,
+                )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
