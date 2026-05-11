@@ -445,16 +445,14 @@ class Qwen3NextDecoderLayer(nn.Module):
             attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
             attn_meta = None
             if attn_meta_raw is not None:
+                layer_name = None
                 if self.layer_type == "full_attention":
                     layer_name = self.self_attn.attn.layer_name
-                elif self.layer_type == "linear_attention":
-                    layer_name = None
-                else:
-                    layer_name = None
                 if layer_name is not None:
                     if isinstance(attn_meta_raw, dict):
                         attn_meta = attn_meta_raw.get(layer_name)
-                    elif isinstance(attn_meta_raw, list):
+                    elif (isinstance(attn_meta_raw, list)
+                          and len(attn_meta_raw) > 0):
                         attn_meta = attn_meta_raw[0].get(layer_name)
                     else:
                         attn_meta = attn_meta_raw
@@ -559,7 +557,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                         if layer_name is not None:
                             if isinstance(attn_meta_raw, dict):
                                 attn_meta = attn_meta_raw.get(layer_name)
-                            elif isinstance(attn_meta_raw, list):
+                            elif (isinstance(attn_meta_raw, list)
+                                  and len(attn_meta_raw) > 0):
                                 attn_meta = attn_meta_raw[0].get(
                                     layer_name)
                             else:
