@@ -433,9 +433,11 @@ class Qwen3NextDecoderLayer(nn.Module):
                     )
 
         # --- Print seq_lens/query_start_loc before attention (first call only) ---
+        # Only set the flag when we successfully resolve metadata;
+        # skip silently when metadata is None (e.g. during profiling/warmup)
+        # so that the diagnostic retries on the next real inference call.
         if not getattr(Qwen3NextDecoderLayer,
                        '_attn_mask_reported', False):
-            Qwen3NextDecoderLayer._attn_mask_reported = True
             from vllm.distributed.parallel_state import get_dp_group
             from vllm.forward_context import get_forward_context
             dp_rank = get_dp_group().rank_in_group
@@ -448,6 +450,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                 layer_name = None
                 if self.layer_type == "full_attention":
                     layer_name = self.self_attn.attn.layer_name
+                elif self.layer_type == "linear_attention":
+                    layer_name = self.linear_attn.prefix
                 if layer_name is not None:
                     if isinstance(attn_meta_raw, dict):
                         attn_meta = attn_meta_raw.get(layer_name)
@@ -457,6 +461,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                     else:
                         attn_meta = attn_meta_raw
             if attn_meta is not None:
+                Qwen3NextDecoderLayer._attn_mask_reported = True
                 num_actual = getattr(attn_meta, 'num_actual_tokens', None)
                 sl = getattr(attn_meta, 'seq_lens', None)
                 qsl = getattr(attn_meta, 'query_start_loc', None)
@@ -489,16 +494,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                     f"query_start_loc(len={qsl_len})={qsl_list} "
                     f"has_zero_seq_len={has_zero} "
                     f"zero_count={zero_count}",
-                    flush=True,
-                )
-            else:
-                raw_type = type(attn_meta_raw).__name__
-                print(
-                    f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
-                    f"layer_idx={self.layer_idx} "
-                    f"attn_metadata=None "
-                    f"(raw_type={raw_type}, "
-                    f"layer_type={self.layer_type})",
                     flush=True,
                 )
 
@@ -554,6 +549,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                         layer_name = None
                         if self.layer_type == "full_attention":
                             layer_name = self.self_attn.attn.layer_name
+                        elif self.layer_type == "linear_attention":
+                            layer_name = self.linear_attn.prefix
                         if layer_name is not None:
                             if isinstance(attn_meta_raw, dict):
                                 attn_meta = attn_meta_raw.get(layer_name)
