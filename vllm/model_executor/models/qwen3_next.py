@@ -433,38 +433,34 @@ class Qwen3NextDecoderLayer(nn.Module):
                     )
 
         # --- Print seq_lens/query_start_loc before attention (first call only) ---
-        # Only set the flag when we successfully resolve metadata;
-        # skip silently when metadata is None (e.g. during profiling/warmup)
-        # so that the diagnostic retries on the next real inference call.
-        if not getattr(Qwen3NextDecoderLayer,
-                       '_attn_mask_reported', False):
+        # Only check attention mask for full_attention layers (which use
+        # softmax — seq_lens=0 causes NaN via 0/0). Linear attention (GDN)
+        # layers don't use softmax and their metadata (GDNAttentionMetadata)
+        # doesn't carry seq_lens/query_start_loc.
+        if (self.layer_type == "full_attention"
+                and not getattr(Qwen3NextDecoderLayer,
+                                '_attn_mask_reported', False)):
             from vllm.distributed.parallel_state import get_dp_group
             from vllm.forward_context import get_forward_context
             dp_rank = get_dp_group().rank_in_group
             fwd_ctx = get_forward_context()
-            # attn_metadata is a dict[str, AttentionMetadata] keyed by
-            # attention layer name; resolve to the actual metadata object.
             attn_meta_raw = getattr(fwd_ctx, 'attn_metadata', None)
             attn_meta = None
             if attn_meta_raw is not None:
-                layer_name = None
-                if self.layer_type == "full_attention":
-                    layer_name = self.self_attn.attn.layer_name
-                elif self.layer_type == "linear_attention":
-                    layer_name = self.linear_attn.prefix
-                if layer_name is not None:
-                    if isinstance(attn_meta_raw, dict):
-                        attn_meta = attn_meta_raw.get(layer_name)
-                    elif (isinstance(attn_meta_raw, list)
-                          and len(attn_meta_raw) > 0):
-                        attn_meta = attn_meta_raw[0].get(layer_name)
-                    else:
-                        attn_meta = attn_meta_raw
+                layer_name = self.self_attn.attn.layer_name
+                if isinstance(attn_meta_raw, dict):
+                    attn_meta = attn_meta_raw.get(layer_name)
+                elif (isinstance(attn_meta_raw, list)
+                      and len(attn_meta_raw) > 0):
+                    attn_meta = attn_meta_raw[0].get(layer_name)
+                else:
+                    attn_meta = attn_meta_raw
             if attn_meta is not None:
                 Qwen3NextDecoderLayer._attn_mask_reported = True
                 num_actual = getattr(attn_meta, 'num_actual_tokens', None)
                 sl = getattr(attn_meta, 'seq_lens', None)
                 qsl = getattr(attn_meta, 'query_start_loc', None)
+                meta_type = type(attn_meta).__name__
                 sl_len = sl.shape[0] if sl is not None else None
                 sl_list = (sl.tolist() if sl is not None and
                            sl.numel() <= 64 else
@@ -488,6 +484,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 print(
                     f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
                     f"layer_idx={self.layer_idx} "
+                    f"meta_type={meta_type} "
                     f"num_actual_tokens={num_actual} "
                     f"seq_lens(len={sl_len} min={sl_min} "
                     f"max={sl_max})={sl_list} "
