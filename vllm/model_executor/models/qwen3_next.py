@@ -403,28 +403,34 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # --- NaN detection before attention ---
+        # --- NaN detection BEFORE attention ---
         if hidden_states.is_floating_point():
             has_nan = bool(torch.isnan(hidden_states).any().item())
             has_inf = bool(torch.isinf(hidden_states).any().item())
             if has_nan or has_inf:
-                from vllm.distributed.parallel_state import get_dp_group
-                dp_rank = get_dp_group().rank_in_group
-                nan_count = int(torch.isnan(hidden_states).sum().item())
-                inf_count = int(torch.isinf(hidden_states).sum().item())
-                nan_rows = torch.isnan(hidden_states).any(dim=-1)
-                total_nan_rows = int(nan_rows.sum().item())
-                nan_row_indices = torch.where(nan_rows)[0].tolist()[:10]
-                print(
-                    f"[NAN_CHECK_PRE_ATTN] dp_rank={dp_rank} "
-                    f"layer_idx={self.layer_idx} "
-                    f"NaN/Inf detected BEFORE attention! "
-                    f"nan_count={nan_count} inf_count={inf_count} "
-                    f"shape={list(hidden_states.shape)} "
-                    f"nan_row_indices={nan_row_indices}... "
-                    f"total_nan_rows={total_nan_rows}",
-                    flush=True,
-                )
+                if not getattr(Qwen3NextDecoderLayer,
+                               '_nan_pre_attn_reported', False):
+                    Qwen3NextDecoderLayer._nan_pre_attn_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    dp_rank = get_dp_group().rank_in_group
+                    nan_count = int(
+                        torch.isnan(hidden_states).sum().item())
+                    inf_count = int(
+                        torch.isinf(hidden_states).sum().item())
+                    nan_rows = torch.isnan(hidden_states).any(dim=-1)
+                    total_nan_rows = int(nan_rows.sum().item())
+                    nan_row_indices = (
+                        torch.where(nan_rows)[0].tolist()[:10])
+                    import logging
+                    logging.getLogger(__name__).error(
+                        "[NAN_CHECK_PRE_ATTN] dp_rank=%s layer_idx=%s "
+                        "NaN/Inf detected BEFORE attention! "
+                        "nan_count=%s inf_count=%s shape=%s "
+                        "nan_row_indices=%s... total_nan_rows=%s",
+                        dp_rank, self.layer_idx, nan_count, inf_count,
+                        list(hidden_states.shape), nan_row_indices,
+                        total_nan_rows,
+                    )
 
         # Use zeros_like instead of empty_like: with DP padding,
         # hidden_states includes padding rows. The attention backend only
@@ -447,6 +453,35 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+
+        # --- NaN detection AFTER attention ---
+        if hidden_states.is_floating_point():
+            has_nan = bool(torch.isnan(hidden_states).any().item())
+            has_inf = bool(torch.isinf(hidden_states).any().item())
+            if has_nan or has_inf:
+                if not getattr(Qwen3NextDecoderLayer,
+                               '_nan_post_attn_reported', False):
+                    Qwen3NextDecoderLayer._nan_post_attn_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    dp_rank = get_dp_group().rank_in_group
+                    nan_count = int(
+                        torch.isnan(hidden_states).sum().item())
+                    inf_count = int(
+                        torch.isinf(hidden_states).sum().item())
+                    nan_rows = torch.isnan(hidden_states).any(dim=-1)
+                    total_nan_rows = int(nan_rows.sum().item())
+                    nan_row_indices = (
+                        torch.where(nan_rows)[0].tolist()[:10])
+                    import logging
+                    logging.getLogger(__name__).error(
+                        "[NAN_CHECK_POST_ATTN] dp_rank=%s layer_idx=%s "
+                        "NaN/Inf detected AFTER attention! "
+                        "nan_count=%s inf_count=%s shape=%s "
+                        "nan_row_indices=%s... total_nan_rows=%s",
+                        dp_rank, self.layer_idx, nan_count, inf_count,
+                        list(hidden_states.shape), nan_row_indices,
+                        total_nan_rows,
+                    )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
