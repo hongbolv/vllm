@@ -403,7 +403,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self_attention_output = torch.empty_like(hidden_states)
+        # Use zeros_like instead of empty_like: with DP padding,
+        # hidden_states includes padding rows. The attention backend only
+        # computes output[:num_actual_tokens], and o_proj then writes all
+        # rows. But if any intermediate step leaves padding rows untouched,
+        # uninitialized memory (which on XPU/BMG frequently contains NaN
+        # in bf16/fp16) would propagate through residual-add.
+        self_attention_output = torch.zeros_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
                 hidden_states=hidden_states,
