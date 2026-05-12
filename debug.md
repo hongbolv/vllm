@@ -109,26 +109,40 @@ residual-add.
 
 ### Fix applied
 
-**File**: `vllm/v1/worker/gpu_model_runner.py`, `_build_attention_metadata()`
+**File**: `vllm/v1/attention/backends/flash_attn.py`,
+`FlashAttentionMetadataBuilder.build()`
 
-Changed `num_actual_tokens=num_tokens_padded` to `num_actual_tokens=num_tokens`
-in the `CommonAttentionMetadata` construction. This keeps `num_actual_tokens` at
-the real token count (26 for dp_rank=0) so the attention backend only processes
-real tokens and skips padding rows entirely.
+The fix is applied at the flash attention backend level rather than in
+`CommonAttentionMetadata`. This is because `CommonAttentionMetadata.num_actual_tokens`
+is consumed by **both** the flash attention backend and the GDN (GatedDeltaNet)
+attention kernel. The GDN kernel requires `num_actual_tokens == hidden_states.size(0)`
+(i.e., `num_tokens_padded`), so we cannot change it globally.
+
+Instead, the flash attention backend now clamps `num_actual_tokens` to
+`query_start_loc_cpu[-1]` (the actual covered token count) during metadata
+construction. When DP padding is active:
+- `CommonAttentionMetadata.num_actual_tokens` = `num_tokens_padded` (30) — GDN happy
+- `FlashAttentionMetadata.num_actual_tokens` = `query_start_loc[-1]` (26) — flash attention skips padding rows
 
 ```diff
-         cm_base = CommonAttentionMetadata(
-             ...
--            num_actual_tokens=num_tokens_padded,
-+            num_actual_tokens=num_tokens,
-             ...
-         )
+     def build(self, ...):
+         num_reqs = common_attn_metadata.num_reqs
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
++        # When DP padding is applied, num_actual_tokens includes padding rows
++        # but query_start_loc only covers real tokens. Clamp to the actual
++        # covered token count so the attention kernel skips unassigned padding
++        # rows (which would otherwise produce NaN via softmax on all-inf mask).
++        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
++        if query_start_loc_cpu is not None and len(query_start_loc_cpu) > 0:
++            covered_tokens = int(query_start_loc_cpu[-1])
++            if covered_tokens < num_actual_tokens:
++                num_actual_tokens = covered_tokens
 ```
 
-The attention backend slices Q/K/V/output to `[:num_actual_tokens]`, so setting
-it to the real count ensures padding rows (26-29) are never processed through
-the attention kernel. The `seq_lens`/`query_start_loc` correctly describe all
-real tokens, eliminating the mismatch that produced NaN.
+The attention backend slices Q/output to `[:num_actual_tokens]` (26), so padding
+rows (26-29) are never processed through the flash attention kernel. The
+`seq_lens`/`query_start_loc` correctly describe all 26 real tokens, eliminating
+the mismatch that produced NaN.
 
 The buffer zero-initialization fix (`torch.empty` → `torch.zeros`) remains
 as defense-in-depth to prevent NaN from uninitialized memory on XPU.
