@@ -66,58 +66,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
-# --- GDN internal NaN diagnostic flags (class-level, first-occurrence) ---
-_gdn_nan_reported_stages: set[str] = set()
-
-
-def _check_gdn_nan(tensor: torch.Tensor, stage: str, layer_idx: int,
-                    label: str = "") -> None:
-    """Check a tensor for NaN/Inf inside GDN and print on first occurrence.
-
-    Uses module-level ``_gdn_nan_reported_stages`` keyed by
-    ``stage`` (e.g. "input_proj", "core_attn_out") so each diagnostic
-    fires at most once across all layers and iterations.
-    """
-    if stage in _gdn_nan_reported_stages:
-        return
-    if not tensor.is_floating_point():
-        return
-    has_nan = bool(torch.isnan(tensor).any().item())
-    has_inf = bool(torch.isinf(tensor).any().item())
-    if not has_nan and not has_inf:
-        return
-    _gdn_nan_reported_stages.add(stage)
-    try:
-        from vllm.distributed.parallel_state import get_dp_group
-        dp_rank = get_dp_group().rank_in_group
-    except Exception:
-        dp_rank = -1
-    nan_count = int(torch.isnan(tensor).sum().item())
-    inf_count = int(torch.isinf(tensor).sum().item())
-    shape = list(tensor.shape)
-    # For >=2D tensors, show which rows are affected
-    if tensor.dim() >= 2:
-        nan_rows = torch.isnan(tensor.reshape(tensor.shape[0], -1)).any(
-            dim=-1)
-        total_nan_rows = int(nan_rows.sum().item())
-        nan_row_idx = torch.where(nan_rows)[0].tolist()[:10]
-    else:
-        total_nan_rows = 1 if has_nan else 0
-        nan_row_idx = []
-    # Check for zeros (potential division-by-zero source)
-    zero_count = 0
-    if tensor.numel() > 0:
-        zero_count = int((tensor == 0).sum().item())
-    extra = f" {label}" if label else ""
-    print(
-        f"[GDN_NAN_CHECK] ERROR dp_rank={dp_rank} layer_idx={layer_idx} "
-        f"stage={stage}{extra} NaN/Inf detected! "
-        f"nan_count={nan_count} inf_count={inf_count} "
-        f"shape={shape} zero_count={zero_count} "
-        f"nan_row_indices={nan_row_idx}... total_nan_rows={total_nan_rows}",
-        flush=True,
-    )
-
 
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -580,10 +528,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-        _li = self.layer_idx  # shorthand for diagnostics
-
-        # --- [GDN_NAN_CHECK] input hidden_states ---
-        _check_gdn_nan(hidden_states, "cuda_input", _li)
 
         # ============================================================
         # Part 1: Input Projection
@@ -620,12 +564,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        # --- [GDN_NAN_CHECK] after input projection ---
-        _check_gdn_nan(mixed_qkv, "cuda_proj_qkv", _li)
-        _check_gdn_nan(b, "cuda_proj_b", _li)
-        _check_gdn_nan(a, "cuda_proj_a", _li)
-        _check_gdn_nan(z, "cuda_gate_z_input", _li)
-
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -645,9 +583,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             _encode_layer_name(self.prefix),
         )
 
-        # --- [GDN_NAN_CHECK] after core attention ---
-        _check_gdn_nan(core_attn_out, "cuda_core_attn_out", _li)
-
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
@@ -657,15 +592,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
 
-        # --- [GDN_NAN_CHECK] after RMSNormGated ---
-        _check_gdn_nan(core_attn_out, "cuda_after_norm", _li)
-
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
-
-        # --- [GDN_NAN_CHECK] after out_proj ---
-        _check_gdn_nan(output[:num_tokens], "cuda_after_out_proj", _li)
 
     def forward_xpu(
         self,
@@ -679,22 +608,14 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-        _li = self.layer_idx  # shorthand for diagnostics
 
         assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on XPU."
-
-        # --- [GDN_NAN_CHECK] input hidden_states ---
-        _check_gdn_nan(hidden_states, "xpu_input", _li)
 
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-
-        # --- [GDN_NAN_CHECK] after input projection ---
-        _check_gdn_nan(projected_states_qkvz, "xpu_proj_qkvz", _li)
-        _check_gdn_nan(projected_states_ba, "xpu_proj_ba", _li)
 
         # ============================================================
         # Part 2: Core Attention
@@ -714,10 +635,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             self.prefix,
         )
 
-        # --- [GDN_NAN_CHECK] after core attention kernel ---
-        _check_gdn_nan(core_attn_out, "xpu_core_attn_out", _li)
-        _check_gdn_nan(z, "xpu_gate_z", _li)
-
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
@@ -727,15 +644,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
 
-        # --- [GDN_NAN_CHECK] after RMSNormGated ---
-        _check_gdn_nan(core_attn_out, "xpu_after_norm", _li)
-
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
-
-        # --- [GDN_NAN_CHECK] after out_proj ---
-        _check_gdn_nan(output[:num_tokens], "xpu_after_out_proj", _li)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         """Warm up GDN prefill kernels during V1 profiling.

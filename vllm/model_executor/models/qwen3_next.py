@@ -438,67 +438,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                         flush=True,
                     )
 
-        # --- Print seq_lens/query_start_loc before attention (first call,
-        #     non-warmup only) ---
-        # Only check attention mask for full_attention layers (which use
-        # softmax — seq_lens=0 causes NaN via 0/0). Linear attention (GDN)
-        # layers don't use softmax and their metadata (GDNAttentionMetadata)
-        # doesn't carry seq_lens/query_start_loc.
-        if (_is_real_inference
-                and self.layer_type == "full_attention"
-                and not getattr(Qwen3NextDecoderLayer,
-                                '_attn_mask_reported', False)):
-            from vllm.distributed.parallel_state import get_dp_group
-            dp_rank = get_dp_group().rank_in_group
-            attn_meta = None
-            if _attn_meta_raw is not None:
-                layer_name = self.self_attn.attn.layer_name
-                if isinstance(_attn_meta_raw, dict):
-                    attn_meta = _attn_meta_raw.get(layer_name)
-                elif (isinstance(_attn_meta_raw, list)
-                      and len(_attn_meta_raw) > 0):
-                    attn_meta = _attn_meta_raw[0].get(layer_name)
-                else:
-                    attn_meta = _attn_meta_raw
-            if attn_meta is not None:
-                Qwen3NextDecoderLayer._attn_mask_reported = True
-                num_actual = getattr(attn_meta, 'num_actual_tokens', None)
-                sl = getattr(attn_meta, 'seq_lens', None)
-                qsl = getattr(attn_meta, 'query_start_loc', None)
-                meta_type = type(attn_meta).__name__
-                sl_len = sl.shape[0] if sl is not None else None
-                sl_list = (sl.tolist() if sl is not None and
-                           sl.numel() <= 64 else
-                           sl[:64].tolist() if sl is not None else
-                           None)
-                qsl_len = qsl.shape[0] if qsl is not None else None
-                qsl_list = (qsl.tolist() if qsl is not None and
-                            qsl.numel() <= 64 else
-                            qsl[:64].tolist() if qsl is not None
-                            else None)
-                has_zero = (bool((sl == 0).any().item())
-                            if sl is not None else None)
-                zero_count = (int((sl == 0).sum().item())
-                              if sl is not None else None)
-                sl_min = (int(sl.min().item())
-                          if sl is not None and sl.numel() > 0
-                          else None)
-                sl_max = (int(sl.max().item())
-                          if sl is not None and sl.numel() > 0
-                          else None)
-                print(
-                    f"[ATTN_MASK_CHECK] dp_rank={dp_rank} "
-                    f"layer_idx={self.layer_idx} "
-                    f"meta_type={meta_type} "
-                    f"num_actual_tokens={num_actual} "
-                    f"seq_lens(len={sl_len} min={sl_min} "
-                    f"max={sl_max})={sl_list} "
-                    f"query_start_loc(len={qsl_len})={qsl_list} "
-                    f"has_zero_seq_len={has_zero} "
-                    f"zero_count={zero_count}",
-                    flush=True,
-                )
-
         # Use zeros_like instead of empty_like: with DP padding,
         # hidden_states includes padding rows. The attention backend only
         # computes output[:num_actual_tokens], and o_proj then writes all
