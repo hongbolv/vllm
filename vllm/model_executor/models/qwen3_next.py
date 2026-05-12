@@ -451,35 +451,71 @@ class Qwen3NextDecoderLayer(nn.Module):
                 output=self_attention_output,
             )
         elif self.layer_type == "full_attention":
-            # --- One-shot print of seq_lens & query_start_loc ---
-            if _is_real_inference and not getattr(
-                    Qwen3NextDecoderLayer,
-                    '_attn_mask_check_reported', False):
-                Qwen3NextDecoderLayer._attn_mask_check_reported = True
-                from vllm.distributed.parallel_state import get_dp_group
-                _dp_rank = get_dp_group().rank_in_group
-                _layer_name = self.self_attn.attn.layer_name
-                _meta = None
-                if isinstance(_attn_meta_raw, dict):
-                    _meta = _attn_meta_raw.get(_layer_name)
-                elif (isinstance(_attn_meta_raw, list)
-                      and len(_attn_meta_raw) > 0):
-                    _meta = _attn_meta_raw[0].get(_layer_name)
-                else:
-                    _meta = _attn_meta_raw
-                if _meta is not None:
-                    _seq_lens = getattr(_meta, 'seq_lens', None)
-                    _qsl = getattr(_meta, 'query_start_loc', None)
-                    _nat = getattr(_meta, 'num_actual_tokens', None)
-                    print(
-                        f"[ATTN_MASK_CHECK] dp_rank={_dp_rank} "
-                        f"layer_idx={self.layer_idx} "
-                        f"num_actual_tokens={_nat} "
-                        f"seq_lens={_seq_lens.tolist() if _seq_lens is not None else None} "
-                        f"query_start_loc={_qsl.tolist() if _qsl is not None else None} "
-                        f"hidden_shape={list(hidden_states.shape)}",
-                        flush=True,
-                    )
+            # --- ATTN_MASK_CHECK: validate attention metadata ---
+            # Print once for prefill and once for decode (first occurrence).
+            # Report ERROR when seq_lens/query_start_loc are inconsistent
+            # with num_actual_tokens or hidden_states shape.
+            if _is_real_inference and self.layer_idx == 0:
+                _num_tokens = hidden_states.shape[0]
+                _is_decode = (_num_tokens > 0 and _num_tokens <= 32)
+                _flag_attr = ('_attn_mask_check_decode_reported'
+                              if _is_decode
+                              else '_attn_mask_check_prefill_reported')
+                if not getattr(Qwen3NextDecoderLayer, _flag_attr, False):
+                    setattr(Qwen3NextDecoderLayer, _flag_attr, True)
+                    from vllm.distributed.parallel_state import (
+                        get_dp_group)
+                    _dp_rank = get_dp_group().rank_in_group
+                    _layer_name = self.self_attn.attn.layer_name
+                    _meta = None
+                    if isinstance(_attn_meta_raw, dict):
+                        _meta = _attn_meta_raw.get(_layer_name)
+                    elif (isinstance(_attn_meta_raw, list)
+                          and len(_attn_meta_raw) > 0):
+                        _meta = _attn_meta_raw[0].get(_layer_name)
+                    else:
+                        _meta = _attn_meta_raw
+                    if _meta is not None:
+                        _seq_lens = getattr(_meta, 'seq_lens', None)
+                        _qsl = getattr(_meta, 'query_start_loc', None)
+                        _nat = getattr(_meta, 'num_actual_tokens', None)
+                        _phase = "decode" if _is_decode else "prefill"
+                        # Validation checks
+                        _errors = []
+                        if _nat is not None and _nat != _num_tokens:
+                            _errors.append(
+                                f"num_actual_tokens({_nat})!=hidden_shape[0]"
+                                f"({_num_tokens})")
+                        if (_qsl is not None and _seq_lens is not None
+                                and len(_qsl) > 0):
+                            _qsl_last = int(_qsl[-1].item())
+                            _seq_sum = int(_seq_lens.sum().item())
+                            if _qsl_last != _nat and _nat is not None:
+                                _errors.append(
+                                    f"query_start_loc[-1]({_qsl_last})"
+                                    f"!=num_actual_tokens({_nat})")
+                            if not _is_decode and _seq_sum > _nat:
+                                _errors.append(
+                                    f"sum(seq_lens)({_seq_sum})"
+                                    f">num_actual_tokens({_nat})")
+                        _prefix = ("[ATTN_MASK_CHECK] ERROR"
+                                   if _errors
+                                   else "[ATTN_MASK_CHECK]")
+                        _err_str = (f" errors={_errors}"
+                                    if _errors else "")
+                        print(
+                            f"{_prefix} phase={_phase} "
+                            f"dp_rank={_dp_rank} "
+                            f"layer_idx={self.layer_idx} "
+                            f"num_actual_tokens={_nat} "
+                            f"seq_lens="
+                            f"{_seq_lens.tolist() if _seq_lens is not None else None} "
+                            f"query_start_loc="
+                            f"{_qsl.tolist() if _qsl is not None else None} "
+                            f"hidden_shape={list(hidden_states.shape)}"
+                            f"{_err_str}",
+                            flush=True,
+                        )
             self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
