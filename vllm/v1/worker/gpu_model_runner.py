@@ -2185,6 +2185,29 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # When DP padding is applied (num_tokens_padded > num_tokens),
+        # query_start_loc ends at num_tokens (the real token count) but the
+        # attention backend processes num_tokens_padded rows.  Rows beyond
+        # num_tokens have no sequence assignment, causing softmax on all-inf
+        # scores → NaN.  Fix: extend query_start_loc to end at
+        # num_tokens_padded and assign the padding rows to the last padded
+        # request as a dummy sequence so all attention backends see consistent
+        # metadata (num_actual_tokens == query_start_loc[-1]).
+        if num_tokens_padded > num_tokens and num_reqs_padded > num_reqs:
+            padding_len = num_tokens_padded - num_tokens
+            # Make the last padded request own the DP padding rows
+            self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
+            self.query_start_loc.cpu[num_reqs_padded] = num_tokens_padded
+            self.query_start_loc.gpu[num_reqs_padded] = num_tokens_padded
+            # Assign a dummy seq_lens so attention mask is valid for padding
+            # rows (seq_lens >= query_len for causal attention)
+            self.seq_lens[num_reqs_padded - 1] = padding_len
+            # Keep seq_lens_cpu consistent with the GPU tensor
+            if seq_lens_cpu is not None:
+                self.optimistic_seq_lens_cpu[num_reqs_padded - 1] = padding_len
+                seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+                seq_lens_cpu_upper_bound = seq_lens_cpu
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],

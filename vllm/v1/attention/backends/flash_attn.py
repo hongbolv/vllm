@@ -400,15 +400,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         """
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
-        # When DP padding is applied, num_actual_tokens includes padding rows
-        # but query_start_loc only covers real tokens. Clamp to the actual
-        # covered token count so the attention kernel skips unassigned padding
-        # rows (which would otherwise produce NaN via softmax on all-inf mask).
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        if query_start_loc_cpu is not None and len(query_start_loc_cpu) > 0:
-            covered_tokens = int(query_start_loc_cpu[-1])
-            if covered_tokens < num_actual_tokens:
-                num_actual_tokens = covered_tokens
         max_query_len = common_attn_metadata.max_query_len
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
