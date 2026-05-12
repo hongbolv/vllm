@@ -2189,32 +2189,40 @@ class GPUModelRunner(
         # query_start_loc ends at num_tokens (the real token count) but the
         # attention backend processes num_tokens_padded rows.  Rows beyond
         # num_tokens have no sequence assignment, causing softmax on all-inf
-        # scores → NaN.  Fix: extend query_start_loc to end at
-        # num_tokens_padded and assign the padding rows to the last request
-        # so all attention backends see consistent metadata
-        # (num_actual_tokens == query_start_loc[-1]).
+        # scores → NaN.  Fix: create local copies of query_start_loc and
+        # seq_lens with the last entry extended to num_tokens_padded so all
+        # attention backends see consistent metadata.  We must NOT modify
+        # self.seq_lens or self.query_start_loc in-place because those
+        # shared buffers are also used for KV cache slot_mapping — inflating
+        # seq_lens would make the attention kernel read KV cache slots that
+        # were never written, causing NaN in subsequent decode steps.
+        attn_query_start_loc_gpu = self.query_start_loc.gpu[
+            : num_reqs_padded + 1]
+        attn_query_start_loc_cpu = self.query_start_loc.cpu[
+            : num_reqs_padded + 1]
+        attn_seq_lens = self.seq_lens[:num_reqs_padded]
         if num_tokens_padded > num_tokens:
             padding_len = num_tokens_padded - num_tokens
+            # Create local copies so we don't corrupt the shared buffers
+            attn_query_start_loc_gpu = attn_query_start_loc_gpu.clone()
+            attn_query_start_loc_cpu = attn_query_start_loc_cpu.clone()
+            attn_seq_lens = attn_seq_lens.clone()
             # Extend query_start_loc so its last entry = num_tokens_padded
-            self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
-            self.query_start_loc.cpu[num_reqs_padded] = num_tokens_padded
-            self.query_start_loc.gpu[num_reqs_padded] = num_tokens_padded
+            attn_query_start_loc_gpu[num_reqs_padded] = num_tokens_padded
+            attn_query_start_loc_cpu[num_reqs_padded] = num_tokens_padded
             # Extend the last request's seq_lens to cover the padding rows.
-            # The last request (index num_reqs_padded - 1) gets additional
-            # padding_len tokens assigned to it so that causal attention mask
-            # covers all rows (seq_lens >= query_len for the padding portion).
             last_idx = num_reqs_padded - 1
-            self.seq_lens[last_idx] += padding_len
-            # Keep seq_lens_cpu consistent with the GPU tensor
+            attn_seq_lens[last_idx] += padding_len
+            # Keep seq_lens_cpu consistent
             if seq_lens_cpu is not None:
-                self.optimistic_seq_lens_cpu[last_idx] += padding_len
-                seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+                seq_lens_cpu = seq_lens_cpu.clone()
+                seq_lens_cpu[last_idx] += padding_len
                 seq_lens_cpu_upper_bound = seq_lens_cpu
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens[:num_reqs_padded],
+            query_start_loc=attn_query_start_loc_gpu,
+            query_start_loc_cpu=attn_query_start_loc_cpu,
+            seq_lens=attn_seq_lens,
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
