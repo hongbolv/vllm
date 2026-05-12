@@ -147,11 +147,42 @@ dp_rank=1 PRE_ATTN layer_idx=2 shape=[4, 2048]
    tp_rank=1) share the same dp_rank and process the same tokens, so both
    report the same NaN event.
 
+### TP=4/DP=1 reference case
+
+The same model (Qwen3.5-35B-A3B) runs successfully with **TP=4, DP=1** on the
+same 4x Intel ARC B60 hardware — no NaN, no hang, correct output. This is a
+critical observation:
+
+- **TP=4/DP=1**: No DP padding → `num_actual_tokens == query.shape[0]` →
+  attention mask parameters (`seq_lens`, `query_start_loc`) correctly reflect
+  actual token boundaries → no NaN
+- **TP=2/DP=2**: DP padding active → token count padded to max across DP ranks
+  → padding changes batch structure → potential attention mask parameter
+  corruption → NaN in specific token positions
+
+Since the XPU attention kernels produce correct results without DP padding
+(TP=4/DP=1), **the kernels themselves are not the root cause**. The NaN is
+caused by how DP padding interacts with attention mask construction.
+
 ### Conclusion
 
-The XPU `fused_recurrent_gated_delta_rule` kernel (GDN linear attention) and
-the full_attention computation both produce NaN on XPU (Intel ARC B60 / BMG).
-These are **XPU kernel numerical issues**, not caused by buffer initialization
-or DP padding. The buffer zero-initialization fix is still necessary to prevent
-additional NaN contamination from uninitialized padding memory, but the core
-NaN source is the attention kernels themselves on XPU.
+NaN only appears when DP padding is active (TP=2/DP=2) and does not appear
+without DP padding (TP=4/DP=1) on the same XPU hardware. This rules out XPU
+kernel numerical issues as the root cause. The most likely cause is **DP
+padding corrupting attention mask parameters** (`seq_lens`, `query_start_loc`),
+leading to:
+
+- **full_attention**: Some tokens see an all-masked attention row (all -inf) →
+  softmax produces 0/0 = NaN (explains the full-row NaN pattern at rows 26-29)
+- **GDN linear_attention**: Padding-related state corruption in the recurrence
+  computation (explains the partial NaN pattern of 86/2048 channels)
+
+The buffer zero-initialization fix (`torch.empty` → `torch.zeros`) remains
+necessary to prevent additional NaN contamination from uninitialized padding
+memory, but the core NaN source is DP padding's impact on attention mask
+construction, not the XPU kernels themselves.
+
+**Next step**: Verify by printing `seq_lens` and `query_start_loc` at the
+attention backend call for full_attention layers during DP=2, checking whether
+the last prompt's token boundaries (rows 26-29) are correctly represented in
+the mask parameters.
