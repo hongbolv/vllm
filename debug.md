@@ -107,19 +107,28 @@ softmax to produce 0/0 = NaN. Observed `nan_row_indices=[26,27,28,29]`
 exactly matches the gap rows. NaN propagates to all subsequent layers via
 residual-add.
 
-### Fix required
+### Fix applied
 
-The `num_actual_tokens` vs `seq_lens` mismatch must be fixed in the DP
-padding → attention metadata construction path. The correct approach is to
-**keep `num_actual_tokens` at the real token count** (26 for dp_rank=0) so the
-attention backend only processes real tokens and skips padding rows. This is
-preferred over extending `seq_lens` because:
+**File**: `vllm/v1/worker/gpu_model_runner.py`, `_build_attention_metadata()`
 
-1. It avoids wasting computation on dummy sequences
-2. The attention backend already supports processing only
-   `output[:num_actual_tokens]` rows
-3. It preserves semantic correctness — padding tokens should not participate
-   in attention
+Changed `num_actual_tokens=num_tokens_padded` to `num_actual_tokens=num_tokens`
+in the `CommonAttentionMetadata` construction. This keeps `num_actual_tokens` at
+the real token count (26 for dp_rank=0) so the attention backend only processes
+real tokens and skips padding rows entirely.
+
+```diff
+         cm_base = CommonAttentionMetadata(
+             ...
+-            num_actual_tokens=num_tokens_padded,
++            num_actual_tokens=num_tokens,
+             ...
+         )
+```
+
+The attention backend slices Q/K/V/output to `[:num_actual_tokens]`, so setting
+it to the real count ensures padding rows (26-29) are never processed through
+the attention kernel. The `seq_lens`/`query_start_loc` correctly describe all
+real tokens, eliminating the mismatch that produced NaN.
 
 The buffer zero-initialization fix (`torch.empty` → `torch.zeros`) remains
 as defense-in-depth to prevent NaN from uninitialized memory on XPU.
