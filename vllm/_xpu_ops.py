@@ -205,7 +205,7 @@ def _gdn_attention_core_xpu_impl(
         if _errors:
             print(
                 f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
-                f"layer={layer_name} PREFILL ssm_state issue! "
+                f"layer_idx={self.layer_idx} PREFILL ssm_state issue! "
                 f"state_indices="
                 f"{non_spec_state_indices_tensor.tolist()} "
                 f"num_prefills={num_prefills} "
@@ -216,7 +216,7 @@ def _gdn_attention_core_xpu_impl(
         else:
             print(
                 f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
-                f"layer={layer_name} PREFILL ssm_state passed. "
+                f"layer_idx={self.layer_idx} PREFILL ssm_state passed. "
                 f"state_indices="
                 f"{non_spec_state_indices_tensor.tolist()} "
                 f"num_prefills={num_prefills} "
@@ -260,7 +260,7 @@ def _gdn_attention_core_xpu_impl(
         if _dcu_errors:
             print(
                 f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
-                f"layer={layer_name} DECODE cu_seqlens issue! "
+                f"layer_idx={self.layer_idx} DECODE cu_seqlens issue! "
                 f"cu_seqlens={_dcu_list} "
                 f"num_decodes={num_decodes} "
                 f"num_actual_tokens={num_actual_tokens} "
@@ -272,7 +272,7 @@ def _gdn_attention_core_xpu_impl(
         else:
             print(
                 f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
-                f"layer={layer_name} DECODE cu_seqlens passed. "
+                f"layer_idx={self.layer_idx} DECODE cu_seqlens passed. "
                 f"cu_seqlens={_dcu_list} "
                 f"num_decodes={num_decodes} "
                 f"num_actual_tokens={num_actual_tokens}",
