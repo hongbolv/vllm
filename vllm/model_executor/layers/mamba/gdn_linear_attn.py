@@ -1011,6 +1011,38 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     _errors.append(
                         f"initial_state had NaN={_nan_c} Inf={_inf_c}"
                         f" shape={list(initial_state.shape)}")
+                # Check cu_seqlens (non_spec_query_start_loc) consistency
+                if non_spec_query_start_loc is not None:
+                    _cu = non_spec_query_start_loc
+                    _cu_list = _cu.tolist()
+                    _num_non_spec_tokens = int(
+                        query_non_spec.shape[1]) if query_non_spec.dim(
+                        ) > 1 else int(query_non_spec.shape[0])
+                    _cu_errors = []
+                    if len(_cu_list) == 0:
+                        _cu_errors.append("cu_seqlens is empty")
+                    else:
+                        if _cu_list[0] != 0:
+                            _cu_errors.append(
+                                f"cu_seqlens[0]={_cu_list[0]} != 0")
+                        if _cu_list[-1] != _num_non_spec_tokens:
+                            _cu_errors.append(
+                                f"cu_seqlens[-1]={_cu_list[-1]} != "
+                                f"num_non_spec_tokens="
+                                f"{_num_non_spec_tokens}")
+                        # Check monotonically non-decreasing
+                        for _i in range(1, len(_cu_list)):
+                            if _cu_list[_i] < _cu_list[_i - 1]:
+                                _cu_errors.append(
+                                    f"cu_seqlens not monotonic at "
+                                    f"idx {_i}: {_cu_list[_i]} < "
+                                    f"{_cu_list[_i-1]}")
+                                break
+                    if _cu_errors:
+                        _errors.append(
+                            f"cu_seqlens issue: "
+                            f"{'; '.join(_cu_errors)} "
+                            f"cu_seqlens={_cu_list}")
                 if _errors:
                     GatedDeltaNetAttention._gdn_state_prefill_reported = True
                     from vllm.distributed.parallel_state import get_dp_group
@@ -1030,6 +1062,57 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     )
                 del _written_state
         elif attn_metadata.num_decodes > 0:
+            _decode_cu_seqlens = non_spec_query_start_loc[  # type: ignore[index]
+                : attn_metadata.num_decodes
+                + 1  # type: ignore[attr-defined]
+            ]
+            # --- GDN_STATE_CHECK: validate decode cu_seqlens ---
+            if not getattr(GatedDeltaNetAttention,
+                           '_gdn_state_decode_reported', False):
+                _dcu_list = _decode_cu_seqlens.tolist()
+                _num_dec_tokens = int(
+                    query_non_spec.shape[1]) if query_non_spec.dim(
+                    ) > 1 else int(query_non_spec.shape[0])
+                _dcu_errors = []
+                if len(_dcu_list) == 0:
+                    _dcu_errors.append("decode cu_seqlens is empty")
+                else:
+                    if _dcu_list[0] != 0:
+                        _dcu_errors.append(
+                            f"cu_seqlens[0]={_dcu_list[0]} != 0")
+                    if _dcu_list[-1] != _num_dec_tokens:
+                        _dcu_errors.append(
+                            f"cu_seqlens[-1]={_dcu_list[-1]} != "
+                            f"num_decode_tokens={_num_dec_tokens}")
+                    for _i in range(1, len(_dcu_list)):
+                        if _dcu_list[_i] < _dcu_list[_i - 1]:
+                            _dcu_errors.append(
+                                f"cu_seqlens not monotonic at "
+                                f"idx {_i}: {_dcu_list[_i]} < "
+                                f"{_dcu_list[_i-1]}")
+                            break
+                    # For decode, each sequence should have exactly 1 token
+                    _expected_len = attn_metadata.num_decodes + 1
+                    if len(_dcu_list) != _expected_len:
+                        _dcu_errors.append(
+                            f"len(cu_seqlens)={len(_dcu_list)} != "
+                            f"num_decodes+1={_expected_len}")
+                if _dcu_errors:
+                    GatedDeltaNetAttention._gdn_state_decode_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _dp_rank = get_dp_group().rank_in_group
+                    print(
+                        f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"DECODE cu_seqlens issue! "
+                        f"cu_seqlens={_dcu_list} "
+                        f"num_decodes={attn_metadata.num_decodes} "
+                        f"num_decode_tokens={_num_dec_tokens} "
+                        f"non_spec_state_indices="
+                        f"{non_spec_state_indices_tensor.tolist()} "
+                        f"{'; '.join(_dcu_errors)}",
+                        flush=True,
+                    )
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1041,10 +1124,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     v=value_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
+                    cu_seqlens=_decode_cu_seqlens,
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
