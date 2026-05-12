@@ -1060,6 +1060,25 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                         f"{' | '.join(_errors)}",
                         flush=True,
                     )
+                else:
+                    # Print OK once to confirm the diagnostic ran
+                    GatedDeltaNetAttention._gdn_state_prefill_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _dp_rank = get_dp_group().rank_in_group
+                    print(
+                        f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"PREFILL ssm_state write passed. "
+                        f"non_spec_state_indices="
+                        f"{non_spec_state_indices_tensor.tolist()} "
+                        f"num_prefills={attn_metadata.num_prefills} "
+                        f"num_actual_tokens={num_actual_tokens} "
+                        f"last_recurrent_state_shape="
+                        f"{list(last_recurrent_state.shape)} "
+                        f"initial_state_shape="
+                        f"{list(initial_state.shape)}",
+                        flush=True,
+                    )
                 del _written_state
         elif attn_metadata.num_decodes > 0:
             _decode_cu_seqlens = non_spec_query_start_loc[  # type: ignore[index]
@@ -1111,6 +1130,19 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                         f"non_spec_state_indices="
                         f"{non_spec_state_indices_tensor.tolist()} "
                         f"{'; '.join(_dcu_errors)}",
+                        flush=True,
+                    )
+                else:
+                    GatedDeltaNetAttention._gdn_state_decode_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _dp_rank = get_dp_group().rank_in_group
+                    print(
+                        f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"DECODE cu_seqlens passed. "
+                        f"cu_seqlens={_dcu_list} "
+                        f"num_decodes={attn_metadata.num_decodes} "
+                        f"num_decode_tokens={_num_dec_tokens}",
                         flush=True,
                     )
             core_attn_out_non_spec, last_recurrent_state = (
