@@ -455,8 +455,9 @@ class Qwen3NextDecoderLayer(nn.Module):
             # Print once for prefill and once for decode (first occurrence).
             # Report ERROR when seq_lens/query_start_loc are inconsistent
             # with num_actual_tokens or hidden_states shape.
-            if _is_real_inference and self.layer_idx == 0:
+            if _is_real_inference and self.layer_idx == 0:  # layer 0 only
                 _num_tokens = hidden_states.shape[0]
+                # Heuristic: decode batches have few tokens (<=32) vs prefill
                 _is_decode = (_num_tokens > 0 and _num_tokens <= 32)
                 _flag_attr = ('_attn_mask_check_decode_reported'
                               if _is_decode
@@ -494,6 +495,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                                 _errors.append(
                                     f"query_start_loc[-1]({_qsl_last})"
                                     f"!=num_actual_tokens({_nat})")
+                            # In prefill, seq_lens sum should not exceed
+                            # num_actual_tokens (decode seq_lens represent
+                            # full KV length, not query tokens)
                             if not _is_decode and _seq_sum > _nat:
                                 _errors.append(
                                     f"sum(seq_lens)({_seq_sum})"
