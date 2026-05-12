@@ -391,7 +391,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
-        self.layer_idx = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )

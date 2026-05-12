@@ -528,7 +528,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -591,7 +590,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
-
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
@@ -643,7 +641,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
-
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)

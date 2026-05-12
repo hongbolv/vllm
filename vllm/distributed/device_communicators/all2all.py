@@ -137,7 +137,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist.barrier(group=dist_group.device_group)
 
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-
         return hidden_states
 
     def destroy(self):
