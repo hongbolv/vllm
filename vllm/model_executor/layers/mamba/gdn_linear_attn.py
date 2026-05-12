@@ -970,13 +970,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
-
         elif attn_metadata.num_decodes > 0:
-            _decode_cu_seqlens = non_spec_query_start_loc[  # type: ignore[index]
-                : attn_metadata.num_decodes
-                + 1  # type: ignore[attr-defined]
-            ]
-
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -988,7 +982,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     v=value_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=_decode_cu_seqlens,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes
+                        + 1  # type: ignore[attr-defined]
+                    ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
