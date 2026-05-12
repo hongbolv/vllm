@@ -121,6 +121,13 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    ssm_state = self.kv_cache[1]
+    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # type: ignore[attr-defined]
+    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc  # type: ignore[attr-defined]
+    num_prefills = attn_metadata.num_prefills  # type: ignore[attr-defined]
+    num_decodes = attn_metadata.num_decodes  # type: ignore[attr-defined]
+    num_actual_tokens = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
@@ -131,21 +138,146 @@ def _gdn_attention_core_xpu_impl(
         self.head_k_dim,
         self.head_v_dim,
         conv_state=self.kv_cache[0],
-        ssm_state=self.kv_cache[1],
+        ssm_state=ssm_state,
         conv_weights=conv_weights,
         conv_bias=self.conv1d.bias,
         activation=self.activation,
         A_log=self.A_log,
         dt_bias=self.dt_bias,
-        num_prefills=attn_metadata.num_prefills,  # type: ignore[attr-defined]
-        num_decodes=attn_metadata.num_decodes,  # type: ignore[attr-defined]
+        num_prefills=num_prefills,
+        num_decodes=num_decodes,
         has_initial_state=attn_metadata.has_initial_state,  # type: ignore[attr-defined]
-        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,  # type: ignore[attr-defined]
-        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,  # type: ignore[attr-defined]
-        num_actual_tokens=attn_metadata.num_actual_tokens,  # type: ignore[attr-defined]
+        non_spec_query_start_loc=non_spec_query_start_loc,
+        non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+        num_actual_tokens=num_actual_tokens,
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
+
+    # --- GDN_STATE_CHECK (XPU): validate ssm_state and cu_seqlens ---
+    from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+        GatedDeltaNetAttention,
+    )
+
+    if num_prefills > 0 and not getattr(
+        GatedDeltaNetAttention, '_gdn_state_prefill_reported', False
+    ):
+        _written = ssm_state[non_spec_state_indices_tensor].contiguous()
+        _has_nan = bool(torch.isnan(_written).any().item())
+        _has_inf = bool(torch.isinf(_written).any().item())
+        _errors: list[str] = []
+        if _has_nan or _has_inf:
+            _nan_c = int(torch.isnan(_written).sum().item())
+            _inf_c = int(torch.isinf(_written).sum().item())
+            _errors.append(
+                f"ssm_state has NaN={_nan_c} Inf={_inf_c}"
+                f" shape={list(_written.shape)}"
+            )
+        # Check cu_seqlens consistency
+        if non_spec_query_start_loc is not None:
+            _cu_list = non_spec_query_start_loc.tolist()
+            _cu_errors: list[str] = []
+            if len(_cu_list) == 0:
+                _cu_errors.append("cu_seqlens is empty")
+            else:
+                if _cu_list[0] != 0:
+                    _cu_errors.append(f"cu_seqlens[0]={_cu_list[0]} != 0")
+                if _cu_list[-1] != num_actual_tokens:
+                    _cu_errors.append(
+                        f"cu_seqlens[-1]={_cu_list[-1]} != "
+                        f"num_actual_tokens={num_actual_tokens}"
+                    )
+                for _i in range(1, len(_cu_list)):
+                    if _cu_list[_i] < _cu_list[_i - 1]:
+                        _cu_errors.append(
+                            f"cu_seqlens not monotonic at idx {_i}: "
+                            f"{_cu_list[_i]} < {_cu_list[_i-1]}"
+                        )
+                        break
+            if _cu_errors:
+                _errors.append(
+                    f"cu_seqlens issue: {'; '.join(_cu_errors)} "
+                    f"cu_seqlens={_cu_list}"
+                )
+        GatedDeltaNetAttention._gdn_state_prefill_reported = True
+        from vllm.distributed.parallel_state import get_dp_group
+        _dp_rank = get_dp_group().rank_in_group
+        if _errors:
+            print(
+                f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                f"layer={layer_name} PREFILL ssm_state issue! "
+                f"state_indices="
+                f"{non_spec_state_indices_tensor.tolist()} "
+                f"num_prefills={num_prefills} "
+                f"num_actual_tokens={num_actual_tokens} "
+                f"{' | '.join(_errors)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
+                f"layer={layer_name} PREFILL ssm_state passed. "
+                f"state_indices="
+                f"{non_spec_state_indices_tensor.tolist()} "
+                f"num_prefills={num_prefills} "
+                f"num_actual_tokens={num_actual_tokens} "
+                f"ssm_state_shape={list(_written.shape)}",
+                flush=True,
+            )
+        del _written
+
+    elif num_decodes > 0 and not getattr(
+        GatedDeltaNetAttention, '_gdn_state_decode_reported', False
+    ):
+        _dcu_list = non_spec_query_start_loc[: num_decodes + 1].tolist()
+        _dcu_errors: list[str] = []
+        if len(_dcu_list) == 0:
+            _dcu_errors.append("decode cu_seqlens is empty")
+        else:
+            if _dcu_list[0] != 0:
+                _dcu_errors.append(f"cu_seqlens[0]={_dcu_list[0]} != 0")
+            if _dcu_list[-1] != num_actual_tokens:
+                _dcu_errors.append(
+                    f"cu_seqlens[-1]={_dcu_list[-1]} != "
+                    f"num_actual_tokens={num_actual_tokens}"
+                )
+            for _i in range(1, len(_dcu_list)):
+                if _dcu_list[_i] < _dcu_list[_i - 1]:
+                    _dcu_errors.append(
+                        f"cu_seqlens not monotonic at idx {_i}: "
+                        f"{_dcu_list[_i]} < {_dcu_list[_i-1]}"
+                    )
+                    break
+            _expected_len = num_decodes + 1
+            if len(_dcu_list) != _expected_len:
+                _dcu_errors.append(
+                    f"len(cu_seqlens)={len(_dcu_list)} != "
+                    f"num_decodes+1={_expected_len}"
+                )
+        GatedDeltaNetAttention._gdn_state_decode_reported = True
+        from vllm.distributed.parallel_state import get_dp_group
+        _dp_rank = get_dp_group().rank_in_group
+        if _dcu_errors:
+            print(
+                f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                f"layer={layer_name} DECODE cu_seqlens issue! "
+                f"cu_seqlens={_dcu_list} "
+                f"num_decodes={num_decodes} "
+                f"num_actual_tokens={num_actual_tokens} "
+                f"state_indices="
+                f"{non_spec_state_indices_tensor.tolist()} "
+                f"{'; '.join(_dcu_errors)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[GDN_STATE_CHECK] OK dp_rank={_dp_rank} "
+                f"layer={layer_name} DECODE cu_seqlens passed. "
+                f"cu_seqlens={_dcu_list} "
+                f"num_decodes={num_decodes} "
+                f"num_actual_tokens={num_actual_tokens}",
+                flush=True,
+            )
 
 
 def _gdn_attention_core_xpu_fake(
