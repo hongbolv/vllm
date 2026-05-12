@@ -970,6 +970,65 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            # --- GDN_STATE_CHECK: validate ssm_state after prefill write ---
+            # Check that last_recurrent_state and the written ssm_state slots
+            # do not contain NaN/Inf. Print ERROR on first occurrence only.
+            if not getattr(GatedDeltaNetAttention,
+                           '_gdn_state_prefill_reported', False):
+                _has_nan_lrs = bool(
+                    torch.isnan(last_recurrent_state).any().item())
+                _has_inf_lrs = bool(
+                    torch.isinf(last_recurrent_state).any().item())
+                _written_state = ssm_state[
+                    non_spec_state_indices_tensor].contiguous()
+                _has_nan_ws = bool(
+                    torch.isnan(_written_state).any().item())
+                _has_inf_ws = bool(
+                    torch.isinf(_written_state).any().item())
+                # Also check initial_state that was fed into chunk_gated_delta_rule
+                _has_nan_init = bool(
+                    torch.isnan(initial_state).any().item())
+                _has_inf_init = bool(
+                    torch.isinf(initial_state).any().item())
+                _errors = []
+                if _has_nan_lrs or _has_inf_lrs:
+                    _nan_c = int(
+                        torch.isnan(last_recurrent_state).sum().item())
+                    _inf_c = int(
+                        torch.isinf(last_recurrent_state).sum().item())
+                    _errors.append(
+                        f"last_recurrent_state has NaN={_nan_c} Inf={_inf_c}"
+                        f" shape={list(last_recurrent_state.shape)}")
+                if _has_nan_ws or _has_inf_ws:
+                    _nan_c = int(torch.isnan(_written_state).sum().item())
+                    _inf_c = int(torch.isinf(_written_state).sum().item())
+                    _errors.append(
+                        f"written ssm_state has NaN={_nan_c} Inf={_inf_c}"
+                        f" shape={list(_written_state.shape)}")
+                if _has_nan_init or _has_inf_init:
+                    _nan_c = int(torch.isnan(initial_state).sum().item())
+                    _inf_c = int(torch.isinf(initial_state).sum().item())
+                    _errors.append(
+                        f"initial_state had NaN={_nan_c} Inf={_inf_c}"
+                        f" shape={list(initial_state.shape)}")
+                if _errors:
+                    GatedDeltaNetAttention._gdn_state_prefill_reported = True
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _dp_rank = get_dp_group().rank_in_group
+                    print(
+                        f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"PREFILL ssm_state write issue! "
+                        f"non_spec_state_indices="
+                        f"{non_spec_state_indices_tensor.tolist()} "
+                        f"num_prefills={attn_metadata.num_prefills} "
+                        f"num_actual_tokens={num_actual_tokens} "
+                        f"has_initial_state="
+                        f"{has_initial_state.tolist() if has_initial_state is not None else None} "
+                        f"{' | '.join(_errors)}",
+                        flush=True,
+                    )
+                del _written_state
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
