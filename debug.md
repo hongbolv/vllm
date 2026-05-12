@@ -164,25 +164,55 @@ Since the XPU attention kernels produce correct results without DP padding
 (TP=4/DP=1), **the kernels themselves are not the root cause**. The NaN is
 caused by how DP padding interacts with attention mask construction.
 
+### ATTN_MASK_CHECK log analysis — definitive confirmation
+
+The `[ATTN_MASK_CHECK]` diagnostic output confirms the DP padding → NaN
+connection:
+
+```
+[ATTN_MASK_CHECK] dp_rank=0 layer_idx=3 num_actual_tokens=30 seq_lens=[5, 5, 8, 8] query_start_loc=[0, 5, 10, 18, 26] hidden_shape=[30, 2048]
+[ATTN_MASK_CHECK] dp_rank=1 layer_idx=3 num_actual_tokens=30 seq_lens=[7, 5, 11, 7] query_start_loc=[0, 7, 12, 23, 30] hidden_shape=[30, 2048]
+[NAN_CHECK_POST_ATTN] ERROR dp_rank=0 layer_idx=3 ... nan_row_indices=[26, 27, 28, 29]... total_nan_rows=4
+```
+
+**dp_rank=1** (no padding needed):
+- `seq_lens=[7, 5, 11, 7]` → sum = **30** = `num_actual_tokens`
+- `query_start_loc=[0, 7, 12, 23, 30]` → last boundary = 30 = total tokens
+- All 30 rows are covered by valid sequences → **no NaN**
+
+**dp_rank=0** (padding applied):
+- `seq_lens=[5, 5, 8, 8]` → sum = **26** real tokens
+- `query_start_loc=[0, 5, 10, 18, 26]` → last boundary = 26
+- `num_actual_tokens=30`, `hidden_shape=[30, 2048]` → DP padding added **4 extra rows** (26→30)
+- Rows 26-29 are **not covered by any sequence** in `seq_lens`/`query_start_loc`
+- These 4 rows have no valid attention mask entry → attention backend processes
+  them with an **all-masked (all -inf)** attention score → softmax(-inf) = 0/0 = **NaN**
+- `nan_row_indices=[26, 27, 28, 29]` — exactly the 4 gap rows
+
+**Root cause confirmed**: DP padding increases `num_actual_tokens` from 26 to 30
+for dp_rank=0, but `seq_lens` and `query_start_loc` still only describe the
+real 26 tokens. The attention backend treats all 30 rows as actual tokens and
+computes attention for rows 26-29, which have no valid sequence assignment. With
+no valid attention targets, these rows receive all-`-inf` attention scores,
+and softmax produces 0/0 = NaN. The NaN then propagates to all subsequent
+layers via residual-add.
+
 ### Conclusion
 
-NaN only appears when DP padding is active (TP=2/DP=2) and does not appear
-without DP padding (TP=4/DP=1) on the same XPU hardware. This rules out XPU
-kernel numerical issues as the root cause. The most likely cause is **DP
-padding corrupting attention mask parameters** (`seq_lens`, `query_start_loc`),
-leading to:
+The full_attention NaN is caused by a **mismatch between DP-padded
+`num_actual_tokens` and the attention mask parameters** (`seq_lens`,
+`query_start_loc`). DP padding extends the token count but does not extend
+the mask parameters to cover the padding rows. This is a bug in the DP
+padding → attention metadata construction path.
 
-- **full_attention**: Some tokens see an all-masked attention row (all -inf) →
-  softmax produces 0/0 = NaN (explains the full-row NaN pattern at rows 26-29)
-- **GDN linear_attention**: Padding-related state corruption in the recurrence
-  computation (explains the partial NaN pattern of 86/2048 channels)
+**Fix direction**: When DP padding is applied, the attention mask parameters
+must either:
+1. **Extend `seq_lens`/`query_start_loc`** to cover padding rows (e.g., add a
+   dummy sequence of length `num_padded - num_real` at the end), or
+2. **Keep `num_actual_tokens` at the real count** (26) so the attention backend
+   only processes real tokens and skips padding rows entirely.
 
 The buffer zero-initialization fix (`torch.empty` → `torch.zeros`) remains
-necessary to prevent additional NaN contamination from uninitialized padding
-memory, but the core NaN source is DP padding's impact on attention mask
-construction, not the XPU kernels themselves.
-
-**Next step**: Verify by printing `seq_lens` and `query_start_loc` at the
-attention backend call for full_attention layers during DP=2, checking whether
-the last prompt's token boundaries (rows 26-29) are correctly represented in
-the mask parameters.
+necessary as a defense-in-depth measure to prevent NaN from uninitialized
+memory, but the core fix must address the `num_actual_tokens` vs `seq_lens`
+mismatch in the DP padding path.
