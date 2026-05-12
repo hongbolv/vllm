@@ -113,32 +113,37 @@ residual-add.
 `_build_attention_metadata()`
 
 The fix extends `seq_lens`/`query_start_loc` to cover DP padding rows by
-assigning them to a dummy sequence (direction 1). This approach keeps all
+assigning them to the last request (direction 1). This approach keeps all
 attention backends seeing consistent metadata — no per-backend special
 handling is needed.
 
 When `num_tokens_padded > num_tokens` (DP padding active), the fix:
 1. Sets `query_start_loc[num_reqs_padded] = num_tokens_padded` so the last
-   padding "request" encompasses the padding rows
-2. Sets `seq_lens[num_reqs_padded - 1] = padding_len` so the dummy sequence
-   has a valid causal attention mask
+   entry covers all rows including padding
+2. Adds `padding_len` to `seq_lens[num_reqs_padded - 1]` so the last
+   request's causal attention mask covers the padding rows
 
 This ensures `num_actual_tokens == query_start_loc[-1]` for all backends.
 Every row has a sequence assignment, eliminating the softmax-on-all-inf NaN.
+
+Note: The condition is `num_tokens_padded > num_tokens` only (not
+`num_reqs_padded > num_reqs`), because DP padding can add extra tokens
+without adding extra requests.
 
 ```diff
      def _build_attention_metadata(self, ...):
          ...
 +        # When DP padding is applied, extend query_start_loc and seq_lens
-+        # to cover padding rows as a dummy sequence.
-+        if num_tokens_padded > num_tokens and num_reqs_padded > num_reqs:
++        # to cover padding rows.
++        if num_tokens_padded > num_tokens:
 +            padding_len = num_tokens_padded - num_tokens
 +            self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
 +            self.query_start_loc.cpu[num_reqs_padded] = num_tokens_padded
 +            self.query_start_loc.gpu[num_reqs_padded] = num_tokens_padded
-+            self.seq_lens[num_reqs_padded - 1] = padding_len
++            last_idx = num_reqs_padded - 1
++            self.seq_lens[last_idx] += padding_len
 +            if seq_lens_cpu is not None:
-+                self.optimistic_seq_lens_cpu[num_reqs_padded - 1] = padding_len
++                self.optimistic_seq_lens_cpu[last_idx] += padding_len
 ```
 
 The buffer zero-initialization fix (`torch.empty` → `torch.zeros`) remains
