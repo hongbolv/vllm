@@ -451,6 +451,35 @@ class Qwen3NextDecoderLayer(nn.Module):
                 output=self_attention_output,
             )
         elif self.layer_type == "full_attention":
+            # --- One-shot print of seq_lens & query_start_loc ---
+            if _is_real_inference and not getattr(
+                    Qwen3NextDecoderLayer,
+                    '_attn_mask_check_reported', False):
+                Qwen3NextDecoderLayer._attn_mask_check_reported = True
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp_rank = get_dp_group().rank_in_group
+                _layer_name = self.self_attn.attn.layer_name
+                _meta = None
+                if isinstance(_attn_meta_raw, dict):
+                    _meta = _attn_meta_raw.get(_layer_name)
+                elif (isinstance(_attn_meta_raw, list)
+                      and len(_attn_meta_raw) > 0):
+                    _meta = _attn_meta_raw[0].get(_layer_name)
+                else:
+                    _meta = _attn_meta_raw
+                if _meta is not None:
+                    _seq_lens = getattr(_meta, 'seq_lens', None)
+                    _qsl = getattr(_meta, 'query_start_loc', None)
+                    _nat = getattr(_meta, 'num_actual_tokens', None)
+                    print(
+                        f"[ATTN_MASK_CHECK] dp_rank={_dp_rank} "
+                        f"layer_idx={self.layer_idx} "
+                        f"num_actual_tokens={_nat} "
+                        f"seq_lens={_seq_lens.tolist() if _seq_lens is not None else None} "
+                        f"query_start_loc={_qsl.tolist() if _qsl is not None else None} "
+                        f"hidden_shape={list(hidden_states.shape)}",
+                        flush=True,
+                    )
             self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
