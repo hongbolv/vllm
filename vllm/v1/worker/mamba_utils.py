@@ -177,6 +177,15 @@ def preprocess_mamba(
         mamba_state_idx.pop(req_id, None)
 
     copy_bufs.offset = 0
+    # [STATE_IDX_CHECK] Direction-2 diagnostic: collect per-request state slot
+    # info to detect whether both DP ranks are using the same mamba_state_idx
+    # values (which would explain identical all_state_slots=[1,5,9,13] on both
+    # dp_rank=0 and dp_rank=1 seen in earlier [DP_PAD_CHECK] logs).
+    _state_idx_check_enabled = not getattr(
+        preprocess_mamba, '_state_idx_check_done', False
+    )
+    _state_idx_records: list = [] if _state_idx_check_enabled else None  # type: ignore[assignment]
+
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -203,6 +212,7 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        copy_triggered = False
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -216,7 +226,46 @@ def preprocess_mamba(
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
+            copy_triggered = True
+
+        if _state_idx_check_enabled:
+            _state_idx_records.append({
+                "req_id": req_id,
+                "num_computed_tokens": req_state.num_computed_tokens,
+                "num_scheduled_tokens": num_scheduled_tokens,
+                "prev_state_idx": prev_state_idx,
+                "curr_state_idx": curr_state_idx,
+                "copy_triggered": copy_triggered,
+            })
+
     do_mamba_copy_block(copy_bufs)
+
+    if _state_idx_check_enabled and _state_idx_records:
+        preprocess_mamba._state_idx_check_done = True  # type: ignore[attr-defined]
+        try:
+            from vllm.distributed.parallel_state import get_dp_group
+            _dp_rank = get_dp_group().rank_in_group
+        except Exception:
+            _dp_rank = -1
+        _req_ids = [r["req_id"] for r in _state_idx_records]
+        _prev_slots = [r["prev_state_idx"] for r in _state_idx_records]
+        _curr_slots = [r["curr_state_idx"] for r in _state_idx_records]
+        _num_computed = [r["num_computed_tokens"] for r in _state_idx_records]
+        _num_scheduled = [r["num_scheduled_tokens"] for r in _state_idx_records]
+        _copies = [r["copy_triggered"] for r in _state_idx_records]
+        print(
+            f"[STATE_IDX_CHECK] dp_rank={_dp_rank} "
+            f"block_size={block_size} "
+            f"num_reqs={len(_req_ids)} "
+            f"req_ids={_req_ids} "
+            f"num_computed_tokens={_num_computed} "
+            f"num_scheduled_tokens={_num_scheduled} "
+            f"prev_state_idx={_prev_slots} "
+            f"curr_state_idx={_curr_slots} "
+            f"copy_triggered={_copies} "
+            f"direction-2: mamba_state_idx src/dst block check",
+            flush=True,
+        )
 
 
 def postprocess_mamba(
