@@ -100,7 +100,8 @@ Investigated batching same-dtype tensors into a single `all_gatherv` call
 tensor shapes were correctly reconstructed (no SHAPE MISMATCH or NOT
 CONTIGUOUS errors), the output did not improve and the fix was determined to
 be unnecessary. The `!!!!` output persisted, and NaN was traced to an
-upstream source independent of this path. **Reverted.**
+upstream source independent of this path — specifically, the attention mask
+metadata mismatch documented in the [Prefill NaN root cause](#prefill-nan-root-cause--confirmed-fixed) section. **Reverted.**
 
 ### Fix 6 — Add XCCL barrier before MoE collectives
 
