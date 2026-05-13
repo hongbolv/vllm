@@ -423,17 +423,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # [DP_PAD_CHECK] Direction-3 diagnostic: verify that DP-padding rows in
         # non_spec_state_indices_tensor are filled with NULL_BLOCK_ID.
         #
-        # Root issue: split_decodes_and_prefills counts zero-len DP padding
-        # rows as "decodes" (fast path: max_query_len==1 <= decode_threshold),
-        # so num_decodes == non_spec_state_indices_tensor.size(0) and there are
-        # no apparent "trailing" padding rows. Instead we detect padding rows
-        # directly via m.seq_lens == 0.
+        # DP padding rows have seq_len == 0. We check ANY batch type (not just
+        # pure-decode) because in continuous batching num_prefills > 0 in most
+        # early batches, and we need to fire at least once to confirm the check
+        # is actually reachable. The num_prefills==0 guard was the bug that
+        # caused no output before.
         if (
             not getattr(
                 GDNAttentionMetadataBuilder, '_dp_pad_check_done', False
             )
             and non_spec_state_indices_tensor is not None
-            and num_prefills == 0  # pure-decode batch
             and m.seq_lens is not None
         ):
             GDNAttentionMetadataBuilder._dp_pad_check_done = True
@@ -448,7 +447,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # No DP padding rows at all
                 print(
                     f"[DP_PAD_CHECK] OK dp_rank={_dp_rank} "
-                    f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
+                    f"num_prefills={num_prefills} num_decodes={num_decodes} "
+                    f"num_actual_tokens={batch_size} "
                     f"use_full_cuda_graph={_in_cuda_graph} "
                     f"seq_lens={_seq_lens_cpu.tolist()} "
                     f"all_state_slots={_all_slots_cpu.tolist()} "
@@ -462,7 +462,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 if _non_null_mask.any():
                     print(
                         f"[DP_PAD_CHECK] ERROR dp_rank={_dp_rank} "
-                        f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
+                        f"num_prefills={num_prefills} num_decodes={num_decodes} "
+                        f"num_actual_tokens={batch_size} "
                         f"num_pad_rows={_zero_len_mask.sum().item()} "
                         f"use_full_cuda_graph={_in_cuda_graph} "
                         f"seq_lens={_seq_lens_cpu.tolist()} "
@@ -476,7 +477,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 else:
                     print(
                         f"[DP_PAD_CHECK] OK dp_rank={_dp_rank} "
-                        f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
+                        f"num_prefills={num_prefills} num_decodes={num_decodes} "
+                        f"num_actual_tokens={batch_size} "
                         f"num_pad_rows={_zero_len_mask.sum().item()} "
                         f"use_full_cuda_graph={_in_cuda_graph} "
                         f"seq_lens={_seq_lens_cpu.tolist()} "
