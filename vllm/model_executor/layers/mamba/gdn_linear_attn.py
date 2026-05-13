@@ -679,6 +679,57 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                             flush=True,
                         )
 
+            # [SSM_TENSOR_CHECK]: one-shot per layer — print ssm_state
+            # data_ptr so we can detect cross-rank tensor sharing.
+            # If both DP ranks print the same address, they share the same
+            # physical ssm_state memory → slots [1,5,9,13] on both ranks
+            # refer to identical locations → mutual state corruption → NaN.
+            if not getattr(self, '_ssm_tensor_ptr_reported', False):
+                self._ssm_tensor_ptr_reported = True
+                try:
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _ssc_dp_rank = get_dp_group().rank_in_group
+                except Exception:
+                    _ssc_dp_rank = -1
+                print(
+                    f"[SSM_TENSOR_CHECK] dp_rank={_ssc_dp_rank} "
+                    f"layer={self.prefix} "
+                    f"ssm_state.data_ptr={ssm_state.data_ptr()} "
+                    f"ssm_state.shape={list(ssm_state.shape)} "
+                    f"ssm_state.device={ssm_state.device} "
+                    f"ssm_state.id={id(ssm_state)}",
+                    flush=True,
+                )
+
+            # [SSM_PRE_KERNEL_CHECK]: one-shot per layer in decode phase —
+            # check if ssm_state slots are already NaN/Inf BEFORE the kernel.
+            # If NaN is found here, the corruption happened upstream (during
+            # prefill or a previous decode step), NOT inside the kernel itself.
+            if (
+                _gdn_num_decodes > 0
+                and _gdn_state_indices is not None
+                and _gdn_state_indices.numel() > 0
+                and not getattr(self, '_ssm_pre_kernel_reported', False)
+            ):
+                self._ssm_pre_kernel_reported = True
+                try:
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _spk_dp_rank = get_dp_group().rank_in_group
+                except Exception:
+                    _spk_dp_rank = -1
+                _pre_states = ssm_state[_gdn_state_indices]
+                _pre_nan = int(torch.isnan(_pre_states).sum().item())
+                _pre_inf = int(torch.isinf(_pre_states).sum().item())
+                _pre_status = "NaN_BEFORE_KERNEL" if (_pre_nan > 0 or _pre_inf > 0) else "clean"
+                print(
+                    f"[SSM_PRE_KERNEL_CHECK] dp_rank={_spk_dp_rank} "
+                    f"layer={self.prefix} phase=decode "
+                    f"slots={_gdn_state_indices.cpu().tolist()} "
+                    f"pre_nan={_pre_nan} pre_inf={_pre_inf} "
+                    f"status={_pre_status}",
+                    flush=True,
+                )
+
             torch.ops._xpu_C.gdn_attention(
                 core_attn_out,
                 z,
