@@ -423,52 +423,68 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # [DP_PAD_CHECK] Direction-3 diagnostic: verify that DP-padding rows in
         # non_spec_state_indices_tensor are filled with NULL_BLOCK_ID.
         #
-        # In the non-CUDAGraph path the NULL_BLOCK_ID fill for padding rows is
-        # skipped.  If DP padding is active (num_actual_tokens > num_decodes),
-        # the padding rows retain whatever stale block IDs were left in
-        # block_table_tensor.  The gdn_attention kernel will then execute delta-
-        # rule updates for those rows and write them back, corrupting the state
-        # slots owned by real sequences in the *next* decode step.
+        # Root issue: split_decodes_and_prefills counts zero-len DP padding
+        # rows as "decodes" (fast path: max_query_len==1 <= decode_threshold),
+        # so num_decodes == non_spec_state_indices_tensor.size(0) and there are
+        # no apparent "trailing" padding rows. Instead we detect padding rows
+        # directly via m.seq_lens == 0.
         if (
             not getattr(
                 GDNAttentionMetadataBuilder, '_dp_pad_check_done', False
             )
             and non_spec_state_indices_tensor is not None
-            and num_prefills == 0  # pure-decode batch; padding rows follow num_decodes
-            and non_spec_state_indices_tensor.size(0) > num_decodes
+            and num_prefills == 0  # pure-decode batch
+            and m.seq_lens is not None
         ):
             GDNAttentionMetadataBuilder._dp_pad_check_done = True
             from vllm.distributed.parallel_state import get_dp_group
             _dp_rank = get_dp_group().rank_in_group
-            _num_pad = non_spec_state_indices_tensor.size(0) - num_decodes
-            _pad_slots_cpu = non_spec_state_indices_tensor[num_decodes:].cpu()
-            _non_null_mask = _pad_slots_cpu != NULL_BLOCK_ID
-            _real_slots_cpu = non_spec_state_indices_tensor[:num_decodes].cpu()
             _in_cuda_graph = self.use_full_cuda_graph
-            if _non_null_mask.any():
-                print(
-                    f"[DP_PAD_CHECK] ERROR dp_rank={_dp_rank} "
-                    f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
-                    f"num_pad_rows={_num_pad} "
-                    f"use_full_cuda_graph={_in_cuda_graph} "
-                    f"pad_state_slots={_pad_slots_cpu.tolist()} "
-                    f"non_null_pad_slots={_pad_slots_cpu[_non_null_mask].tolist()} "
-                    f"real_state_slots={_real_slots_cpu.tolist()} "
-                    f"NULL_BLOCK_ID={NULL_BLOCK_ID} "
-                    f"direction-3 BUG: padding rows have non-null state slots",
-                    flush=True,
-                )
-            else:
+            _seq_lens_cpu = m.seq_lens.cpu()
+            # DP padding rows have seq_len == 0
+            _zero_len_mask = (_seq_lens_cpu == 0)
+            _all_slots_cpu = non_spec_state_indices_tensor.cpu()
+            if not _zero_len_mask.any():
+                # No DP padding rows at all
                 print(
                     f"[DP_PAD_CHECK] OK dp_rank={_dp_rank} "
                     f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
-                    f"num_pad_rows={_num_pad} "
                     f"use_full_cuda_graph={_in_cuda_graph} "
-                    f"pad_state_slots={_pad_slots_cpu.tolist()} "
-                    f"real_state_slots={_real_slots_cpu.tolist()} "
-                    f"direction-3 clean: all padding rows have NULL_BLOCK_ID",
+                    f"seq_lens={_seq_lens_cpu.tolist()} "
+                    f"all_state_slots={_all_slots_cpu.tolist()} "
+                    f"direction-3: no DP padding rows (seq_len>0 for all)",
                     flush=True,
                 )
+            else:
+                _pad_slots_cpu = _all_slots_cpu[_zero_len_mask]
+                _real_slots_cpu = _all_slots_cpu[~_zero_len_mask]
+                _non_null_mask = _pad_slots_cpu != NULL_BLOCK_ID
+                if _non_null_mask.any():
+                    print(
+                        f"[DP_PAD_CHECK] ERROR dp_rank={_dp_rank} "
+                        f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
+                        f"num_pad_rows={_zero_len_mask.sum().item()} "
+                        f"use_full_cuda_graph={_in_cuda_graph} "
+                        f"seq_lens={_seq_lens_cpu.tolist()} "
+                        f"pad_state_slots={_pad_slots_cpu.tolist()} "
+                        f"non_null_pad_slots={_pad_slots_cpu[_non_null_mask].tolist()} "
+                        f"real_state_slots={_real_slots_cpu.tolist()} "
+                        f"NULL_BLOCK_ID={NULL_BLOCK_ID} "
+                        f"direction-3 BUG: padding rows have non-null state slots",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[DP_PAD_CHECK] OK dp_rank={_dp_rank} "
+                        f"num_decodes={num_decodes} num_actual_tokens={batch_size} "
+                        f"num_pad_rows={_zero_len_mask.sum().item()} "
+                        f"use_full_cuda_graph={_in_cuda_graph} "
+                        f"seq_lens={_seq_lens_cpu.tolist()} "
+                        f"pad_state_slots={_pad_slots_cpu.tolist()} "
+                        f"real_state_slots={_real_slots_cpu.tolist()} "
+                        f"direction-3 clean: all padding rows have NULL_BLOCK_ID",
+                        flush=True,
+                    )
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
