@@ -246,4 +246,4 @@ Each uses a class-level flag to print ERROR only on first occurrence.
 |-----------|------|---------|
 | `[NAN_CHECK_PRE_ATTN]` | `qwen3_next.py` | Detect NaN in `hidden_states` **before** attention call in `Qwen3NextDecoderLayer` |
 | `[NAN_CHECK_POST_ATTN]` | `qwen3_next.py` | Detect NaN in `hidden_states` **after** attention call; reports `actual_nan_rows` vs `padding_nan_rows` |
-| `[GDN_STATE_CHECK]` | `_xpu_ops.py` | Validate GDN `ssm_state` after `gdn_attention` kernel, and `cu_seqlens` consistency in prefill and decode |
+| `[GDN_STATE_CHECK]` | `gdn_linear_attn.py` | Validate `cu_seqlens` (`non_spec_query_start_loc`) consistency before `gdn_attention` kernel (starts at 0, monotone, final entry = `num_actual_tokens`), and validate `ssm_state` slots for NaN/Inf after the kernel |
