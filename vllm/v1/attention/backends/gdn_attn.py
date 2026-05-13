@@ -185,12 +185,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # read an uninitialized or NULL_BLOCK_ID slot → NaN in ssm_state.
         if (
             not getattr(
-                GDNAttentionMetadataBuilder, '_seq_len_check_reported', False
+                GDNAttentionMetadataBuilder, '_seq_len_check_done', False
             )
             and self.vllm_config.cache_config.mamba_cache_mode == "align"
             and m.block_table_tensor is not None
             and m.seq_lens is not None
         ):
+            GDNAttentionMetadataBuilder._seq_len_check_done = True
+            from vllm.distributed.parallel_state import get_dp_group
+            _dp_rank = get_dp_group().rank_in_group
             _block_size = self.kv_cache_spec.block_size
             _sl_cpu = m.seq_lens.cpu().to(torch.int64)
             _raw_bt = m.block_table_tensor  # shape: [num_reqs, max_cols]
@@ -207,9 +210,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 block_table_tensor[:, 0].cpu() == NULL_BLOCK_ID
             ) & (_sl_cpu > 0)
             if _oob_mask.any() or _null_slot_mask.any():
-                GDNAttentionMetadataBuilder._seq_len_check_reported = True
-                from vllm.distributed.parallel_state import get_dp_group
-                _dp_rank = get_dp_group().rank_in_group
                 print(
                     f"[SEQ_LEN_CHECK] ERROR dp_rank={_dp_rank} "
                     f"mamba_cache_mode=align "
@@ -220,6 +220,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     f"oob_requests={_oob_mask.nonzero(as_tuple=False).squeeze(-1).tolist()} "
                     f"null_slot_real_requests={_null_slot_mask.nonzero(as_tuple=False).squeeze(-1).tolist()} "
                     f"gathered_state_slots={_gathered_slots}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[SEQ_LEN_CHECK] OK dp_rank={_dp_rank} "
+                    f"mamba_cache_mode=align "
+                    f"seq_lens={_sl_cpu.tolist()} "
+                    f"block_size={_block_size} "
+                    f"block_table_max_cols={_max_cols} "
+                    f"start_indices={_start_idx.tolist()} "
+                    f"gathered_state_slots={_gathered_slots} "
+                    f"direction-1 clean",
                     flush=True,
                 )
 
