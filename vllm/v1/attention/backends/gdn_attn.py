@@ -399,6 +399,36 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+        # [STATE_IDX_CHECK] Direction-2: print state slot assignments once to
+        # verify whether both DP ranks see the same or different block IDs.
+        # Fires for all mamba_cache_mode values (unlike preprocess_mamba which
+        # is only called for mamba_cache_mode="align" and therefore never fired
+        # when the system runs with mamba_cache_mode="none").
+        if not getattr(self.__class__, '_state_idx_check_done', False):
+            self.__class__._state_idx_check_done = True
+            try:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp_rank = get_dp_group().rank_in_group
+            except Exception:
+                _dp_rank = -1
+            _mamba_mode = self.vllm_config.cache_config.mamba_cache_mode
+            _seq_lens_cpu = m.seq_lens.cpu().tolist()
+            _bt_cpu = block_table_tensor[:, 0].cpu().tolist()
+            if non_spec_state_indices_tensor is not None:
+                _non_spec_slots = non_spec_state_indices_tensor.cpu().tolist()
+            else:
+                _non_spec_slots = None
+            print(
+                f"[STATE_IDX_CHECK] dp_rank={_dp_rank} "
+                f"mamba_cache_mode={_mamba_mode} "
+                f"num_decodes={num_decodes} num_prefills={num_prefills} "
+                f"seq_lens={_seq_lens_cpu} "
+                f"block_table_col0={_bt_cpu} "
+                f"non_spec_state_slots={_non_spec_slots} "
+                f"direction-2: per-rank block_table slot check",
+                flush=True,
+            )
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
