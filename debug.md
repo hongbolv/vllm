@@ -21,22 +21,21 @@ DP rank 0: 'The capital of France is' → ' known as!!!!!!...'
 
 ---
 
-## All Six Fixes — Status Summary
+## Applied Fixes — Status Summary
 
 | Fix | File | Status | Description |
 |-----|------|--------|-------------|
-| Fix 1 | `dp_utils.py` | ✅ Applied | Force DP padding when EP is enabled |
-| Fix 2 | `gpu_model_runner.py` | ✅ Applied | Align `pad_attn` with DP padding state |
-| Fix 3 | `gpu_model_runner.py` | ✅ Applied | Disable async scheduling for EP+DP |
-| Fix 4 | `xpu_communicator.py` | ❌ Reverted | Fix `all_gather` API usage — confirmed not the issue |
-| Fix 5 | `xpu_communicator.py` | ❌ Reverted | Same-dtype tensor batching — confirmed not the issue |
-| Fix 6 | `all2all.py` | ✅ Applied | Add XCCL barrier before MoE collectives |
+| Hongbo Fix 1 | `dp_utils.py` | ✅ Applied | Force DP padding when EP is enabled |
+| Hongbo Fix 2 | `gpu_model_runner.py` | ✅ Applied | Align `pad_attn` with DP padding state |
+| Hongbo Fix 3 | `gpu_model_runner.py` | ✅ Applied | Disable async scheduling for EP+DP |
+| Hongbo Fix 4 | `gpu_model_runner.py` | ✅ Applied | Fix attention metadata for DP padding rows (prefill NaN fix) |
+| Hongbo Fix 6 | `all2all.py`, `qwen3_next.py`, `attention.py` | ✅ Applied | Add XCCL barrier + zero-initialize attention output buffers |
 
 ---
 
 ## Applied Fixes
 
-### Fix 1 — Force DP padding when EP is enabled
+### Hongbo Fix 1 — Force DP padding when EP is enabled
 
 **File**: `vllm/v1/worker/dp_utils.py`
 
@@ -52,7 +51,7 @@ EP all-to-all collective deadlock.
 +                     or parallel_config.enable_expert_parallel)
 ```
 
-### Fix 2 — Align `pad_attn` with DP padding state
+### Hongbo Fix 2 — Align `pad_attn` with DP padding state
 
 **File**: `vllm/v1/worker/gpu_model_runner.py`
 
@@ -66,7 +65,7 @@ only when CUDAGraph FULL mode is active.
 +            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
 ```
 
-### Fix 3 — Disable async scheduling for EP+DP
+### Hongbo Fix 3 — Disable async scheduling for EP+DP
 
 **File**: `vllm/v1/worker/gpu_model_runner.py`
 
@@ -81,29 +80,18 @@ iteration N+1's `all_reduce` while the other is still in iteration N.
 +            self.use_async_scheduling = False
 ```
 
-### Fix 4 — `all_gather` API fix in `xpu_communicator.py` (Reverted)
+### Hongbo Fix 4 — Fix attention metadata for DP padding rows (prefill NaN fix)
 
-**File**: `vllm/distributed/device_communicators/xpu_communicator.py`
+**File**: `vllm/v1/worker/gpu_model_runner.py`, `_build_attention_metadata()`
 
-Investigated replacing `dist.all_gather([output_tensor], input_, ...)` with
-`dist.all_gather_into_tensor(output_tensor, input_, ...)` to fix potential
-API misuse. Confirmed via experiment that removing this fix causes no change
-in output — the original `all_gather([output_tensor], ...)` with a single-element
-list works correctly on XCCL. **Reverted.**
+When DP padding is applied (`num_tokens_padded > num_tokens`), `query_start_loc`
+ends at the real token count but the attention backend processes
+`num_tokens_padded` rows. Rows beyond `num_tokens` have no sequence
+assignment, causing softmax on all-`-inf` scores → NaN. Fix: create local
+copies of `query_start_loc` and `seq_lens` and extend them to cover the
+padding rows.
 
-### Fix 5 — Same-dtype tensor batching in `xpu_communicator.py` (Reverted)
-
-**File**: `vllm/distributed/device_communicators/xpu_communicator.py`
-
-Investigated batching same-dtype tensors into a single `all_gatherv` call
-(concatenating along dim=1) to reduce collective count. After validating that
-tensor shapes were correctly reconstructed (no SHAPE MISMATCH or NOT
-CONTIGUOUS errors), the output did not improve and the fix was determined to
-be unnecessary. The `!!!!` output persisted, and NaN was traced to an
-upstream source independent of this path — specifically, the attention mask
-metadata mismatch documented in the [Prefill NaN root cause](#prefill-nan-root-cause--confirmed-fixed) section. **Reverted.**
-
-### Fix 6 — Add XCCL barrier before MoE collectives
+### Hongbo Fix 6 — Add XCCL barrier before MoE collectives
 
 **File**: `vllm/distributed/device_communicators/all2all.py`
 
@@ -115,6 +103,13 @@ In the DP=2, TP=2, EP=True configuration, `dist_group.device_group` covers
 all 4 ranks when called from `is_sequence_parallel=True` (EP group), or 2 DP
 peers when called from `is_sequence_parallel=False`.
 
+Also includes zero-initialization of attention output buffers
+(`vllm/model_executor/layers/attention/attention.py`,
+`vllm/model_executor/models/qwen3_next.py`): changed `torch.empty` →
+`torch.zeros` and `torch.empty_like` → `torch.zeros_like`. With DP padding,
+uninitialized padding rows on XPU (BMG) frequently contain NaN bit patterns;
+using `torch.zeros` eliminates this contamination.
+
 ```diff
 +        dist.barrier(group=dist_group.device_group)
          gathered_tensors = dist_group.all_gatherv(...)
@@ -123,19 +118,6 @@ peers when called from `is_sequence_parallel=False`.
 ---
 
 ## Additional Fixes
-
-### Attention output buffer zero-initialization
-
-**Files**: `vllm/model_executor/layers/attention/attention.py`,
-`vllm/model_executor/models/qwen3_next.py`
-
-Changed `torch.empty` → `torch.zeros` (shared `Attention` layer) and
-`torch.empty_like` → `torch.zeros_like` (Qwen3.5 `Qwen3NextDecoderLayer`)
-for attention output buffer allocation. With DP padding, `query.shape[0]` is
-rounded up beyond `num_actual_tokens`, and the attention backend only writes
-`output[:num_actual_tokens]`. On XPU (BMG), uninitialized memory in bf16/fp16
-frequently contains NaN bit patterns. Using `torch.zeros` eliminates NaN
-contamination from uninitialized padding rows (defense-in-depth).
 
 ### Flash attention k/v contiguous fix
 
@@ -151,16 +133,6 @@ or crashes in the XPU flash attention kernel.
 +            k=k.contiguous(),
 +            v=v.contiguous(),
 ```
-
-### DP padding NaN root cause fix — attention metadata
-
-**File**: `vllm/v1/worker/gpu_model_runner.py`, `_build_attention_metadata()`
-
-This is the definitive fix for prefill NaN. See [Prefill NaN Root Cause](#prefill-nan-root-cause--confirmed-fixed) below.
-Uses **local clones** of `seq_lens` and `query_start_loc` so the DP padding
-extension only affects attention metadata; the shared buffers used for KV
-cache `slot_mapping` computation remain unmodified (prevents KV cache
-corruption that would cause NaN in subsequent decode steps).
 
 ---
 
@@ -193,7 +165,7 @@ softmax to produce 0/0 = NaN. NaN propagates to all subsequent layers via
 residual-add. dp_rank=0 layer 0–2 (GDN linear-attention layers) show no
 prefill NaN — the GDN kernel processes only real tokens in prefill.
 
-**Fix applied** (`_build_attention_metadata()`): extend `seq_lens` and
+**Hongbo Fix 4 applied** (`_build_attention_metadata()`): extend `seq_lens` and
 `query_start_loc` to cover DP padding rows by assigning them to the last
 request (direction 1). All attention backends see consistent metadata with
 no uncovered rows.
