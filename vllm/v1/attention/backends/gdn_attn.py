@@ -174,34 +174,34 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.vllm_config.cache_config.mamba_cache_mode,
         )
 
-        # [SEQ_LEN_CHECK] Direction-1 diagnostic: validate that seq_lens used to
-        # compute state-slot indices are not inflated by DP padding.
-        # In mamba_cache_mode="align", mamba_get_block_table_tensor computes:
-        #   start_indices = clamp((seq_lens - 1) // block_size, min=0)
-        # and then gathers block_table_tensor[:, start_indices].  If
-        # seq_lens[i] is inflated (e.g. due to DP-padding fix that adds
-        # padding_len to the last request's seq_len), start_indices[i] can
-        # exceed the number of actually-allocated blocks, making the kernel
-        # read an uninitialized or NULL_BLOCK_ID slot → NaN in ssm_state.
+        # [SEQ_LEN_CHECK] Direction-1 diagnostic: validate that the state-slot
+        # indices passed to the kernel are sane.
+        # Works for all mamba_cache_mode values ("none", "align", "all").
+        # - "align": mamba_get_block_table_tensor computes
+        #     start_indices = clamp((seq_lens - 1) // block_size, min=0)
+        #   and gathers those columns.  Inflated seq_lens (DP padding) can push
+        #   start_indices OOB → NULL_BLOCK_ID slot → NaN in ssm_state.
+        # - "none"/"all": the raw block_table is used directly; column 0 is the
+        #   state slot. We still check for NULL_BLOCK_ID on real requests.
         if (
             not getattr(
                 GDNAttentionMetadataBuilder, '_seq_len_check_done', False
             )
-            and self.vllm_config.cache_config.mamba_cache_mode == "align"
             and m.block_table_tensor is not None
             and m.seq_lens is not None
         ):
             GDNAttentionMetadataBuilder._seq_len_check_done = True
             from vllm.distributed.parallel_state import get_dp_group
             _dp_rank = get_dp_group().rank_in_group
+            _cache_mode = self.vllm_config.cache_config.mamba_cache_mode
             _block_size = self.kv_cache_spec.block_size
             _sl_cpu = m.seq_lens.cpu().to(torch.int64)
             _raw_bt = m.block_table_tensor  # shape: [num_reqs, max_cols]
             _max_cols = _raw_bt.shape[1]
-            # Recompute start_indices on CPU for inspection
+            # For "align" mode, recompute start_indices on CPU for inspection
             _start_idx = torch.clamp((_sl_cpu - 1) // _block_size, min=0)
-            # Indices that go out of bounds in the raw block_table
-            _oob_mask = _start_idx >= _max_cols
+            # Indices that go out of bounds in the raw block_table (align only)
+            _oob_mask = (_start_idx >= _max_cols) if _cache_mode == "align" else torch.zeros_like(_start_idx, dtype=torch.bool)
             # Block IDs actually gathered (column 0 of the output block table)
             # block_table_tensor is already the gathered result; its column 0
             # is the state slot used by the kernel.
@@ -212,7 +212,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if _oob_mask.any() or _null_slot_mask.any():
                 print(
                     f"[SEQ_LEN_CHECK] ERROR dp_rank={_dp_rank} "
-                    f"mamba_cache_mode=align "
+                    f"mamba_cache_mode={_cache_mode} "
                     f"seq_lens={_sl_cpu.tolist()} "
                     f"block_size={_block_size} "
                     f"block_table_max_cols={_max_cols} "
@@ -225,7 +225,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 print(
                     f"[SEQ_LEN_CHECK] OK dp_rank={_dp_rank} "
-                    f"mamba_cache_mode=align "
+                    f"mamba_cache_mode={_cache_mode} "
                     f"seq_lens={_sl_cpu.tolist()} "
                     f"block_size={_block_size} "
                     f"block_table_max_cols={_max_cols} "
