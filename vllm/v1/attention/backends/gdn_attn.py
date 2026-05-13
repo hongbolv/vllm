@@ -399,35 +399,67 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
-        # [STATE_IDX_CHECK] Direction-2: print state slot assignments once to
-        # verify whether both DP ranks see the same or different block IDs.
-        # Fires for all mamba_cache_mode values (unlike preprocess_mamba which
-        # is only called for mamba_cache_mode="align" and therefore never fired
-        # when the system runs with mamba_cache_mode="none").
-        if not getattr(self.__class__, '_state_idx_check_done', False):
-            self.__class__._state_idx_check_done = True
-            try:
-                from vllm.distributed.parallel_state import get_dp_group
-                _dp_rank = get_dp_group().rank_in_group
-            except Exception:
-                _dp_rank = -1
-            _mamba_mode = self.vllm_config.cache_config.mamba_cache_mode
-            _seq_lens_cpu = m.seq_lens.cpu().tolist()
-            _bt_cpu = block_table_tensor[:, 0].cpu().tolist()
-            if non_spec_state_indices_tensor is not None:
-                _non_spec_slots = non_spec_state_indices_tensor.cpu().tolist()
-            else:
-                _non_spec_slots = None
-            print(
-                f"[STATE_IDX_CHECK] dp_rank={_dp_rank} "
-                f"mamba_cache_mode={_mamba_mode} "
-                f"num_decodes={num_decodes} num_prefills={num_prefills} "
-                f"seq_lens={_seq_lens_cpu} "
-                f"block_table_col0={_bt_cpu} "
-                f"non_spec_state_slots={_non_spec_slots} "
-                f"direction-2: per-rank block_table slot check",
-                flush=True,
-            )
+        # [BLOCK_TABLE_CHECK] Direction-2: validate block_table slot allocation
+        # every batch to detect duplicate/null slots and track slot changes
+        # across prefill→decode transitions. Fires for all mamba_cache_mode
+        # values so it works with mamba_cache_mode="none" (the active mode).
+        try:
+            from vllm.distributed.parallel_state import get_dp_group
+            _dp_rank = get_dp_group().rank_in_group
+        except Exception:
+            _dp_rank = -1
+        _mamba_mode = self.vllm_config.cache_config.mamba_cache_mode
+        _seq_lens_cpu = m.seq_lens.cpu().tolist()
+        _bt_cpu = block_table_tensor[:, 0].cpu().tolist()
+        if non_spec_state_indices_tensor is not None:
+            _non_spec_slots = non_spec_state_indices_tensor.cpu().tolist()
+        else:
+            _non_spec_slots = _bt_cpu
+        _phase = "decode" if num_prefills == 0 else "prefill"
+
+        # Check 1: Duplicate slots within this batch (any two requests sharing
+        # the same mamba state slot is always a bug).
+        _slot_set = set()
+        _dup_slots = []
+        for _s in _non_spec_slots:
+            if _s in _slot_set:
+                _dup_slots.append(_s)
+            _slot_set.add(_s)
+
+        # Check 2: NULL slots (0) for real requests.
+        _null_slots = [
+            (i, _s) for i, (_s, _sl) in enumerate(zip(_non_spec_slots, _seq_lens_cpu))
+            if _s == 0 and _sl > 0
+        ]
+
+        # Check 3: Cross-step consistency — detect if any request's slot
+        # changed unexpectedly (tracked via seq_len as proxy for request ID).
+        _prev_map = getattr(self, '_prev_slot_map', {})
+        _changed = []
+        _new_map = {}
+        for i, (_sl, _s) in enumerate(zip(_seq_lens_cpu, _non_spec_slots)):
+            if _sl > 0 and _sl in _prev_map and _prev_map[_sl] != _s:
+                _changed.append((_sl, _prev_map[_sl], _s))
+            _new_map[_sl] = _s
+        self._prev_slot_map = _new_map
+
+        _has_error = bool(_dup_slots or _null_slots)
+        _level = "ERROR" if _has_error else "OK"
+        _msg = (
+            f"[BLOCK_TABLE_CHECK] {_level} dp_rank={_dp_rank} "
+            f"mamba_cache_mode={_mamba_mode} phase={_phase} "
+            f"num_decodes={num_decodes} num_prefills={num_prefills} "
+            f"seq_lens={_seq_lens_cpu} "
+            f"block_table_col0={_bt_cpu} "
+            f"non_spec_state_slots={_non_spec_slots}"
+        )
+        if _dup_slots:
+            _msg += f" DUPLICATE_SLOTS={_dup_slots}"
+        if _null_slots:
+            _msg += f" NULL_SLOTS_FOR_REAL_REQS={_null_slots}"
+        if _changed:
+            _msg += f" SLOT_CHANGED={_changed}"
+        print(_msg, flush=True)
 
         if (
             self.use_full_cuda_graph
