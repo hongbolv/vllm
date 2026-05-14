@@ -247,3 +247,246 @@ Each uses a class-level flag to print ERROR only on first occurrence.
 | `[NAN_CHECK_PRE_ATTN]` | `qwen3_next.py` | Detect NaN in `hidden_states` **before** attention call in `Qwen3NextDecoderLayer` |
 | `[NAN_CHECK_POST_ATTN]` | `qwen3_next.py` | Detect NaN in `hidden_states` **after** attention call; reports `actual_nan_rows` vs `padding_nan_rows` |
 | `[GDN_STATE_CHECK]` | `gdn_linear_attn.py` | Validate `cu_seqlens` (`non_spec_query_start_loc`) consistency before `gdn_attention` kernel (starts at 0, monotone, final entry = `num_actual_tokens`), and validate `ssm_state` slots for NaN/Inf after the kernel |
+| `[SSM_TENSOR_CHECK]` | `gdn_linear_attn.py` | One-shot per layer: print `ssm_state.data_ptr()` and `id(ssm_state)` so cross-rank tensor sharing can be detected. If both DP ranks show the same address, they share physical ssm_state memory → NaN from mutual state overwrite. |
+| `[SSM_PRE_KERNEL_CHECK]` | `gdn_linear_attn.py` | One-shot per layer on first decode batch: check if `ssm_state` target slots are already NaN/Inf **before** the kernel runs. If `status=NaN_BEFORE_KERNEL`, the corruption occurred upstream (during prefill or a prior decode step). |
+| `[BLOCK_TABLE_CHECK]` | `gdn_attn.py` | Every batch: check (1) DUPLICATE\_SLOTS — two requests sharing the same state slot, (2) NULL\_SLOTS\_FOR\_REAL\_REQS — real sequence mapped to NULL slot 0, (3) SLOT\_CHANGED — slot assignment changed unexpectedly between prefill and decode. |
+
+---
+
+## Kernel Call Flow: Qwen3.5 Prefill → First Decode Token
+
+This section documents all compute kernels invoked for a single forward pass,
+from the first prefill batch through the first decode step, on the XPU (SYCL)
+execution path. The model is **Qwen3.5-35B-A3B** (qwen3_next.py architecture),
+configured with TP=2, DP=2, EP=True on 4× Intel ARC B60 GPUs.
+
+### Model Architecture Overview
+
+- **40 decoder layers** total
+- **Layer type pattern** (controlled by `full_attention_interval=4`):
+  - Layers 0, 1, 2: `linear_attention` (GDN / Gated Delta Network)
+  - Layer 3: `full_attention` (Flash Attention)
+  - Layers 4, 5, 6: `linear_attention`
+  - Layer 7: `full_attention`
+  - ... (repeating pattern: 3 GDN + 1 FlashAttn)
+- **MLP type**: MoE (Mixture of Experts) for every layer that satisfies
+  `(layer_idx + 1) % decoder_sparse_step == 0` when `num_experts > 0`.
+  For Qwen3.5-MoE the default is all non-mlp-only layers use MoE.
+- **Parallelism**: TP splits Q/K/V/O projections and expert matrices.
+  EP distributes expert weights across DP ranks.
+
+### Phase 1: Prefill (prompt processing, T tokens per sequence)
+
+```
+Qwen3NextForCausalLM.forward()
+└─ Qwen3NextModel.forward()
+   │
+   ├─ [Embedding]  embed_tokens(input_ids)
+   │     Kernel: XPU gather / embedding lookup
+   │     Output: hidden_states [T, hidden_size]
+   │
+   └─ For layer_idx in [0 .. 39]:
+      │
+      ├─ [RMSNorm]  input_layernorm(hidden_states, residual)
+      │     Kernel: fused_rms_norm (XPU element-wise)
+      │
+      ├─ [IF linear_attention layer (GDN)]
+      │   │
+      │   ├─ 1. Input Projection (forward_xpu)
+      │   │     in_proj_qkvz(hidden_states)  → projected_states_qkvz [T, qkvz_dim]
+      │   │     Kernel: ColumnParallelLinear matmul (XPU GEMM, TP-sharded)
+      │   │     in_proj_ba(hidden_states)    → projected_states_ba   [T, 2*num_v_heads]
+      │   │     Kernel: ReplicatedLinear matmul (XPU GEMM)
+      │   │
+      │   ├─ 2. Core Attention  — torch.ops._xpu_C.gdn_attention  (SYCL kernel)
+      │   │     Inputs:
+      │   │       projected_states_qkvz, projected_states_ba
+      │   │       conv_state  [num_slots, num_k_heads, head_k_dim, conv_width-1]
+      │   │       ssm_state   [num_slots, num_v_heads, head_v_dim, head_k_dim]
+      │   │       conv_weights, conv_bias, A_log, dt_bias
+      │   │       num_prefills, num_decodes, has_initial_state
+      │   │       non_spec_query_start_loc (cu_seqlens), non_spec_state_indices_tensor
+      │   │     Operations inside SYCL kernel:
+      │   │       a) causal_conv1d (1-D depthwise convolution over qkv)
+      │   │       b) gated delta rule recurrent scan (chunked, updates ssm_state)
+      │   │     Outputs:
+      │   │       core_attn_out [T, num_v_heads, head_v_dim]
+      │   │       z             [T, num_v_heads, head_v_dim]   (gate)
+      │   │       ssm_state written in-place (persistent KV cache slot)
+      │   │       conv_state written in-place (persistent conv cache slot)
+      │   │
+      │   ├─ 3. Gate-Norm  norm(core_attn_out, z)
+      │   │     Kernel: fused gate × RMSNorm (XPU element-wise)
+      │   │
+      │   └─ 4. Output Projection
+      │         out_proj(core_attn_out) → hidden_states [T, hidden_size]
+      │         Kernel: RowParallelLinear matmul + TP all_reduce (XPU GEMM + XCCL)
+      │
+      ├─ [IF full_attention layer (Flash Attention)]
+      │   │
+      │   ├─ 1. QKV Projection
+      │   │     qkv_proj(hidden_states) → qkv [T, (num_heads*(1+gate)+2*kv_heads)*head_dim]
+      │   │     Kernel: QKVParallelLinear matmul (XPU GEMM, TP-sharded)
+      │   │
+      │   ├─ 2. Split gate / q_norm / k_norm
+      │   │     q_norm(q), k_norm(k)
+      │   │     Kernel: per-head RMSNorm (XPU element-wise)
+      │   │
+      │   ├─ 3. RoPE  rotary_emb(positions, q, k) → q_rot, k_rot
+      │   │     Kernel: rotary position embedding (XPU element-wise)
+      │   │
+      │   ├─ 4. Flash Attention  attn(q_rot, k_rot, v)
+      │   │     Kernel: flash_attn_varlen_func (XPU SYCL flash attention)
+      │   │     Writes K, V to paged KV cache (slot_mapping)
+      │   │     Reads full prefix KV from paged cache during prefill
+      │   │     Output: attn_output [T, num_heads*head_dim]
+      │   │
+      │   ├─ 5. Attention Output Gate (if enabled)
+      │   │     gate = sigmoid(gate_slice)
+      │   │     attn_output = attn_output * gate
+      │   │     Kernel: XPU element-wise sigmoid + multiply
+      │   │
+      │   └─ 6. Output Projection
+      │         o_proj(attn_output) → hidden_states [T, hidden_size]
+      │         Kernel: RowParallelLinear matmul + TP all_reduce (XPU GEMM + XCCL)
+      │
+      ├─ [RMSNorm]  post_attention_layernorm(hidden_states, residual)
+      │     Kernel: fused_rms_norm (XPU element-wise), also fuses residual add
+      │
+      └─ [MLP / MoE]
+          │
+          ├─ [IF MoE layer]
+          │   ├─ Router  gate(hidden_states) → router_logits [T, num_experts]
+          │   │     Kernel: ReplicatedLinear matmul (XPU GEMM)
+          │   │
+          │   ├─ EP Dispatch  (if enable_expert_parallel)
+          │   │     all_gatherv()   — XCCL gather tokens across EP ranks
+          │   │     Barrier before collective (Hongbo Fix 6)
+          │   │
+          │   ├─ FusedMoE  experts(hidden_states, router_logits)
+          │   │     Top-K token→expert routing
+          │   │     gate_up_proj  matmul per expert  (XPU GEMM, TP-sharded col-wise)
+          │   │     SiLU activation
+          │   │     down_proj     matmul per expert  (XPU GEMM, TP-sharded row-wise)
+          │   │     Shared expert: gate_up_proj → SiLU → down_proj
+          │   │
+          │   ├─ EP Combine
+          │   │     reduce_scatterv() — XCCL scatter-reduce outputs back to home rank
+          │   │     Barrier before collective (Hongbo Fix 6)
+          │   │
+          │   └─ TP all_reduce / all_gather (if TP>1 and not sequence_parallel)
+          │
+          └─ [IF dense MLP]
+                gate_up_proj(hidden_states) [T, 2*intermediate_size]
+                Kernel: ColumnParallelLinear matmul (XPU GEMM)
+                SiLU+multiply (fused gated activation, XPU element-wise)
+                down_proj → hidden_states [T, hidden_size]
+                Kernel: RowParallelLinear matmul + TP all_reduce (XPU GEMM + XCCL)
+
+   ├─ [Final RMSNorm]  norm(hidden_states, residual)
+   │     Kernel: fused_rms_norm (XPU element-wise)
+   │
+   └─ LogitsProcessor  lm_head(hidden_states) → logits [T, vocab_size]
+         Kernel: VocabParallelEmbedding / ParallelLMHead matmul (XPU GEMM + XCCL)
+
+Sampler  → next_token_ids [batch_size]
+```
+
+### Phase 2: First Decode Step (1 token per active sequence)
+
+The decode step repeats the same `Qwen3NextModel.forward()` call, but with
+`num_actual_tokens = batch_size` (one new token per sequence).  The key
+differences per layer type are:
+
+#### GDN Linear Attention Layer (decode)
+
+On **CUDA**:
+```
+in_proj_qkvz, in_proj_ba  [same as prefill, but shape [B, dim]]
+
+causal_conv1d_update(mixed_qkv, conv_state, ...)
+  → single-step conv, updates conv_state[state_index] in-place
+
+fused_recurrent_gated_delta_rule_packed_decode(
+    mixed_qkv, a, b, A_log, dt_bias,
+    initial_state=ssm_state, ssm_state_indices=...) [packed B-sequence update]
+  → updates ssm_state[state_index] in-place, outputs core_attn_out [B, 1, v_dim]
+
+norm + out_proj  [same as prefill]
+```
+
+On **XPU** (current debug target):
+```
+in_proj_qkvz, in_proj_ba  [same as prefill]
+
+torch.ops._xpu_C.gdn_attention(
+    core_attn_out, z,
+    projected_states_qkvz, projected_states_ba,
+    ...
+    num_prefills=0, num_decodes=B,
+    non_spec_query_start_loc=[0, 1, 2, ..., B],
+    non_spec_state_indices_tensor=[slot_0, slot_1, ..., slot_{B-1}])
+  → same SYCL kernel as prefill, decode mode:
+     causal_conv1d single-step update per sequence
+     delta rule single-step recurrent update per sequence
+     writes conv_state[slot_i], ssm_state[slot_i] in-place
+
+norm + out_proj  [same as prefill]
+```
+
+#### Full Attention Layer (decode)
+
+```
+qkv_proj, q_norm, k_norm, rotary_emb  [same projections, shape [B, dim]]
+
+flash_attn_varlen_func  (or paged attention kernel)
+  Reads all T_i prefix KV from paged cache for each sequence i
+  Appends current K, V to paged cache at next slot
+  Computes attention over [T_i+1] keys per sequence
+  Output: attn_output [B, num_heads*head_dim]
+
+o_proj  [same as prefill]
+```
+
+#### MoE / MLP Layer (decode)
+
+Structurally identical to prefill; only the token dimension changes from
+`T_total` (prefill) to `B` (decode batch size).
+
+### Key State Tensors (persistent across prefill→decode)
+
+| Tensor | Shape | Purpose |
+|--------|-------|---------|
+| `conv_state` | `[num_slots, num_k_heads, head_k_dim, conv_width-1]` | Causal conv sliding window state per sequence slot |
+| `ssm_state` | `[num_slots, num_v_heads, head_v_dim, head_k_dim]` | GDN recurrent (delta-rule) hidden state per sequence slot |
+| KV cache | `[num_blocks, block_size, num_kv_heads, head_dim]` × 2 | Paged K/V cache for full-attention layers |
+
+`num_slots` is determined by `max_model_len // block_size`.  In DP=2, each
+DP rank allocates its own `num_slots` pool independently.  Both ranks start
+their allocators from the same base index, which means they assign the same
+slot IDs to different sequences — a root-cause candidate for shared-state NaN
+when `ssm_state` is physically shared across DP ranks (see `[SSM_TENSOR_CHECK]`).
+
+### Kernel Summary Table
+
+| Phase | Layer type | Kernel | Backend |
+|-------|-----------|--------|---------|
+| Both | All | `rms_norm` (input/post layernorm) | XPU element-wise |
+| Both | linear_attn | `in_proj_qkvz` GEMM | XPU GEMM (TP col-split) |
+| Both | linear_attn | `in_proj_ba` GEMM | XPU GEMM (replicated) |
+| Prefill | linear_attn | `gdn_attention` (causal_conv1d + delta-rule chunk) | XPU SYCL |
+| Decode | linear_attn | `gdn_attention` (causal_conv1d_update + delta-rule recurrent) | XPU SYCL |
+| Both | linear_attn | gate-norm (RMSNorm × sigmoid gate) | XPU element-wise |
+| Both | linear_attn | `out_proj` GEMM + all_reduce | XPU GEMM + XCCL |
+| Both | full_attn | `qkv_proj` GEMM | XPU GEMM (TP col-split) |
+| Both | full_attn | q_norm, k_norm RMSNorm | XPU element-wise |
+| Both | full_attn | RoPE | XPU element-wise |
+| Both | full_attn | `flash_attn_varlen_func` (paged KV) | XPU SYCL flash attention |
+| Both | full_attn | `o_proj` GEMM + all_reduce | XPU GEMM + XCCL |
+| Both | MoE | router `gate` GEMM | XPU GEMM |
+| Both | MoE | EP `all_gatherv` / `reduce_scatterv` | XCCL |
+| Both | MoE | `FusedMoE` expert GEMMs (gate_up + down per expert) | XPU GEMM |
+| Both | dense MLP | `gate_up_proj` GEMM | XPU GEMM (TP col-split) |
+| Both | dense MLP | SiLU gated activation | XPU element-wise |
+| Both | dense MLP | `down_proj` GEMM + all_reduce | XPU GEMM + XCCL |
+| End | — | `lm_head` GEMM | XPU GEMM + XCCL |
