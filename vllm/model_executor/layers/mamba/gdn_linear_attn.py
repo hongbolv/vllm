@@ -629,6 +629,107 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             conv_state = self.kv_cache[0]
             ssm_state = self.kv_cache[1]
 
+            # [GDN_STATE_CHECK]: Validate cu_seqlens (non_spec_query_start_loc)
+            # consistency before invoking the gdn_attention SYCL kernel.
+            # Reports on first violation only (class-level flag).
+            _gdn_num_prefills = attn_metadata.num_prefills
+            _gdn_num_decodes = attn_metadata.num_decodes
+            _gdn_num_actual = attn_metadata.num_actual_tokens
+            _gdn_cu_seqlens = attn_metadata.non_spec_query_start_loc
+            _gdn_state_indices = attn_metadata.non_spec_state_indices_tensor
+            _gdn_phase = (
+                "prefill" if _gdn_num_prefills > 0
+                else "decode" if _gdn_num_decodes > 0
+                else "unknown"
+            )
+            if _gdn_cu_seqlens is not None:
+                _expected_entries = (
+                    _gdn_num_prefills + 1 if _gdn_num_prefills > 0
+                    else _gdn_num_decodes + 1
+                )
+                _cu_cpu = _gdn_cu_seqlens.cpu()
+                _cu_slice = _cu_cpu[:_expected_entries]
+                _starts_at_zero = _cu_slice[0].item() == 0 if len(_cu_slice) > 0 else False
+                _is_monotone = bool(
+                    (_cu_slice[1:] >= _cu_slice[:-1]).all().item()
+                ) if len(_cu_slice) > 1 else True
+                _final_val = _cu_slice[-1].item() if len(_cu_slice) > 0 else -1
+                if (
+                    not _starts_at_zero
+                    or not _is_monotone
+                    or _final_val != _gdn_num_actual
+                ):
+                    if not getattr(
+                        GatedDeltaNetAttention, '_gdn_cu_seqlens_reported', False
+                    ):
+                        GatedDeltaNetAttention._gdn_cu_seqlens_reported = True
+                        from vllm.distributed.parallel_state import get_dp_group
+                        _dp_rank = get_dp_group().rank_in_group
+                        print(
+                            f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                            f"layer={self.prefix} phase={_gdn_phase} "
+                            f"cu_seqlens INVALID: "
+                            f"starts_at_zero={_starts_at_zero} "
+                            f"is_monotone={_is_monotone} "
+                            f"final_val={_final_val} "
+                            f"expected_final={_gdn_num_actual} "
+                            f"expected_entries={_expected_entries} "
+                            f"actual_entries={len(_cu_slice)} "
+                            f"cu_seqlens[:8]={_cu_slice[:8].tolist()}",
+                            flush=True,
+                        )
+
+            # [SSM_TENSOR_CHECK]: one-shot per layer — print ssm_state
+            # data_ptr so we can detect cross-rank tensor sharing.
+            # If both DP ranks print the same address, they share the same
+            # physical ssm_state memory → slots [1,5,9,13] on both ranks
+            # refer to identical locations → mutual state corruption → NaN.
+            if not getattr(self, '_ssm_tensor_ptr_reported', False):
+                self._ssm_tensor_ptr_reported = True
+                try:
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _ssc_dp_rank = get_dp_group().rank_in_group
+                except Exception:
+                    _ssc_dp_rank = -1
+                print(
+                    f"[SSM_TENSOR_CHECK] dp_rank={_ssc_dp_rank} "
+                    f"layer={self.prefix} "
+                    f"ssm_state.data_ptr={ssm_state.data_ptr()} "
+                    f"ssm_state.shape={list(ssm_state.shape)} "
+                    f"ssm_state.device={ssm_state.device} "
+                    f"ssm_state.id={id(ssm_state)}",
+                    flush=True,
+                )
+
+            # [SSM_PRE_KERNEL_CHECK]: one-shot per layer in decode phase —
+            # check if ssm_state slots are already NaN/Inf BEFORE the kernel.
+            # If NaN is found here, the corruption happened upstream (during
+            # prefill or a previous decode step), NOT inside the kernel itself.
+            if (
+                _gdn_num_decodes > 0
+                and _gdn_state_indices is not None
+                and _gdn_state_indices.numel() > 0
+                and not getattr(self, '_ssm_pre_kernel_reported', False)
+            ):
+                self._ssm_pre_kernel_reported = True
+                try:
+                    from vllm.distributed.parallel_state import get_dp_group
+                    _spk_dp_rank = get_dp_group().rank_in_group
+                except Exception:
+                    _spk_dp_rank = -1
+                _pre_states = ssm_state[_gdn_state_indices]
+                _pre_nan = int(torch.isnan(_pre_states).sum().item())
+                _pre_inf = int(torch.isinf(_pre_states).sum().item())
+                _pre_status = "NaN_BEFORE_KERNEL" if (_pre_nan > 0 or _pre_inf > 0) else "clean"
+                print(
+                    f"[SSM_PRE_KERNEL_CHECK] dp_rank={_spk_dp_rank} "
+                    f"layer={self.prefix} phase=decode "
+                    f"slots={_gdn_state_indices.cpu().tolist()} "
+                    f"pre_nan={_pre_nan} pre_inf={_pre_inf} "
+                    f"status={_pre_status}",
+                    flush=True,
+                )
+
             torch.ops._xpu_C.gdn_attention(
                 core_attn_out,
                 z,
@@ -654,6 +755,35 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 tp_size=self.tp_size,
                 reorder_input=not self.gqa_interleaved_layout,
             )
+
+            # [GDN_STATE_CHECK]: Validate ssm_state written by gdn_attention.
+            # Checks slots indexed by non_spec_state_indices_tensor for NaN/Inf.
+            if _gdn_state_indices is not None and _gdn_state_indices.numel() > 0:
+                _written_states = ssm_state[_gdn_state_indices]
+                _has_nan = bool(torch.isnan(_written_states).any().item())
+                _has_inf = bool(torch.isinf(_written_states).any().item())
+                if _has_nan or _has_inf:
+                    if not getattr(
+                        GatedDeltaNetAttention, '_gdn_ssm_state_reported', False
+                    ):
+                        GatedDeltaNetAttention._gdn_ssm_state_reported = True
+                        from vllm.distributed.parallel_state import get_dp_group
+                        _dp_rank = get_dp_group().rank_in_group
+                        _nan_count = int(
+                            torch.isnan(_written_states).sum().item()
+                        )
+                        _inf_count = int(
+                            torch.isinf(_written_states).sum().item()
+                        )
+                        print(
+                            f"[GDN_STATE_CHECK] ERROR dp_rank={_dp_rank} "
+                            f"layer={self.prefix} phase={_gdn_phase} "
+                            f"ssm_state NaN/Inf after gdn_attention kernel: "
+                            f"nan_count={_nan_count} inf_count={_inf_count} "
+                            f"state_shape={list(_written_states.shape)} "
+                            f"num_written_slots={_gdn_state_indices.numel()}",
+                            flush=True,
+                        )
 
         # ============================================================
         # Part 3: Output Projection

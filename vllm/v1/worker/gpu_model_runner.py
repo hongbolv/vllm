@@ -474,8 +474,17 @@ class GPUModelRunner(
             self.max_encoder_len = 0
 
         # Async scheduling
+        # Hongbo Fix 3: to avoid deadlock.
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-
+        # Disable async scheduling when Expert Parallelism + Data Parallelism
+        # is active: AsyncGPUModelRunnerOutput lets one DP rank advance to the
+        # next iteration before the other DP rank finishes the current one.
+        # This skew causes the DP all_reduce in _run_ar to deadlock because one
+        # rank enters iteration N+1's collective while the other is still in N.
+        if (self.use_async_scheduling
+                and self.parallel_config.enable_expert_parallel
+                and self.parallel_config.data_parallel_size > 1):
+            self.use_async_scheduling = False
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
@@ -2171,10 +2180,48 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # Hongbo Fix 4
+        # When DP padding is applied (num_tokens_padded > num_tokens),
+        # query_start_loc ends at num_tokens (the real token count) but the
+        # attention backend processes num_tokens_padded rows.  Rows beyond
+        # num_tokens have no sequence assignment, causing softmax on all-inf
+        # scores → NaN.  Fix: create local copies of query_start_loc and
+        # seq_lens with the last entry extended to num_tokens_padded so all
+        # attention backends see consistent metadata.  We must NOT modify
+        # self.seq_lens or self.query_start_loc in-place because those
+        # shared buffers are also used for KV cache slot_mapping — inflating
+        # seq_lens would make the attention kernel read KV cache slots that
+        # were never written, causing NaN in subsequent decode steps.
+        attn_query_start_loc_gpu = self.query_start_loc.gpu[
+            : num_reqs_padded + 1]
+        attn_query_start_loc_cpu = self.query_start_loc.cpu[
+            : num_reqs_padded + 1]
+        attn_seq_lens = self.seq_lens[:num_reqs_padded]
+        if num_tokens_padded > num_tokens:
+            padding_len = num_tokens_padded - num_tokens
+            # Create local copies so we don't corrupt the shared buffers
+            attn_query_start_loc_gpu = attn_query_start_loc_gpu.clone()
+            attn_query_start_loc_cpu = attn_query_start_loc_cpu.clone()
+            attn_seq_lens = attn_seq_lens.clone()
+            # Extend query_start_loc so its last entry = num_tokens_padded
+            attn_query_start_loc_gpu[num_reqs_padded] = num_tokens_padded
+            attn_query_start_loc_cpu[num_reqs_padded] = num_tokens_padded
+            # Extend the last request's seq_lens to cover the padding rows.
+            last_idx = num_reqs_padded - 1
+            attn_seq_lens[last_idx] += padding_len
+            # Keep seq_lens_cpu consistent
+            if seq_lens_cpu is not None:
+                seq_lens_cpu = seq_lens_cpu.clone()
+                seq_lens_cpu[last_idx] += padding_len
+                seq_lens_cpu_upper_bound = seq_lens_cpu
+
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens[:num_reqs_padded],
+            #query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+            #query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
+            #seq_lens=self.seq_lens[:num_reqs_padded],
+            query_start_loc=attn_query_start_loc_gpu,
+            query_start_loc_cpu=attn_query_start_loc_cpu,
+            seq_lens=attn_seq_lens,
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
@@ -3767,6 +3814,7 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -3912,7 +3960,13 @@ class GPUModelRunner(
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            
+            # Hongbo Fix 2:
+            # Attention metadata needs padded sizes when CUDAGraph FULL
+            # mode is active, or when DP padding has increased the token
+            # count (e.g. for equal-size EP collectives on XPU).
+            dp_padding_applied = num_tokens_padded > num_tokens_unpadded
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or dp_padding_applied
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
@@ -4028,6 +4082,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4036,6 +4091,7 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -4054,7 +4110,6 @@ class GPUModelRunner(
                         num_scheduled_tokens_np,
                         kv_connector_output,
                     )
-
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
@@ -4086,7 +4141,6 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4105,7 +4159,6 @@ class GPUModelRunner(
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-
         return None
 
     @torch.inference_mode
@@ -4151,10 +4204,8 @@ class GPUModelRunner(
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -4261,7 +4312,6 @@ class GPUModelRunner(
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
-
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4279,7 +4329,6 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
-
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4297,7 +4346,6 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
-
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4319,10 +4367,8 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
-
         if not self.use_async_scheduling:
             return output
-
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
@@ -4343,7 +4389,6 @@ class GPUModelRunner(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
-
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

@@ -145,12 +145,16 @@ def _synchronize_dp_ranks(
     # Check conditions for microbatching
     should_ubatch = _post_process_ubatch(tensor, parallel_config.num_ubatches)
 
+    # Hongbo Fix 1: Come from others
     # DP padding is needed when cudagraph is enabled (synced across ranks)
     # or when ubatching/DBO is active (ubatching requires uniform batch
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    # Also force DP padding when expert parallelism is enabled to ensure
+    # equal-size collectives (xccl workaround for unequal-size corruption).
+    should_dp_pad = (synced_cudagraph_mode != 0 or should_ubatch
+                     or parallel_config.enable_expert_parallel)
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True

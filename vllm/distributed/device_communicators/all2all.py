@@ -179,7 +179,8 @@ class AgRsAll2AllManager(All2AllManagerBase):
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
-
+        #Hongbo Fix 6
+        dist.barrier(group=dist_group.device_group)
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
@@ -214,7 +215,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
-
+        dist.barrier(group=dist_group.device_group)
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
@@ -242,6 +243,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        dist.barrier(group=dist_group.device_group)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
 

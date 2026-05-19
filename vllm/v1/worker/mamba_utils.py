@@ -177,6 +177,7 @@ def preprocess_mamba(
         mamba_state_idx.pop(req_id, None)
 
     copy_bufs.offset = 0
+
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -203,6 +204,7 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        copy_triggered = False
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -216,6 +218,8 @@ def preprocess_mamba(
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
+            copy_triggered = True
+
     do_mamba_copy_block(copy_bufs)
 
 
