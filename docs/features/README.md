@@ -1,5 +1,7 @@
 # Features
 
+See also: [Experimental AV1 Tensor Compression](av1_tensor_compression.md).
+
 ## Compatibility Matrix
 
 The tables below show mutually exclusive features and the support on some hardware.
