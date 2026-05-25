@@ -25,7 +25,12 @@ class TensorCompressor(ABC):
 
     @abstractmethod
     def encode(self, tensor: torch.Tensor) -> EncodedTensor:
-        """Encode a tensor into a compressed payload."""
+        """
+        Encode a tensor into a compressed payload.
+
+        Args:
+            tensor: Input tensor to compress.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -34,7 +39,14 @@ class TensorCompressor(ABC):
         encoded: EncodedTensor,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """Decode a tensor payload back to a tensor."""
+        """
+        Decode a tensor payload back to a tensor.
+
+        Args:
+            encoded: Encoded payload and metadata.
+            device: Optional target device for the decoded tensor.
+                If omitted, the tensor remains on CPU.
+        """
         raise NotImplementedError
 
 
@@ -44,7 +56,7 @@ def _encode_tensor_bytes(tensor: torch.Tensor) -> tuple[np.ndarray, dict[str, An
     payload = np_tensor.view(np.uint8).reshape(-1)
     metadata = {
         "shape": list(cpu_tensor.shape),
-        "numpy_dtype": np_tensor.dtype.str,
+        "numpy_dtype": np_tensor.dtype.name,
     }
     return payload, metadata
 
@@ -69,7 +81,7 @@ def _load_pyav():
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "AV1 tensor compression requires optional dependency 'av'. "
-            "Install it with: pip install av"
+            "Install it with: uv pip install av"
         ) from exc
     return av
 
@@ -99,8 +111,19 @@ class AV1TensorCompressor(TensorCompressor):
         codec_name: str = "libaom-av1",
         codec_options: dict[str, str] | None = None,
     ):
+        """
+        Initialize an AV1 tensor compressor.
+
+        Args:
+            max_frame_width: Width used to pack byte-stream rows into a frame.
+                A moderate default avoids excessively wide frames.
+            codec_name: AV1 codec name recognized by FFmpeg/PyAV.
+            codec_options: Optional codec configuration (e.g. lossless mode).
+        """
         if max_frame_width <= 0:
-            raise ValueError("max_frame_width must be positive")
+            raise ValueError(
+                f"max_frame_width must be positive, got {max_frame_width}"
+            )
         self.max_frame_width = max_frame_width
         self.codec_name = codec_name
         self.codec_options = codec_options or {"lossless": "1"}
@@ -108,12 +131,12 @@ class AV1TensorCompressor(TensorCompressor):
     def encode(self, tensor: torch.Tensor) -> EncodedTensor:
         av = _load_pyav()
         raw_bytes, metadata = _encode_tensor_bytes(tensor)
-        original_num_bytes = int(raw_bytes.size)
+        num_bytes = int(raw_bytes.size)
 
         width = self.max_frame_width
-        height = max(1, math.ceil(original_num_bytes / width))
+        height = max(1, math.ceil(num_bytes / width))
         padded = np.zeros(width * height, dtype=np.uint8)
-        padded[:original_num_bytes] = raw_bytes
+        padded[:num_bytes] = raw_bytes
         image = padded.reshape(height, width)
 
         output = io.BytesIO()
@@ -134,7 +157,7 @@ class AV1TensorCompressor(TensorCompressor):
             "codec": "av1",
             "height": height,
             "width": width,
-            "original_num_bytes": original_num_bytes,
+            "original_num_bytes": num_bytes,
         })
         return EncodedTensor(output.getvalue(), metadata)
 
@@ -173,4 +196,4 @@ def create_tensor_compressor(
         return NoOpTensorCompressor()
     if codec_name == "av1":
         return AV1TensorCompressor(**kwargs)
-    raise ValueError(f"Unsupported tensor compression codec: {codec}")
+    raise ValueError(f"Unsupported tensor compression codec: {codec_name}")

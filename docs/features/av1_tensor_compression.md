@@ -19,7 +19,7 @@ The AV1 path depends on [PyAV](https://pyav.org/), which is not installed by
 default.
 
 ```bash
-pip install av
+uv pip install av
 ```
 
 If `av` is unavailable, AV1 encode/decode raises a clear runtime error with the
