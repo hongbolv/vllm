@@ -675,6 +675,87 @@ pytest -s -v \
 
 > 注：上表只列出 `test_*` 函数；这些函数大多通过 `pytest.mark.parametrize` 形成数十~数百个子用例，子用例参数空间见正文第 2~3 节。
 
+### A.4 硬件支持矩阵（按文件汇总，含 XPU 可跑用例）
+
+下表汇总每个 attention 测试文件**实际支持的硬件**（依据文件顶层 `pytest.skip(..., allow_module_level=True)`、`@pytest.mark.skipif(...)`、`current_platform.is_*()` 判断、kernel 自身的设备调用以及参数化 device 列表）。
+图例：✅ = 支持并运行；❌ = 文件级或函数级 skip / 不支持；⚠️ = 仅部分函数或部分参数支持（详见备注列）。
+
+| 文件 | NVIDIA CUDA | AMD ROCm | Intel XPU | CPU | 备注 |
+| ---- | :---------: | :------: | :-------: | :-: | ---- |
+| `tests/kernels/attention/test_attention.py` | ✅ | ✅ | ❌ | ❌ | ROCm 多一个 `version="rocm"` 分支 |
+| `tests/kernels/attention/test_flash_attn.py` | ✅ | ❌ | ❌ | ❌ | ROCm 整文件 skip |
+| `tests/kernels/attention/test_cascade_flash_attn.py` | ✅ | ❌ | ❌ | ❌ | ROCm 整文件 skip |
+| `tests/kernels/attention/test_aiter_flash_attn.py` | ❌ | ✅ | ❌ | ❌ | 仅 ROCm + `aiter` |
+| `tests/kernels/attention/test_flashinfer.py` | ✅ | ❌ | ❌ | ❌ | ROCm 整文件 skip |
+| `tests/kernels/attention/test_flashinfer_mla_decode.py` | ✅ | ❌ | ❌ | ❌ | 需 FlashInfer |
+| `tests/kernels/attention/test_flashinfer_trtllm_attention.py` | ⚠️ SM100 | ❌ | ❌ | ❌ | 仅 Blackwell |
+| `tests/kernels/attention/test_use_trtllm_attention.py` | ✅ | ✅ | ✅ | ✅ | 纯 mock，与硬件无关 |
+| `tests/kernels/attention/test_trtllm_kvfp8_dequant.py` | ⚠️ SM100 | ❌ | ❌ | ❌ | 仅 Blackwell + FlashInfer |
+| `tests/kernels/attention/test_flashmla.py` | ⚠️ Hopper | ❌ | ❌ | ❌ | 需 FlashMLA + Hopper |
+| `tests/kernels/attention/test_cutlass_mla_decode.py` | ⚠️ SM100 | ❌ | ❌ | ❌ | 仅 Blackwell |
+| `tests/kernels/attention/test_flashmla_sparse.py` | ⚠️ Hopper | ❌ | ❌ | ❌ | 需 FlashMLA |
+| `tests/kernels/attention/test_xpu_mla_sparse.py` | ❌ | ❌ | ✅ | ❌ | **XPU 专属用例**（`torch.xpu.is_available()`） |
+| `tests/kernels/attention/test_mla_decode_cpu.py` | ❌ | ❌ | ❌ | ✅ | `is_cpu` 才运行 |
+| `tests/kernels/attention/test_triton_decode_attention.py` | ✅ | ✅ | ❌ | ❌ | Triton GPU kernel |
+| `tests/kernels/attention/test_triton_prefill_attention.py` | ✅ | ✅ | ❌ | ❌ | 同上 |
+| `tests/kernels/attention/test_triton_unified_attention.py` | ✅ | ✅ | ❌ | ❌ | 同上 |
+| `tests/kernels/attention/test_prefix_prefill.py` | ✅ | ⚠️ | ❌ | ❌ | ROCm 上部分参数化分支被 skip |
+| `tests/kernels/attention/test_merge_attn_states.py` | ✅ | ❌ | ❌ | ❌ | `is_cuda` 限制 |
+| `tests/kernels/attention/test_pack_unpack_triton.py` | ✅ | ✅ | ❌ | ❌ | Triton FP8 |
+| `tests/kernels/attention/test_lightning_attn.py` | ✅ | ✅ | ❌ | ❌ | Triton kernel |
+| `tests/kernels/attention/test_cache.py` | ✅ | ⚠️ | ❌ | ⚠️ | 部分 MLA 路径 ROCm 不支持；`test_concat_and_cache_mla_cpu` 仅 CPU |
+| `tests/kernels/attention/test_attention_selector.py` | ✅ | ✅ | ✅ | ✅ | 纯 mock，**XPU 也能跑** |
+| `tests/kernels/attention/test_rocm_attention_selector.py` | ❌ | ✅ | ❌ | ❌ | 仅 ROCm |
+| `tests/kernels/attention/test_mha_attn.py` | ✅ | ✅ | ❌ | ❌ | platform fixture 限定 cuda/rocm |
+| `tests/kernels/attention/test_deepgemm_attention.py` | ⚠️ Hopper | ❌ | ❌ | ❌ | 需 DeepGEMM + `is_cuda` |
+| `tests/kernels/attention/test_cpu_attn.py` | ❌ | ❌ | ❌ | ✅ | `is_cpu` 整文件 gate；AMX/NEON 需对应 ISA |
+| `tests/v1/attention/test_attention_backends.py` | ✅ | ⚠️ | ❌ | ❌ | 部分 backend（FlashInfer 等）ROCm skip |
+| `tests/v1/attention/test_mla_backends.py` | ✅ | ⚠️ | ❌ | ❌ | CUTLASS_MLA/FLASHINFER_MLA 仅 SM100 |
+| `tests/v1/attention/test_sparse_mla_backends.py` | ⚠️ Hopper | ❌ | ❌ | ❌ | 需 FlashMLA |
+| `tests/v1/attention/test_attention_backends_selection.py` | ✅ | ✅ | ✅ | ✅ | 纯 mock，**XPU 也能跑** |
+| `tests/v1/attention/test_rocm_attention_backends_selection.py` | ❌ | ✅ | ❌ | ❌ | 仅 ROCm |
+| `tests/v1/attention/test_mla_prefill_selector.py` | ✅ | ✅ | ✅ | ✅ | 纯 mock，**XPU 也能跑** |
+| `tests/v1/attention/test_attention_splitting.py` | ✅ | ✅ | ✅ | ✅ | 全部使用 `device="cpu"`，**XPU 也能跑** |
+| `tests/v1/attention/test_batch_reordering.py` | ✅ | ✅ | ✅ | ✅ | 纯 Mock 类，**XPU 也能跑** |
+| `tests/v1/attention/test_chunked_local_attention.py` | ✅ | ✅ | ⚠️ | ✅ | 取 `DEVICE_TYPE`，CPU/GPU 均可；XPU 取决于 `DEVICE_TYPE` 检测 |
+| `tests/v1/attention/test_kv_head_stride_canonicalization.py` | ✅ | ✅ | ✅ | ✅ | 纯 stride 逻辑，**XPU 也能跑** |
+| `tests/v1/attention/test_gdn_metadata_builder.py` | ✅ | ✅ | ✅ | ✅ | `DEVICE = "cpu"`，**XPU 也能跑** |
+| `tests/v1/attention/test_indexer_deepseek_v4_slot_mapping.py` | ✅ | ❌ | ❌ | ❌ | `requires CUDA` |
+| `tests/v1/attention/test_mamba_update_block_table.py` | ✅ | ✅ | ✅ | ✅ | CPU tensors，**XPU 也能跑** |
+| `tests/v1/attention/test_trtllm_attention_integration.py` | ⚠️ SM100 | ❌ | ❌ | ❌ | 需 FlashInfer + Blackwell |
+| `tests/test_attention_backend_registry.py` | ✅ | ✅ | ✅ | ✅ | 纯注册逻辑，**XPU 也能跑** |
+| `tests/kernels/test_flex_attention.py` | ✅ | ⚠️ | ❌ | ❌ | 需 PyTorch flex_attention，部分用例 GPU-only |
+| `tests/compile/passes/test_fusion_attn.py` 等 fusion pass | ✅ | ⚠️ | ❌ | ❌ | 大多依赖 CUDA compile pipeline |
+| `tests/v1/e2e/general/test_cascade_attention.py` / `test_correctness_sliding_window.py` | ✅ | ⚠️ | ❌ | ❌ | 端到端需要 GPU 起 engine |
+| `tests/v1/spec_decode/test_tree_attention.py` | ✅ | ⚠️ | ❌ | ❌ | 同上 |
+
+#### A.4.1 在 XPU 机器上推荐运行的用例集合
+
+XPU 机器上建议**优先**运行下面这些用例（一类是 XPU 专属 kernel，另一类是平台无关的纯逻辑用例）：
+
+```bash
+# 1) XPU 专属 kernel
+pytest -s -v tests/kernels/attention/test_xpu_mla_sparse.py
+
+# 2) 平台无关的 selector / registry / decision 单测（mock-only）
+pytest -s -v \
+    tests/kernels/attention/test_attention_selector.py \
+    tests/kernels/attention/test_use_trtllm_attention.py \
+    tests/test_attention_backend_registry.py \
+    tests/v1/attention/test_attention_backends_selection.py \
+    tests/v1/attention/test_mla_prefill_selector.py
+
+# 3) 平台无关的 v1 metadata / batch / splitting 用例（CPU tensor）
+pytest -s -v \
+    tests/v1/attention/test_attention_splitting.py \
+    tests/v1/attention/test_batch_reordering.py \
+    tests/v1/attention/test_kv_head_stride_canonicalization.py \
+    tests/v1/attention/test_gdn_metadata_builder.py \
+    tests/v1/attention/test_mamba_update_block_table.py
+```
+
+> 说明：除 `test_xpu_mla_sparse.py` 真正调用 XPU Triton kernel 外，第 2、3 组用例只验证 Python 侧逻辑（backend 选择规则、metadata 构造、batch 重排、stride canonical 化等），它们既不依赖 CUDA 也不依赖 ROCm，因此在 XPU build 上同样可以 100% 通过。其他文件由于在模块顶层就以 `is_rocm` / `is_cuda` / `requires CUDA` 等条件 skip，**在 XPU 上会被整体跳过**，不要期望执行。
+
 ---
 
 ## 12. 备注
