@@ -246,7 +246,159 @@ vLLM 中的 Attention 测试主要分布在以下几个目录：
 
 ---
 
-## 10. 备注
+## 10. 如何运行这些用例
+
+### 10.1 环境准备
+
+vLLM 使用 `pytest` 驱动所有测试，运行 attention 测试前需要先按官方文档安装测试依赖（参见 `docs/contributing/README.md`）：
+
+```bash
+# 1) 安装与 CI 一致的依赖（CUDA 环境）
+uv pip install -r requirements/common.txt -r requirements/dev.txt --torch-backend=auto
+
+# 2) 安装通用测试依赖（与硬件无关）
+uv pip install pytest pytest-asyncio
+
+# 3) 以 editable 模式安装 vLLM 本身（如果还没装），保证 import 的是当前仓库代码
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+```
+
+可选依赖按需安装（缺失时对应文件会通过 `pytest.skip(..., allow_module_level=True)` 整体跳过）：
+
+| 测试 | 需要的额外依赖 |
+| ---- | -------------- |
+| `test_flashinfer*.py`、`test_use_trtllm_attention.py`、`test_trtllm_kvfp8_dequant.py`、`test_flashinfer_trtllm_attention.py` | `flashinfer-python`（且通常需要 SM100 / Hopper+ GPU） |
+| `test_aiter_flash_attn.py`、`test_rocm_attention_selector.py`、`tests/v1/attention/test_rocm_attention_backends_selection.py` | ROCm + `aiter` |
+| `test_flashmla*.py` | FlashMLA（DeepSeek） + Hopper |
+| `test_cutlass_mla_decode.py`、`tests/v1/attention/test_mla_backends.py`（CUTLASS_MLA / FLASHINFER_MLA 分支） | SM100（Blackwell） |
+| `test_deepgemm_attention.py` | `deep_gemm` + Hopper |
+| `test_cpu_attn.py`、`test_mla_decode_cpu.py` | CPU build（部分用例需要 AMX / VEC ISA） |
+| `test_xpu_mla_sparse.py` | XPU build |
+| `tests/kernels/test_flex_attention.py`、`tests/v1/attention/test_attention_backends.py` 中的 FlexAttention 分支 | PyTorch ≥ 2.5（`torch.nn.attention.flex_attention`） |
+
+### 10.2 常用运行方式
+
+下面所有命令都假设在仓库根目录 `/.../vllm/` 下执行。
+
+```bash
+# 1) 运行整个 kernel 级 attention 测试目录
+pytest -s -v tests/kernels/attention/
+
+# 2) 运行整个 v1 引擎 attention 测试目录
+pytest -s -v tests/v1/attention/
+
+# 3) 同时跑两组（最常用的一次性回归命令）
+pytest -s -v tests/kernels/attention/ tests/v1/attention/
+
+# 4) 只跑某个文件
+pytest -s -v tests/kernels/attention/test_flash_attn.py
+pytest -s -v tests/v1/attention/test_attention_backends.py
+
+# 5) 只跑文件里的某个用例
+pytest -s -v tests/kernels/attention/test_attention.py::test_paged_attention
+
+# 6) 用 -k 过滤名字（适合 parametrize 出来的大量子用例）
+pytest -s -v tests/kernels/attention/test_flash_attn.py -k "head_size128 and sliding_window-256 and fa_version2"
+pytest -s -v tests/v1/attention/test_mla_backends.py -k "FLASHMLA and small_decode"
+
+# 7) 列出所有子用例但不执行（确认参数化展开）
+pytest --collect-only -q tests/kernels/attention/test_flash_attn.py
+
+# 8) 失败时打印更多信息 / 失败即停 / 显示最慢的 N 个
+pytest -s -v --tb=long -x --durations=20 tests/kernels/attention/
+
+# 9) 并行加速（需要 pytest-xdist）
+uv pip install pytest-xdist
+pytest -n 8 tests/kernels/attention/
+```
+
+### 10.3 运行 backend 选择 / 注册类测试
+
+这些测试主要是 mock + 单元逻辑，对硬件依赖较弱：
+
+```bash
+pytest -s -v tests/kernels/attention/test_attention_selector.py
+pytest -s -v tests/kernels/attention/test_use_trtllm_attention.py
+pytest -s -v tests/test_attention_backend_registry.py
+pytest -s -v tests/v1/attention/test_attention_backends_selection.py
+pytest -s -v tests/v1/attention/test_mla_prefill_selector.py
+```
+
+### 10.4 运行 compile / fusion pass 中的 attention 相关测试
+
+```bash
+pytest -s -v \
+    tests/compile/passes/test_fusion_attn.py \
+    tests/compile/passes/test_mla_attn_quant_fusion.py \
+    tests/compile/passes/test_qk_norm_rope_fusion.py \
+    tests/compile/passes/test_rope_kvcache_fusion.py \
+    tests/compile/passes/test_fuse_mla_dual_rms_norm.py
+```
+
+### 10.5 运行端到端 / spec-decode 中的 attention 测试
+
+这类测试会真正起 vLLM engine 加载小模型，**需要 GPU 且会下载 HF 模型**，运行时间相对较长：
+
+```bash
+# cascade attention 端到端
+pytest -s -v tests/v1/e2e/general/test_cascade_attention.py
+
+# sliding window 正确性
+pytest -s -v tests/v1/e2e/general/test_correctness_sliding_window.py
+
+# tree attention（投机解码）
+pytest -s -v tests/v1/spec_decode/test_tree_attention.py
+```
+
+可以通过 `HF_HUB_OFFLINE=1` + 预下载模型避免网络拉取，或通过 `VLLM_TEST_MODEL=...` 等环境变量切换为本地小模型（视具体测试而定）。
+
+### 10.6 常用环境变量与 backend 切换
+
+很多 attention 测试会读取环境变量来选择后端 / 验证 fallback，可在命令前显式覆盖：
+
+```bash
+# 强制选择某个 backend（部分测试会自己设置，不需要手动指定）
+VLLM_ATTENTION_BACKEND=FLASH_ATTN  pytest -s -v tests/v1/attention/test_attention_backends.py
+VLLM_ATTENTION_BACKEND=FLASHINFER  pytest -s -v tests/v1/attention/test_attention_backends.py
+VLLM_ATTENTION_BACKEND=TRITON_ATTN pytest -s -v tests/v1/attention/test_attention_backends.py
+VLLM_ATTENTION_BACKEND=FLEX_ATTENTION pytest -s -v tests/kernels/test_flex_attention.py
+
+# 限制使用的 GPU
+CUDA_VISIBLE_DEVICES=0 pytest -s -v tests/kernels/attention/test_attention.py
+
+# 跳过会下载模型的测试（按需结合 -k / -m 使用）
+HF_HUB_OFFLINE=1 pytest -s -v tests/kernels/attention/
+```
+
+### 10.7 一些快速 smoke 用例
+
+只想最快地确认 attention 路径没坏，可以挑这些“小而全”的子集：
+
+```bash
+# 最小集：PagedAttention + FA varlen + v1 standard backend correctness 抽样
+pytest -s -v \
+    tests/kernels/attention/test_attention.py::test_paged_attention \
+    tests/kernels/attention/test_flash_attn.py::test_varlen_with_paged_kv \
+    tests/v1/attention/test_attention_backends.py::test_causal_backend_correctness \
+    -k "head_size128 and block_size16"
+
+# MLA smoke
+pytest -s -v \
+    tests/kernels/attention/test_flashmla.py::test_flash_mla \
+    tests/v1/attention/test_mla_backends.py::test_backend_correctness \
+    -k "small_decode"
+
+# Selector / 注册（CPU 即可跑）
+pytest -s -v \
+    tests/kernels/attention/test_attention_selector.py \
+    tests/test_attention_backend_registry.py
+```
+
+> 提示：由于绝大多数文件都用 `pytest.mark.parametrize` 形成笛卡尔积，**全量执行非常耗时**。日常开发推荐先用 `-k` 锁定一个小参数子集快速回归，再在提交前跑完整目录。
+
+---
+
+## 11. 备注
 
 - 大量 kernel 测试通过 `pytest.mark.parametrize` 形成笛卡尔积，实际用例数远大于函数数量。修改通用 attention 路径前建议先在小参数子集上快速回归。
 - `tests/kernels/attention/conftest.py` 控制 device/平台过滤；`tests/v1/attention/utils.py` 中的 `BatchSpec`、`BackendConfig`、`create_common_attn_metadata` 是 v1 后端测试的核心工具。
