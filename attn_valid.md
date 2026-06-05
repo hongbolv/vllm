@@ -256,12 +256,23 @@ vLLM 使用 `pytest` 驱动所有测试，运行 attention 测试前需要先按
 # 1) 安装与 CI 一致的依赖（CUDA 环境）
 uv pip install -r requirements/common.txt -r requirements/dev.txt --torch-backend=auto
 
-# 2) 安装通用测试依赖（与硬件无关）
-uv pip install pytest pytest-asyncio
+# 2) 安装 tests/conftest.py 所需的测试依赖（按硬件平台选择其一）
+#    —— 这一步非常关键。tests/conftest.py 第 7 行 `from tblib import pickling_support`
+#       会要求 tblib 等测试依赖；缺失时整个 tests/ 目录都会以
+#       `ImportError while loading conftest '.../tests/conftest.py'` 失败而无法运行。
+uv pip install -r requirements/test/cuda.txt   # NVIDIA GPU
+# 或：
+# uv pip install -r requirements/test/rocm.txt # AMD ROCm
+# uv pip install -r requirements/test/xpu.txt  # Intel XPU
 
-# 3) 以 editable 模式安装 vLLM 本身（如果还没装），保证 import 的是当前仓库代码
+# 3) 通用测试依赖（一般已被 dev.txt / test/*.txt 拉入，这里兜底）
+uv pip install pytest pytest-asyncio tblib
+
+# 4) 以 editable 模式安装 vLLM 本身（如果还没装），保证 import 的是当前仓库代码
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 ```
+
+> **常见报错**：`ImportError while loading conftest '.../tests/conftest.py'` / `tests/conftest.py:7: in <module> from tblib import pickling_support` 表示当前环境没装 `tblib`（以及多半也没装其它测试依赖）。`tests/conftest.py` 是 pytest 的全局 fixture 文件，跑 `tests/` 下任意用例都会先加载它，所以缺依赖时**所有** attention 测试都会立刻失败、连 collection 都进不去。修复方法就是补跑上面第 2 / 3 步。
 
 可选依赖按需安装（缺失时对应文件会通过 `pytest.skip(..., allow_module_level=True)` 整体跳过）：
 
